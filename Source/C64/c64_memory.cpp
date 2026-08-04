@@ -36,6 +36,7 @@ CC64Memory::CC64Memory()
 	  m_SelectedEmulatedHz( 0 ),
 	  m_IECThrottleEnabled( true ), m_IECHoldCycles( 0 ),
 	  m_LastCIA2PortA( 0 ), m_HaveCIA2PortA( false ),
+	  m_LastVICControl{ 0, 0, 0 }, m_HaveVICControl( 0 ),
 	  m_TimingHook( 0 ), m_TimingHookCtx( 0 )
 {
 	c64BankingInit();
@@ -229,6 +230,51 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 		if ( m_IO && m_IO->ioWrite( a, value ) )
 			return;
 
+		// Flushing before just these restores program order where it is
+		// visible -- but only when the bits that CHANGE WHAT THE VIC LOOKS AT
+		// actually change. That refinement is not an optimisation, it is a
+		// hard requirement, learned on hardware:
+		//
+		//   $DD00 is also the SERIAL PORT. ATN, CLK and DATA share the register
+		//   with the VIC bank bits, and an IEC transfer toggles them thousands
+		//   of times. Flushing the whole dirty buffer on every CLK edge
+		//   inserted milliseconds of stall between protocol transitions; the
+		//   drive timed out mid-byte and the KERNAL sat forever in its
+		//   no-timeout receive wait -- a frozen machine with the freeze PC in
+		//   the serial routines, which is exactly what the reset diagnostic
+		//   reported.
+		//
+		//   $D011 is also the raster-compare high bit and Y-scroll, written by
+		//   every raster interrupt handler; only ECM/BMM/DEN change the fetch
+		//   source. $D016's X-scroll is likewise written constantly; only MCM
+		//   matters here. $D018 changes the fetch source by definition.
+		//
+		// First write with no baseline flushes, conservatively.
+		if ( m_Mirror )
+		{
+			bool displayChanged = false;
+
+			if ( a == 0xDD00 )
+			{
+				displayChanged = !m_HaveCIA2PortA
+				              || ( ( m_LastCIA2PortA ^ value ) & 0x03 ) != 0;
+			}
+			else if ( a == 0xD011 || a == 0xD016 || a == 0xD018 )
+			{
+				const u32 idx  = ( a == 0xD011 ) ? 0 : ( a == 0xD016 ) ? 1 : 2;
+				const u8  mask = ( a == 0xD011 ) ? 0x70			// ECM | BMM | DEN
+				               : ( a == 0xD016 ) ? 0x10			// MCM
+				               : 0xFF;							// $D018: all of it
+				displayChanged = !( m_HaveVICControl & ( 1u << idx ) )
+				              || ( ( m_LastVICControl[ idx ] ^ value ) & mask ) != 0;
+				m_LastVICControl[ idx ] = value;
+				m_HaveVICControl |= (u8)( 1u << idx );
+			}
+
+			if ( displayChanged )
+				m_Mirror->flush();
+		}
+
 		// $DD00 is CIA2 port A, which carries ATN, CLK and DATA for the serial
 		// bus as well as the VIC bank select. Only IEC-line changes arm the
 		// fallback; an ordinary VIC bank change must remain at turbo speed.
@@ -276,12 +322,6 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 		//   $D018  memory pointers -- screen base, character/bitmap base
 		//   $DD00  CIA2 port A -- VIC bank select
 		//
-		// Flushing before just these restores program order where it is
-		// visible. They are rare -- a handful per mode change -- unlike the
-		// constant $D012/$DC01 traffic that made flushing before EVERY I/O
-		// write corrupt the display.
-		if ( m_Mirror && ( a == 0xD011 || a == 0xD016 || a == 0xD018 || a == 0xDD00 ) )
-			m_Mirror->flush();
 
 		m_IOWrites++;
 		if ( m_C64 ) m_C64->write( a, value );

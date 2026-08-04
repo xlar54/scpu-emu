@@ -346,6 +346,8 @@ private:
 	u32  m_IECHoldCycles;		// emulated cycles left at forced 1MHz
 	u8   m_LastCIA2PortA;
 	bool m_HaveCIA2PortA;
+	u8   m_LastVICControl[ 3 ];		// last written $D011 / $D016 / $D018
+	u8   m_HaveVICControl;			// bitmask of which of those have a baseline
 	TimingHook m_TimingHook;
 	void      *m_TimingHookCtx;
 };

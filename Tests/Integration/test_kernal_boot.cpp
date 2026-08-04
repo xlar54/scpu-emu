@@ -767,3 +767,37 @@ TEST( integration_frame_budget_counts_automatic_iec_throttle_as_slow )
 	CHECK( ran > 19000 );
 	CHECK( ran < 21000 );
 }
+
+TEST( integration_serial_toggles_on_dd00_do_not_flush )
+{
+	// The IEC-killing regression, pinned. $DD00 is both the VIC bank select
+	// AND the serial port: ATN, CLK and DATA live in bits 3-5 and an IEC
+	// transfer toggles them thousands of times. Flushing the dirty buffer on
+	// every toggle inserted milliseconds of stall between protocol edges; the
+	// drive timed out mid-byte and the KERNAL hung forever in its no-timeout
+	// receive wait. Only bits 0-1 -- the VIC bank -- may trigger the flush.
+	SystemFixture f;
+	const u8 code[] = {
+		0xA9, 0x41, 0x8D, 0x00, 0x04,	// LDA #$41 / STA $0400  (dirty a byte)
+		0xAD, 0x00, 0xDD,				// LDA $DD00             (seed baseline $97)
+		0xA9, 0x87, 0x8D, 0x00, 0xDD,	// STA $DD00  CLK toggled  (bit 4: $97->$87)
+		0xA9, 0x97, 0x8D, 0x00, 0xDD,	// STA $DD00  CLK back
+		0xA9, 0xB7, 0x8D, 0x00, 0xDD,	// STA $DD00  DATA toggled (bit 5)
+		0xA9, 0x96, 0x8D, 0x00, 0xDD	// STA $DD00  VIC BANK changed (bits 0-1)
+	};
+	f.installKernal( 0xE000, code, sizeof( code ), 0xE000 );
+	f.start();
+	f.wb.setOptMode( SCPU_OPT_NONE );
+	f.bus.m_Memory[ 0xDD00 ] = 0x97;
+
+	// Through the three serial-bit toggles the dirty byte must stay queued.
+	// (9 instructions: the two setup, the baseline read, then three LDA/STA
+	// pairs ending with the DATA toggle.)
+	for ( int i = 0; i < 9; i++ ) f.cpu.step();
+	CHECK_EQ( f.wb.pending(), 1 );
+
+	// The VIC-bank change is the one that flushes.
+	f.cpu.step(); f.cpu.step();
+	CHECK_EQ( f.wb.pending(), 0 );
+	CHECK_EQ( f.bus.m_Memory[ 0x0400 ], 0x41 );
+}
