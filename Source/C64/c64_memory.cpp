@@ -254,28 +254,73 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 			return;
 		}
 
-		// NO synchronous mirror flushing on I/O writes -- none, ever. Three
-		// generations of "flush before display-state changes" each failed on
-		// hardware, and the sequence is worth recording:
+		// Display-state writes with staged data pending are FLUSH-SYNCHRONISED:
+		// hold the write, wait for the raster to reach the border, drain the
+		// mirror there, and only then let the register write land. This is the
+		// synthesis of two half-right answers that each failed on hardware:
 		//
-		//   1. Flush before every display write: broke IEC, because $DD00 is
-		//      also the serial port and the flush stalls stretched byte
-		//      handshakes past the 200us threshold that MEANS end-of-data.
-		//   2. Flush when the buffer held <=128 bytes: rolled the display
-		//      whenever the CMD splash's raster interrupt -- which toggles
-		//      $D011 mode bits mid-display BY DESIGN -- met a modestly dirty
-		//      buffer.
-		//   3. Flush when <=8 bytes: STILL rolled, one boot in two. The flush
-		//      emits a BURST, and bursts are never display-safe at arbitrary
-		//      raster positions -- that is the entire reason the border
-		//      scheduler exists. Whether a boot rolled came down to power-on
-		//      phase: a coin flip.
+		//   * Synchronous flushing at the write ordered the data correctly but
+		//     burst the bus at arbitrary raster positions -- and bursts are
+		//     never display-safe; the CMD splash's own raster interrupt writes
+		//     these registers mid-display BY DESIGN. Rolling screens, one boot
+		//     in two.
+		//   * No flushing at all was raster-safe but broke ordering: the
+		//     splash double-buffers its animation, flipping $D018 between two
+		//     bitmaps while the DRAWING travels through the border-budgeted
+		//     mirror. Each displayed buffer was a stale mix -- logos ghosted
+		//     at two positions -- while the machine sat healthy at READY
+		//     behind an unwatchable display.
 		//
-		// Ordering between staged screen data and the register write that
-		// points the VIC at it is handled ENTIRELY by the border-scheduled
-		// flusher, eight times a frame: worst-case staleness ~1ms, the same
-		// transient a real SuperCPU's asynchronous mirroring shows on a mode
-		// switch.
+		// Waiting for the border satisfies both constraints at once: ordered,
+		// and never bursting inside the picture. Cost: the writing instruction
+		// stalls up to about a frame, which paces a double-buffered animation
+		// to the raster -- exactly what such an animation expects.
+		//
+		// Never during serial activity (pauses have protocol meaning there --
+		// and serial code has no business flipping display state mid-byte),
+		// and bounded by a timeout so a backend with no raster cannot wedge.
+		if ( m_Mirror && m_C64 && m_Mirror->pendingBytes() > 8
+		     && m_IECActivityCycles == 0 && m_IECHoldCycles == 0 )
+		{
+			bool displayChanged = false;
+
+			if ( a == 0xDD00 )
+			{
+				displayChanged = !m_HaveCIA2PortA
+				              || ( ( m_LastCIA2PortA ^ value ) & 0x03 ) != 0;
+			}
+			else if ( a == 0xD011 || a == 0xD016 || a == 0xD018 )
+			{
+				const u32 idx  = ( a == 0xD011 ) ? 0 : ( a == 0xD016 ) ? 1 : 2;
+				const u8  mask = ( a == 0xD011 ) ? 0x70			// ECM | BMM | DEN
+				               : ( a == 0xD016 ) ? 0x10			// MCM
+				               : 0xFF;							// $D018: all of it
+				displayChanged = !( m_HaveVICControl & ( 1u << idx ) )
+				              || ( ( m_LastVICControl[ idx ] ^ value ) & mask ) != 0;
+			}
+
+			if ( displayChanged )
+			{
+				const C64VideoStandard vid = m_C64->signals().video;
+				for ( u32 guard = 0; guard < 40000; guard++ )
+				{
+					const u16 line = m_C64->rasterLine();
+					if ( line == 0xFFFF )
+						break;						// no raster: host bus, just flush
+					if ( c64RasterIsSafeForBulkTransfer( vid, line ) )
+						break;
+				}
+				m_Mirror->flush();
+			}
+		}
+
+		// Track the last written control values for the change detection above.
+		if ( a == 0xD011 || a == 0xD016 || a == 0xD018 )
+		{
+			const u32 idx = ( a == 0xD011 ) ? 0 : ( a == 0xD016 ) ? 1 : 2;
+			m_LastVICControl[ idx ] = value;
+			m_HaveVICControl |= (u8)( 1u << idx );
+		}
 
 		// $DD00 is CIA2 port A, which carries ATN, CLK and DATA for the serial
 		// bus as well as the VIC bank select. Only IEC-line changes arm the

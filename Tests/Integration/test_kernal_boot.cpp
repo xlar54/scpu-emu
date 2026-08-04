@@ -828,3 +828,27 @@ TEST( integration_iec_activity_window_expires )
 	for ( u32 i = 0; i < 110000; i++ ) f.mem.tickFast( 1 );
 	CHECK( !f.mem.iecBusActive() );
 }
+
+TEST( integration_display_flip_with_bulk_pending_flushes_at_border )
+{
+	// The synthesis rule: a display-state change with real data pending holds
+	// the write until the raster is in the border, drains there, then lands.
+	// Ordered AND raster-safe -- see the note in c64_memory.cpp. Small buffers
+	// (<=8) skip the wait entirely, which the never-flush test above pins.
+	SystemFixture f;
+	const u8 code[] = { 0xA9, 0x3B, 0x8D, 0x18, 0xD0 };	// LDA #$3B / STA $D018
+	f.installKernal( 0xE000, code, sizeof( code ), 0xE000 );
+	f.start();
+	f.wb.setOptMode( SCPU_OPT_NONE );
+
+	// Stage a bitmap's worth of data -- well past the trivial threshold.
+	for ( u32 i = 0; i < 100; i++ ) f.mem.write8( (u16)( 0x2000 + i ), (u8)i );
+	CHECK( f.wb.pending() >= 100 );
+
+	f.cpu.step(); f.cpu.step();		// LDA, then the flip
+
+	// The flip waited for the border and drained everything first.
+	CHECK_EQ( f.wb.pending(), 0 );
+	CHECK_EQ( f.bus.m_Memory[ 0x2000 ], 0 );
+	CHECK_EQ( f.bus.m_Memory[ 0x2063 ], 0x63 );
+}
