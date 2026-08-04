@@ -88,7 +88,13 @@ KERNAL with the Pi as the CPU.
 - [ ] `$D0B0`/`$D0BC` detection confirmed against hardware or VICE — the sources
       disagree on which address in `$D0Bx` carries the flag
 - [ ] Character ROM capture via an injected Ultimax stub
-- [ ] SuperCPU ROM image support (SuperCPU DOS, JiffyDOS)
+- [x] SuperCPU ROM image loaded from the SD card and readable at `$F80000`
+      (`SCPU/scpu.rom`, staged from SuperCPU DOS 2.04)
+- [ ] **Bootmap**: mapping the SuperCPU ROM over bank 0 at reset so its own code
+      runs before the C64's KERNAL, which is what a real card does. Held back
+      deliberately — it changes power-on behaviour before the machine can read
+      `scpu.cfg`, so a mistake could not be backed out from the SD card. Needs
+      the reset sequence verified against VICE's `scpu64mem.c` first.
 
 ## Milestone 4 — beyond a stock machine
 

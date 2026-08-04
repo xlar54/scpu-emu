@@ -84,7 +84,15 @@ static CRADBus   radBus;
 static CActLED   actLED;
 static CSuperCPU superCPU;
 
+// Shared scratch for the three C64 images, safe to reuse because CC64Memory
+// COPIES what it is given.
 static u8 romBuffer[ C64_BASIC_SIZE ];
+
+// The SuperCPU's own ROM needs its own home for the life of the program:
+// CSuperCPUMemoryMap::setROM() stores a POINTER rather than copying, so this
+// cannot share romBuffer above. Sized for the largest image the address space
+// can hold; the shipped SuperCPU DOS images are 128K.
+static u8 scpuROMBuffer[ SCPU_ROM_MAXSIZE ];
 
 static bool radBusButtonPressed() { return radBus.buttonPressed(); }
 static bool radBusHardwareResetPressed() { return radBus.hardwareResetPressed(); }
@@ -135,6 +143,34 @@ static bool loadROMFile( CLogger *logger, const char *name, u8 *dst, u32 expecte
 
 	logger->Write( "SCPU", LogNotice, "loaded %s", name );
 	return true;
+}
+
+// Same, but for an image whose size is not known in advance. The SuperCPU DOS
+// images ship at 128K, but the ROM region is larger and CMD produced more than
+// one build, so the size is reported rather than demanded -- an image that is
+// not the size we expected is far more useful loaded than refused.
+// Returns 0 if absent or unusable.
+static u32 loadROMFileSized( CLogger *logger, const char *name, u8 *dst, u32 capacity )
+{
+	u32 size = 0;
+
+	if ( !readFile( logger, SCPU_DRIVE, name, dst, &size, capacity ) )
+		return 0;
+
+	if ( size == 0 )
+		return 0;
+
+	// A ROM that is not a power of two cannot mirror cleanly into its region,
+	// which is how the address decode fills the space above the image.
+	if ( size & ( size - 1 ) )
+	{
+		logger->Write( "SCPU", LogWarning,
+		               "%s is %u bytes, not a power of two -- ignored", name, size );
+		return 0;
+	}
+
+	logger->Write( "SCPU", LogNotice, "loaded %s (%u KB)", name, size / 1024 );
+	return size;
 }
 
 
@@ -232,6 +268,24 @@ void scpuBootRun( CLogger *logger )
 
 	if ( loadROMFile( logger, SCPU_ROM_DIR "chargen.rom", romBuffer, C64_CHARROM_SIZE ) )
 		superCPU.setCharROM( romBuffer );
+
+	// The SuperCPU's own ROM -- SuperCPU DOS and its JiffyDOS support. Entirely
+	// optional: SCPU-EMU boots the machine's own KERNAL out of bank 0, so
+	// without this the accelerator still works and $F80000 simply reads open
+	// bus. With it, software that knows about the accelerator can reach the
+	// code CMD shipped.
+	//
+	// Note this only makes the ROM READABLE. It does not map it over bank 0 at
+	// reset -- see the bootmap note in registers.h. Changing what runs at
+	// power-on is a different decision, and one that cannot be backed out from
+	// the config file, because the machine would never get far enough to read
+	// it.
+	{
+		const u32 scpuROMSize = loadROMFileSized( logger, SCPU_ROM_DIR "scpu.rom",
+		                                          scpuROMBuffer, SCPU_ROM_MAXSIZE );
+		if ( scpuROMSize )
+			superCPU.memoryMap().setROM( scpuROMBuffer, scpuROMSize );
+	}
 
 	// From here on the SD card is not touched again: the FAT driver takes
 	// interrupts and allocates, neither of which is safe once we are holding

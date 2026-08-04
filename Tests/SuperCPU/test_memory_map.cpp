@@ -114,6 +114,37 @@ TEST( map_rom_region_reads_the_image_when_supplied )
 	CHECK_EQ( f.map.read8( SCPU_ROM_BASE ), rom[ 0 ] );
 }
 
+TEST( map_128k_rom_mirrors_across_the_whole_region )
+{
+	// The real SuperCPU DOS images are 128K and the ROM region is 512K, so an
+	// image mirrors four times. The property that matters is the alignment: the
+	// TOP of the image has to land at the TOP of the address space, because
+	// that is where a 65816 vector table sits. SuperCPU DOS 2.04 has a valid one
+	// there -- RESET=$FF3D, NMI=$FF05, IRQ=$FF17 -- and a mapping that put the
+	// image's top anywhere else would decode it as ordinary data.
+	MapFixture f;
+
+	static u8 rom[ 0x20000 ];					// 128K, as shipped
+	for ( u32 i = 0; i < sizeof( rom ); i++ ) rom[ i ] = (u8)( i * 7 + ( i >> 8 ) );
+	f.map.setROM( rom, sizeof( rom ) );
+
+	// Base of the region is the base of the image.
+	CHECK_EQ( f.map.read8( SCPU_ROM_BASE ), rom[ 0 ] );
+
+	// Top of the address space is the top of the image.
+	CHECK_EQ( f.map.read8( 0xFFFFFF ), rom[ 0x1FFFF ] );
+	CHECK_EQ( f.map.read8( 0xFFFFFC ), rom[ 0x1FFFC ] );
+
+	// And it repeats every 128K in between, four times over the 512K region.
+	for ( u32 copy = 0; copy < 4; copy++ )
+	{
+		const u32 base = SCPU_ROM_BASE + copy * 0x20000;
+		CHECK_EQ( f.map.read8( base ),          rom[ 0 ] );
+		CHECK_EQ( f.map.read8( base + 0x1234 ), rom[ 0x1234 ] );
+		CHECK_EQ( f.map.read8( base + 0x1FFFF), rom[ 0x1FFFF ] );
+	}
+}
+
 TEST( map_rom_region_is_open_bus_without_an_image )
 {
 	MapFixture f;

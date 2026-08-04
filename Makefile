@@ -107,6 +107,12 @@ sdcard:
 	@cp -f ROMs/kernal.rom  $(SDDIR)/SCPU/ 2>/dev/null || true
 	@cp -f ROMs/basic.rom   $(SDDIR)/SCPU/ 2>/dev/null || true
 	@cp -f ROMs/chargen.rom $(SDDIR)/SCPU/ 2>/dev/null || true
+	@# The SuperCPU's own ROM: SuperCPU DOS and its JiffyDOS support. Optional --
+	@# the accelerator boots the machine's own KERNAL without it. 2.04 is the
+	@# later of the two CMD builds; drop scpu-dos-1.4.bin in as scpu.rom instead
+	@# to run that one.
+	@cp -f ROMs/scpu-dos-2.04.bin $(SDDIR)/SCPU/scpu.rom 2>/dev/null \
+		|| echo "  (no SuperCPU ROM staged -- optional, see ROMs/README.md)"
 	@cp -f Source/kernel8.img $(SDDIR)/ 2>/dev/null \
 		|| echo "  MISSING kernel8.img       -- run 'make firmware' first (needs a Circle tree, see Docs/build.md)"
 	@cp -f Tools/sdcard_readme.txt $(SDDIR)/README.txt 2>/dev/null || true

@@ -26,9 +26,28 @@ boot a genuine KERNAL through the CPU core. Those tests report as *skipped*
 rather than failing when the files are absent, so a fresh clone still goes
 green.
 
-The SuperCPU DOS images are 128KB and are not used yet — they become relevant in
-milestone 3, when SCPU-EMU can run the accelerator's own ROM instead of the
-host's KERNAL. See [../Docs/roadmap.md](../Docs/roadmap.md).
+The SuperCPU DOS images are 128KB. `make sdcard` stages **2.04** as
+`SCPU/scpu.rom`, and the firmware maps it at `$F80000` where accelerator-aware
+software can read it. It is entirely optional: SCPU-EMU boots the machine's own
+KERNAL out of bank 0, so without it `$F80000` simply reads open bus and
+everything still works.
+
+The two images are not equivalent:
+
+| | populated | vector table at the top |
+|---|---|---|
+| `scpu-dos-2.04.bin` | all 128KB | yes — `RESET=$FF3D`, `NMI=$FF05`, `IRQ=$FF17` |
+| `scpu-dos-1.4.bin` | first 64KB only, rest `$FF` | no — the top half is blank |
+
+2.04 is the default for that reason. To run 1.4 instead, copy it over
+`SCPU/scpu.rom` on the card.
+
+**What this does not do:** it makes the ROM *readable*, not *executed*. A real
+SuperCPU has a "bootmap" mode in which it maps its own ROM over bank 0 at reset
+so that its code runs before the C64's KERNAL. SCPU-EMU does not do that yet,
+deliberately — it changes what happens at power-on, before the machine gets far
+enough to read `scpu.cfg`, so a mistake there could not be backed out from the
+SD card. See [../Docs/roadmap.md](../Docs/roadmap.md).
 
 ## Default: no files at all
 
@@ -49,9 +68,13 @@ Place in `SCPU/` on the SD card:
 | `kernal.rom` | 8192 | overrides the snapshot |
 | `basic.rom` | 8192 | overrides the snapshot |
 | `chargen.rom` | 4096 | cannot be snapshotted — see below |
+| `scpu.rom` | any power of two up to 512K | the accelerator's own ROM, mapped at `$F80000`. Staged from `scpu-dos-2.04.bin`. |
 
-Use these to pin a specific KERNAL revision, or to run a real SuperCPU ROM image
-(SuperCPU DOS, which brings JiffyDOS with it).
+Use the first three to pin a specific KERNAL revision. `scpu.rom` is the real
+SuperCPU ROM image — SuperCPU DOS, which brings JiffyDOS with it.
+
+A `scpu.rom` that is not a power of two is refused with a warning rather than
+loaded, because a non-power-of-two image cannot mirror cleanly into its region.
 
 ## Why chargen is different
 
