@@ -442,9 +442,20 @@ static void scpuDumpEmulatedScreen( CLogger *logger, CSuperCPU &scpu )
 		               (unsigned long long)dwait,
 		               (unsigned long long)( dc && dh > dwait ? ( dh - dwait ) / dc : 0 ) );
 		if ( superCPU.benchArmPerEmuCycle() )
+		{
 			logger->Write( "SCPU", LogNotice,
 			               "  interpreter pure: %u arm/emucycle (70 = 20MHz)",
 			               (unsigned)superCPU.benchArmPerEmuCycle() );
+			// Per 1000 emulated cycles: the stall diagnosis. A 32K two-way
+			// L1I refilling constantly, a D-cache thrashing, or a mispredict
+			// per dispatch each point at a different fix.
+			logger->Write( "SCPU", LogNotice,
+			               "  bench PMU/1k emu: instr=%u l1i=%u l1d=%u brmiss=%u",
+			               (unsigned)superCPU.m_BenchInstrPer1k,
+			               (unsigned)superCPU.m_BenchL1IRefillPer1k,
+			               (unsigned)superCPU.m_BenchL1DRefillPer1k,
+			               (unsigned)superCPU.m_BenchBranchMissPer1k );
+		}
 		logger->Write( "SCPU", LogNotice,
 		               "  bus: %llu io + %llu mirrored = %llu accesses, ~%llu%% of the time",
 		               (unsigned long long)dio, (unsigned long long)dmir,

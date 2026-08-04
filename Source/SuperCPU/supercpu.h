@@ -86,6 +86,16 @@ public:
 	// 0 when the 65816 core is not in use.
 	u32 benchArmPerEmuCycle() const { return m_BenchArmPerEmuCycle; }
 
+	// PMU event rates measured over the same benchmark, each scaled to
+	// per-1000-emulated-cycles so they read as densities. Zero on the host
+	// build, which has no A53 PMU. These are what turn "128 arm/emucycle" into
+	// a diagnosis: instruction-cache refills, data-cache refills, and branch
+	// mispredicts each demand a completely different optimisation.
+	u32 m_BenchInstrPer1k   = 0;	// instructions retired
+	u32 m_BenchL1IRefillPer1k = 0;	// I-cache refills
+	u32 m_BenchL1DRefillPer1k = 0;	// D-cache refills
+	u32 m_BenchBranchMissPer1k = 0;	// mispredicted branches
+
 	// Run the accelerator for approximately one C64 frame's worth of emulated
 	// time, then flush pending mirrored writes. Returns cycles executed.
 	u64 runFrame();

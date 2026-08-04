@@ -231,6 +231,26 @@ void CSuperCPU::benchmark65816()
 	m_Core65816.m_PC  = 0xF000;
 	m_Core65816.m_S   = 0x01FD;
 
+#if !defined( SCPU_HOST_BUILD ) && defined( __aarch64__ )
+	// Program four PMU event counters alongside the cycle counter the bus
+	// timing already owns (PMCR is enabled in lowlevel_arm64). Event numbers
+	// from the ARMv8 architectural set: 0x08 instructions retired, 0x01 L1I
+	// refill, 0x03 L1D refill, 0x10 branch mispredicted.
+	static const u32 events[ 4 ] = { 0x08, 0x01, 0x03, 0x10 };
+	for ( u32 i = 0; i < 4; i++ )
+	{
+		asm volatile( "msr PMSELR_EL0, %0" : : "r"( (u64)i ) );
+		asm volatile( "isb" );
+		asm volatile( "msr PMXEVTYPER_EL0, %0" : : "r"( (u64)events[ i ] ) );
+		asm volatile( "msr PMXEVCNTR_EL0, %0" : : "r"( (u64)0 ) );
+	}
+	u64 enset;
+	asm volatile( "mrs %0, PMCNTENSET_EL0" : "=r"( enset ) );
+	enset |= 0x0F;
+	asm volatile( "msr PMCNTENSET_EL0, %0" : : "r"( enset ) );
+	asm volatile( "isb" );
+#endif
+
 	const u64 c0 = m_Core65816.cycles();
 	const u64 h0 = m_Bus->hostCycles();
 	m_Core65816.run( 2000000 );
@@ -238,6 +258,23 @@ void CSuperCPU::benchmark65816()
 	const u64 dc = m_Core65816.cycles() - c0;
 
 	m_BenchArmPerEmuCycle = dc ? (u32)( dh / dc ) : 0;
+
+#if !defined( SCPU_HOST_BUILD ) && defined( __aarch64__ )
+	if ( dc )
+	{
+		u64 ev[ 4 ];
+		for ( u32 i = 0; i < 4; i++ )
+		{
+			asm volatile( "msr PMSELR_EL0, %0" : : "r"( (u64)i ) );
+			asm volatile( "isb" );
+			asm volatile( "mrs %0, PMXEVCNTR_EL0" : "=r"( ev[ i ] ) );
+		}
+		m_BenchInstrPer1k      = (u32)( ev[ 0 ] * 1000 / dc );
+		m_BenchL1IRefillPer1k  = (u32)( ev[ 1 ] * 1000 / dc );
+		m_BenchL1DRefillPer1k  = (u32)( ev[ 2 ] * 1000 / dc );
+		m_BenchBranchMissPer1k = (u32)( ev[ 3 ] * 1000 / dc );
+	}
+#endif
 }
 
 u32 CSuperCPU::currentClockHz() const
