@@ -347,6 +347,15 @@ private:
 	u8   m_LastCIA2PortA;
 	bool m_HaveCIA2PortA;
 	u8   m_LastVICControl[ 3 ];		// last written $D011 / $D016 / $D018
+public:
+	// The last 16 I/O accesses, newest last: addr | value<<16 | (write?1:0)<<24.
+	// Costs a store on the I/O path only -- never on the RAM hot path -- and
+	// exists so a frozen machine can say what it last did to the hardware. A
+	// freeze is almost always a wait for an I/O event that never came, and the
+	// last few accesses name the conversation that died.
+	u32 m_IOLog[ 16 ];
+	u8  m_IOLogPos;
+private:
 	u8   m_HaveVICControl;			// bitmask of which of those have a baseline
 	TimingHook m_TimingHook;
 	void      *m_TimingHookCtx;

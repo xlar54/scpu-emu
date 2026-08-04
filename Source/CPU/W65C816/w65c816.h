@@ -102,6 +102,7 @@ public:
 	void requestRunBreak() override { m_RunBreak = true; }
 	u64  cycles() const override { return m_Cycles; }
 	scpu_addr_t pc() const override { return ( (u32)m_PBR << 16 ) | m_PC; }
+	u16  stackPointer() const override { return m_S; }
 	const char *name() const override { return "WDC 65C816"; }
 
 	// --- register file, public for tracing and tests ----------------------

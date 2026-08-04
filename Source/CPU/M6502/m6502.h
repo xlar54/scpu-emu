@@ -61,6 +61,7 @@ public:
 	void requestRunBreak() override { m_RunBreak = true; }
 	u64  cycles() const override { return m_Cycles; }
 	scpu_addr_t pc() const override { return m_PC; }
+	u16  stackPointer() const override { return (u16)( 0x0100 | m_S ); }
 	const char *name() const override { return "MOS 6502"; }
 
 	// --- register file, public for tracing and unit tests -----------------

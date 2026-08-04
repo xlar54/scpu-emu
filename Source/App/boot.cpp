@@ -47,6 +47,14 @@ extern "C" void radUnmountFileSystem();
 
 static bool radBusButtonPressed();
 static bool radBusHardwareResetPressed();
+
+// Bare metal: no snprintf. Enough formatter for the freeze dumps.
+static int scpuHexByte( char *dst, u8 v )
+{
+	static const char *h = "0123456789ABCDEF";
+	dst[ 0 ] = h[ v >> 4 ]; dst[ 1 ] = h[ v & 15 ]; dst[ 2 ] = ' ';
+	return 3;
+}
 static void scpuWaitForButtonThenReboot();
 static CLogger *s_Logger;
 
@@ -70,19 +78,56 @@ static bool scpuCheckButton( void *ctx )
 
 	if ( radBusHardwareResetPressed() )
 	{
-		// Before resetting, say where the machine was. A frozen program is a
-		// loop that never exits, and the PC names the loop -- which turns "it
-		// froze" into a diagnosable report. The KERNAL's serial routines live
-		// in $ED00-$EEFF (stock) and the JiffyDOS patches around $F76E-$FC57,
-		// so the PC alone usually says whether IEC is the suspect.
+		// Before resetting, say where the machine was -- and what it was
+		// doing. Three freezes in a row sampled the identical PC, which no
+		// scattered busy-wait produces; either the stack is corrupt (an RTS
+		// storm cycles through one or two addresses) or the code itself is.
+		// The stack bytes, the code around the PC as the CPU actually sees it,
+		// and the last I/O accesses decide between those from one photo.
 		if ( s_Logger && scpu && scpu->cpu() )
+		{
+			const u32 pc = (u32)scpu->cpu()->pc();
+			const u16 sp = scpu->cpu()->stackPointer();
+
 			s_Logger->Write( "SCPU", LogNotice,
-			               "reset pressed: PC=$%06X cycles=%llu speed=%uK IEC=%s A4/A5=%02X/%02X",
-			               (unsigned)scpu->cpu()->pc(),
-			               (unsigned long long)scpu->cpu()->cycles(),
-			               (unsigned)( scpu->currentClockHz() / 1000 ),
-			               scpu->memory().iecThrottleActive() ? "slow" : "idle",
-			               scpu->memory().m_RAM[ 0xA4 ], scpu->memory().m_RAM[ 0xA5 ] );
+			               "reset pressed: PC=$%06X S=$%04X cycles=%u",
+			               (unsigned)pc, (unsigned)sp,
+			               (unsigned)scpu->cpu()->cycles() );
+
+			// 16 stack bytes upward from S (the return addresses).
+			char line[ 128 ]; int n = 0;
+			for ( u32 i = 1; i <= 16; i++ )
+				n += scpuHexByte( line + n,
+				               scpu->memory().m_RAM[ 0x0100 | ( ( sp + i ) & 0xFF ) ] );
+			line[ n ] = 0;
+			s_Logger->Write( "SCPU", LogNotice, "  stack: %s", line );
+
+			// The code around the PC, read the way the CPU reads it -- through
+			// the live map, so a corrupted shadow shows itself here.
+			if ( ( pc & 0xF000 ) != 0xD000 )
+			{
+				n = 0;
+				for ( int i = -4; i < 12; i++ )
+					n += scpuHexByte( line + n,
+					               scpu->memory().read8( (u16)( pc + i ) ) );
+				line[ n ] = 0;
+				s_Logger->Write( "SCPU", LogNotice, "  code@PC-4: %s", line );
+			}
+
+			// Last 16 I/O accesses, oldest first: rWADDR=VAL.
+			n = 0;
+			for ( u32 i = 0; i < 16; i++ )
+			{
+				const u32 e = scpu->memory().m_IOLog[ ( scpu->memory().m_IOLogPos + i ) & 15 ];
+				line[ n++ ] = ( e >> 24 ) ? 'w' : 'r';
+				n += scpuHexByte( line + n, (u8)( ( e >> 8 ) & 0xFF ) ) - 1;
+				n += scpuHexByte( line + n, (u8)( e & 0xFF ) ) - 1;
+				line[ n++ ] = '=';
+				n += scpuHexByte( line + n, (u8)( ( e >> 16 ) & 0xFF ) );
+			}
+			line[ n ] = 0;
+			s_Logger->Write( "SCPU", LogNotice, "  io: %s", line );
+		}
 
 		// Wait for release so one press is one reset, then restart the
 		// emulated machine from its reset vector. The Pi keeps running and the

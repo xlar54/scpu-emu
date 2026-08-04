@@ -62,6 +62,9 @@ public:
 	// Current program counter, for tracing and test assertions.
 	virtual scpu_addr_t pc() const = 0;
 
+	// Stack pointer as a bank-0 address, for post-mortem stack dumps.
+	virtual u16 stackPointer() const { return 0; }
+
 	virtual const char *name() const = 0;
 };
 
