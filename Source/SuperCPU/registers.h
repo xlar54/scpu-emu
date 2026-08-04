@@ -156,6 +156,13 @@ public:
 	bool turboEnabled() const        { return fastMode(); }
 	bool hardwareRegsEnabled() const { return m_HWRegsEnabled; }
 	bool bootmapEnabled() const      { return m_Bootmap; }
+
+	// Point this at CC64Memory::m_BootmapActive. A $D0B6 write then takes
+	// effect on the very next instruction fetch, which is exactly what the
+	// SuperCPU's own boot code depends on: it maps itself out and continues
+	// straight into the machine's KERNAL. Anything lazier -- updating at a
+	// frame boundary, say -- would keep executing ROM that is no longer there.
+	void trackBootmap( bool *flag ) { m_BootmapFlag = flag; applyBootmap(); }
 	bool dosExtensionEnabled() const { return m_DOSExt; }
 	u8   simmConfig() const          { return m_SIMMConfig; }
 	u8   optimRegister() const       { return m_Optim; }
@@ -177,7 +184,10 @@ private:
 	bool m_SwitchJiffy;		// physical JiffyDOS switch
 
 	bool m_HWRegsEnabled;
-	bool m_Bootmap;
+	bool  m_Bootmap;
+	bool *m_BootmapFlag;
+
+	void applyBootmap() { if ( m_BootmapFlag ) *m_BootmapFlag = m_Bootmap; }
 	bool m_DOSExt;
 	bool m_RAMLink;
 	bool m_EmulationMode;

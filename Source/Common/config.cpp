@@ -81,6 +81,7 @@ int getNextLine()
 int timingValues[ TIMING_NAMES ] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
 int cfgCPUCore = SCPU_CFG_CORE_DEFAULT;
+int cfgBootmap = SCPU_CFG_BOOTMAP_DEFAULT;
 
 char cfg[ 65536 ];
 
@@ -96,6 +97,7 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	cfgPos = cfg;
 
 	bool cpuCoreSeen = false;
+	bool bootmapSeen = false;
 
 	while ( *cfgPos != 0 )
 	{
@@ -116,6 +118,7 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 					{
 						timingValues[ i ] = atoi( ptr );
 						if ( i == 21 ) cpuCoreSeen = true;
+						if ( i == 22 ) bootmapSeen = true;
 						while ( *ptr == '\t' || *ptr == ' ' ) ptr++;
 					#ifdef DEBUG_OUT
 						logger->Write( "RaspiMenu", LogNotice, "  %s >%d< (%s)", timingNames[ i ], timingValues[ i ], ptr );
@@ -155,6 +158,10 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	// CPU_CORE 0 has to be able to select the 6502.
 	if ( cpuCoreSeen )
 		cfgCPUCore = ( timingValues[ 21 ] != 0 ) ? SCPU_CFG_CORE_65816 : SCPU_CFG_CORE_6502;
+
+	// Same reasoning: BOOTMAP 0 has to be able to turn it off.
+	if ( bootmapSeen )
+		cfgBootmap = ( timingValues[ 22 ] != 0 ) ? 1 : 0;
 
 	return 1;
 }

@@ -304,6 +304,12 @@ void scpuBootRun( CLogger *logger )
 	logger->Write( "SCPU", LogNotice, "CPU core: %s",
 	               ( core == SCPU_CORE_6502 ) ? "MOS 6502 (fallback)" : "WDC 65C816" );
 
+	// Bootmap runs CMD's own boot code before the C64's KERNAL, which is where
+	// the SuperCPU banner comes from. It is read from the config here, on the
+	// Pi, well before any emulation starts -- so BOOTMAP 0 on the SD card is
+	// always effective, however badly the emulated machine behaves with it on.
+	superCPU.setBootmapEnabled( cfgBootmap != 0 );
+
 	if ( !superCPU.init( &radBus, core, SCPU_SIMM_16MB ) )
 	{
 		// init() releases /DMA on every failure path, so the C64 is running its

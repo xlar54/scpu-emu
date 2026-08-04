@@ -176,3 +176,89 @@ TEST( map_simm_sizes_round_down_to_what_hardware_accepts )
 	r.init( 64 ); CHECK_EQ( r.sizeMB(), 16 );	// clamped to the maximum
 	r.init( 0 );  CHECK( !r.present() );
 }
+
+// ---------------------------------------------------------------------------
+// Bootmap
+// ---------------------------------------------------------------------------
+// A real SuperCPU comes out of reset with its own ROM mapped over bank 0, so
+// CMD's boot code runs before the C64's KERNAL. The layout below is VICE's
+// scpu64meminit.c at the reset configuration (mem_config $87), and the ROM is
+// indexed 1:1 by the 16-bit address -- $FFFC reads image offset $FFFC.
+
+static void fillBootROM( u8 *rom )
+{
+	// Distinctive per-address content, plus a plausible reset vector.
+	for ( u32 i = 0; i < 0x10000; i++ ) rom[ i ] = (u8)( ( i >> 8 ) ^ 0xA5 );
+	rom[ 0xFFFC ] = 0x00;
+	rom[ 0xFFFD ] = 0xFE;		// SuperCPU DOS 2.04 resets to $FE00
+}
+
+TEST( bootmap_maps_the_scpu_rom_over_bank_zero )
+{
+	static u8 rom[ 0x10000 ];
+	fillBootROM( rom );
+
+	CC64Memory mem;
+	mem.setBootmapROM( rom );
+	mem.m_BootmapActive = true;
+
+	// RAM below $8000 is untouched -- the boot code needs somewhere to work.
+	mem.m_RAM[ 0x1234 ] = 0x77;
+	CHECK_EQ( mem.read8( 0x1234 ), 0x77 );
+
+	// $8000-$CFFF and $E000-$FFFF come from the EPROM, indexed 1:1.
+	CHECK_EQ( mem.read8( 0x8000 ), rom[ 0x8000 ] );
+	CHECK_EQ( mem.read8( 0xA000 ), rom[ 0xA000 ] );
+	CHECK_EQ( mem.read8( 0xCFFF ), rom[ 0xCFFF ] );
+	CHECK_EQ( mem.read8( 0xE000 ), rom[ 0xE000 ] );
+	CHECK_EQ( mem.read8( 0xFFFC ), 0x00 );
+	CHECK_EQ( mem.read8( 0xFFFD ), 0xFE );
+
+	// ...and the reset vector a 65816 would fetch is CMD's, not the KERNAL's.
+	const u16 resetVector = (u16)( mem.read8( 0xFFFC ) | ( mem.read8( 0xFFFD ) << 8 ) );
+	CHECK_EQ( resetVector, 0xFE00 );
+}
+
+TEST( bootmap_leaves_io_and_low_ram_alone )
+{
+	static u8 rom[ 0x10000 ];
+	fillBootROM( rom );
+
+	CC64Memory mem;
+	mem.setBootmapROM( rom );
+	mem.m_BootmapActive = true;
+
+	// $D000-$DFFF stays I/O at every configuration this emulator can reach.
+	// The boot code needs the VIC-II and the CIAs, so mapping ROM over them
+	// would leave it with no screen and no keyboard.
+	CHECK_EQ( c64MapRead( 0xD020, mem.m_BankMode ), REG_IO );
+
+	// And the whole of $0000-$7FFF is still RAM.
+	mem.m_RAM[ 0x0400 ] = 0x11;
+	mem.m_RAM[ 0x7FFF ] = 0x22;
+	CHECK_EQ( mem.read8( 0x0400 ), 0x11 );
+	CHECK_EQ( mem.read8( 0x7FFF ), 0x22 );
+}
+
+TEST( bootmap_off_restores_the_normal_c64_map )
+{
+	static u8 rom[ 0x10000 ];
+	fillBootROM( rom );
+
+	static u8 kernal[ C64_KERNAL_SIZE ];
+	for ( u32 i = 0; i < C64_KERNAL_SIZE; i++ ) kernal[ i ] = 0x5A;
+
+	CC64Memory mem;
+	mem.setKernalROM( kernal );
+	mem.setBootmapROM( rom );
+	mem.m_BootmapActive = true;
+
+	CHECK_EQ( mem.read8( 0xE000 ), rom[ 0xE000 ] );
+
+	// Writing $D0B6 maps it out. The very next fetch must see the KERNAL --
+	// the boot code disables bootmap and continues straight on, so anything
+	// lazier than immediate would keep executing ROM that is no longer there.
+	mem.m_BootmapActive = false;
+	CHECK_EQ( mem.read8( 0xE000 ), 0x5A );
+	CHECK_EQ( mem.read8( 0xFFFC ), 0x5A );
+}

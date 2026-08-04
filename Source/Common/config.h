@@ -29,7 +29,7 @@
 #define _config_h
 
 
-#define TIMING_NAMES 22
+#define TIMING_NAMES 23
 const char timingNames[TIMING_NAMES][32] = {
 	"WAIT_FOR_SIGNALS", 
 	"WAIT_CYCLE_READ", 
@@ -60,7 +60,9 @@ const char timingNames[TIMING_NAMES][32] = {
 	// table because that is the whole config mechanism, and having it on the SD
 	// card means switching cores -- or falling back after a bad run -- needs no
 	// rebuild and no toolchain.
-	"CPU_CORE"
+	"CPU_CORE",
+	// Also not a timing: 1 maps the SuperCPU's own ROM over bank 0 at reset.
+	"BOOTMAP"
 };
 
 // Which CPU core boot.cpp should install. Set from CPU_CORE in the config file;
@@ -70,6 +72,12 @@ extern int cfgCPUCore;
 #define SCPU_CFG_CORE_6502      0
 #define SCPU_CFG_CORE_65816     1
 #define SCPU_CFG_CORE_DEFAULT   SCPU_CFG_CORE_65816
+
+// Whether to let the SuperCPU's own ROM run at reset. Set from BOOTMAP in the
+// config file. Ignored unless SCPU/scpu.rom is present and at least 64K.
+extern int cfgBootmap;
+
+#define SCPU_CFG_BOOTMAP_DEFAULT 1
 
 extern int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME );
 

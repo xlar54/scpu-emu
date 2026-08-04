@@ -19,15 +19,20 @@
 */
 #include "c64_memory.h"
 
+// The initialiser list follows the DECLARATION order in the header. GCC warns
+// otherwise (-Wreorder), and rightly: the compiler initialises in declaration
+// order regardless of what is written here, so a list in a different order
+// reads as a lie about what happens.
 CC64Memory::CC64Memory()
-	: m_Port00( 0x2F ), m_Port01( 0x37 ), m_BankMode( 0 ),
+	: m_BootmapActive( false ),
+	  m_Port00( 0x2F ), m_Port01( 0x37 ), m_BankMode( 0 ),
 	  m_IOReads( 0 ), m_IOWrites( 0 ), m_RamWrites( 0 ),
-	  m_PacingDebtCycles( 0 ),
-	  m_C64( 0 ), m_Mirror( 0 ), m_IO( 0 ),
 	  m_IECThrottleEvents( 0 ),
+	  m_PacingDebtCycles( 0 ),
+	  m_C64( 0 ), m_Mirror( 0 ), m_IO( 0 ), m_BootmapROM( 0 ),
+	  m_HasBasic( false ), m_HasKernal( false ), m_HasChar( false ),
 	  m_HostPerEmuQ16( 0 ), m_HostPerEmuQ16Slow( 0 ), m_PacingAnchor( 0 ),
-	  m_IECThrottleEnabled( true ), m_IECHoldCycles( 0 ),
-	  m_HasBasic( false ), m_HasKernal( false ), m_HasChar( false )
+	  m_IECThrottleEnabled( true ), m_IECHoldCycles( 0 )
 {
 	c64BankingInit();
 
@@ -134,6 +139,14 @@ u8 CC64Memory::read8( scpu_addr_t addr )
 	// software reads the cassette sense and motor lines through here too.
 	if ( a <= 1 )
 		return ( a == 0 ) ? m_Port00 : c64PortRead( m_Port00, m_Port01 );
+
+	// Bootmap sits ABOVE the PLA: while it is active the $01 banking bits do
+	// not matter for these ranges. I/O is deliberately left alone -- the boot
+	// code needs the VIC-II and the CIAs, and $D000-$DFFF stays I/O in VICE's
+	// table at every configuration this emulator can reach.
+	if ( m_BootmapActive
+	     && ( ( a >= 0x8000 && a <= 0xCFFF ) || a >= 0xE000 ) )
+		return m_BootmapROM[ a ];
 
 	switch ( c64MapRead( a, m_BankMode ) )
 	{

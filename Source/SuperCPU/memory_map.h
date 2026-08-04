@@ -63,6 +63,8 @@ public:
 	// KERNAL out of bank 0 and never needs the accelerator's ROM.
 	void setROM( const u8 *image, u32 length );
 	bool hasROM() const { return m_ROMLength != 0; }
+	const u8 *romImage() const { return m_ROM; }
+	u32  romLength() const { return m_ROMLength; }
 
 	void reset();
 

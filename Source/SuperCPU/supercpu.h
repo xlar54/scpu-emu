@@ -69,6 +69,13 @@ public:
 	void setKernalROM( const u8 *data ) { m_Memory.setKernalROM( data ); }
 	void setCharROM  ( const u8 *data ) { m_Memory.setCharROM( data ); }
 
+	// Bootmap: map the SuperCPU's own ROM over bank 0 at reset, so CMD's boot
+	// code runs before the C64's KERNAL -- which is where the SuperCPU banner
+	// comes from, and what a real card does. Needs a ROM image of at least 64K;
+	// without one this is ignored and the machine boots its own KERNAL.
+	void setBootmapEnabled( bool on ) { m_BootmapEnabled = on; }
+	bool bootmapEnabled() const       { return m_BootmapEnabled; }
+
 	void reset();
 
 	// Run the accelerator for approximately one C64 frame's worth of emulated
@@ -111,6 +118,7 @@ private:
 	ICpu    *m_CPU;
 	IC64Bus *m_Bus;
 	bool     m_Running;
+	bool     m_BootmapEnabled;
 	FrameHook m_FrameHook;
 	void     *m_FrameHookCtx;
 };

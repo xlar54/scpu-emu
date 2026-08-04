@@ -24,7 +24,7 @@ CSuperCPURegisters::CSuperCPURegisters()
 	: m_RegWrites( 0 ), m_WriteBuffer( 0 ), m_Version( SCPU_V2 ),
 	  m_Sys1MHz( false ), m_Soft1MHz( false ),
 	  m_SwitchSlow( false ), m_SwitchJiffy( false ),
-	  m_HWRegsEnabled( false ), m_Bootmap( false ),
+	  m_HWRegsEnabled( false ), m_Bootmap( true ), m_BootmapFlag( 0 ),
 	  m_DOSExt( false ), m_RAMLink( false ),
 	  m_EmulationMode( true ), m_EmulationFlag( 0 ), m_SpeedChanged( true ),
 	  m_Optim( SCPU_OPTIM_NONE ), m_SIMMConfig( 0 )
@@ -39,7 +39,10 @@ void CSuperCPURegisters::reset()
 	m_Sys1MHz       = false;
 	m_Soft1MHz      = false;
 	m_HWRegsEnabled = false;
-	m_Bootmap       = false;
+	// A real SuperCPU comes out of reset with its own ROM mapped in --
+	// VICE's scpu64_hardware_reset() sets mem_reg_bootmap = 1. Whether it
+	// takes effect depends on an image being loaded; see CSuperCPU::reset().
+	m_Bootmap       = true;
 	m_DOSExt        = false;
 	m_RAMLink       = false;
 	m_SpeedChanged  = true;
@@ -51,6 +54,7 @@ void CSuperCPURegisters::reset()
 	for ( u32 i = 0; i < SCPU_USERRAM_SIZE; i++ ) m_UserRAM[ i ] = 0;
 
 	applyOptimisation();
+	applyBootmap();
 }
 
 void CSuperCPURegisters::noteSpeedChange( bool wasFast )
@@ -263,12 +267,18 @@ bool CSuperCPURegisters::ioWrite( u16 addr, u8 value )
 
 	case SCPU_REG_PROCMODE:		// write side: disable bootmap
 		if ( m_HWRegsEnabled )
+		{
 			m_Bootmap = false;
+			applyBootmap();
+		}
 		break;
 
 	case SCPU_REG_BOOTMAP_ON:
 		if ( m_HWRegsEnabled )
+		{
 			m_Bootmap = true;
+			applyBootmap();
+		}
 		break;
 
 	case SCPU_REG_SPEEDFLAGS:

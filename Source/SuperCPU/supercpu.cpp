@@ -20,7 +20,7 @@
 #include "supercpu.h"
 
 CSuperCPU::CSuperCPU()
-	: m_CPU( 0 ), m_Bus( 0 ), m_Running( false ),
+	: m_CPU( 0 ), m_Bus( 0 ), m_Running( false ), m_BootmapEnabled( false ),
 	  m_FrameHook( 0 ), m_FrameHookCtx( 0 )
 {
 }
@@ -121,6 +121,24 @@ void CSuperCPU::reset()
 {
 	m_WriteBuffer.flush();
 	m_Memory.reset();
+
+	// Bootmap, before the registers are reset -- CSuperCPURegisters::reset()
+	// drives the live flag through trackBootmap(), so the ROM pointer has to be
+	// in place first or the flag would come up set with nothing behind it.
+	//
+	// Requires at least 64K of image: bootmap indexes the EPROM 1:1 with the
+	// 16-bit address, so anything smaller would read past the end. Without a
+	// usable image the machine simply boots its own KERNAL, which is the
+	// configuration everything up to now has been running in.
+	const bool bootmapUsable = m_BootmapEnabled
+	                        && m_MemoryMap.romImage() != 0
+	                        && m_MemoryMap.romLength() >= 0x10000;
+
+	m_Memory.setBootmapROM( bootmapUsable ? m_MemoryMap.romImage() : 0 );
+	m_Registers.trackBootmap( bootmapUsable ? &m_Memory.m_BootmapActive : 0 );
+	if ( !bootmapUsable )
+		m_Memory.m_BootmapActive = false;
+
 	m_Registers.reset();
 
 	// Put the mirroring policy back to its power-on state too, or a reset would

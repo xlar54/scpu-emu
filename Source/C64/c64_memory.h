@@ -81,6 +81,27 @@ public:
 	// and clear shadow DRAM. Does not touch the ROM images.
 	void reset();
 
+	// --- bootmap ----------------------------------------------------------
+	// A real SuperCPU comes out of reset with its OWN ROM mapped over most of
+	// bank 0, so CMD's boot code runs before the C64's KERNAL -- that is where
+	// the SuperCPU banner comes from. Writing $D0B6 maps it out again and
+	// execution continues into the machine's own KERNAL.
+	//
+	// Verified against VICE's scpu64meminit.c, at the reset configuration
+	// (mem_config $87): $8000-$CFFF and $E000-$FFFF come from the EPROM,
+	// $0000-$7FFF stays RAM, and $D000-$DFFF stays I/O. The EPROM is indexed
+	// 1:1 by the 16-bit address, so $FFFC reads image offset $FFFC.
+	//
+	// 'rom' must point at at least 64K and stay alive for the life of the
+	// object -- it is not copied.
+	void setBootmapROM( const u8 *rom ) { m_BootmapROM = rom; }
+	bool hasBootmapROM() const          { return m_BootmapROM != 0; }
+
+	// The live flag. CSuperCPURegisters points at this directly so a $D0B6
+	// write takes effect on the very next fetch, which is what the boot code
+	// depends on.
+	bool m_BootmapActive;
+
 	// --- ROM images -------------------------------------------------------
 	void setBasicROM  ( const u8 *data );	// 8K
 	void setKernalROM ( const u8 *data );	// 8K
@@ -160,6 +181,7 @@ private:
 	IC64Bus        *m_C64;
 	IMirrorSink    *m_Mirror;
 	IIOInterceptor *m_IO;
+	const u8       *m_BootmapROM;
 	bool            m_HasBasic, m_HasKernal, m_HasChar;
 
 	// Pacing state. m_HostPerEmuQ16 is host cycles per emulated cycle in 16.16
