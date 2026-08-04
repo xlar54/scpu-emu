@@ -108,6 +108,7 @@ public:
 	void invalidateRange( u16 addr, u32 length );
 
 	u32 pending() const { return m_Count; }
+	u32 pendingBytes() override { return m_Count; }
 
 	// True when there is nothing outstanding.
 	bool empty() const { return m_Count == 0; }

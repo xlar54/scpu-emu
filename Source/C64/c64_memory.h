@@ -48,6 +48,7 @@ public:
 	virtual ~IMirrorSink() {}
 	virtual void onRamWrite( u16 addr, u8 value ) = 0;
 	virtual void flush() = 0;
+	virtual u32  pendingBytes() { return 0; }
 };
 
 // Lets an accelerator claim addresses inside the I/O window before they are
