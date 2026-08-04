@@ -25,7 +25,7 @@ CWriteBuffer::CWriteBuffer()
 	  m_Bus( 0 ), m_RAM( 0 ),
 	  m_Mode( SCPU_OPT_DEFAULT ), m_ExcludeZPStack( true ),
 	  m_RangeLo( 0x0000 ), m_RangeHi( 0xFFFF ),
-	  m_Count( 0 )
+	  m_Head( 0 ), m_Count( 0 )
 {
 	clearDirty();
 	setOptMode( SCPU_OPT_DEFAULT );
@@ -130,9 +130,12 @@ void CWriteBuffer::onRamWrite( u16 addr, u8 value )
 	setDirty( addr );
 
 	// Cannot overflow: the dirty bitmap admits each address at most once and
-	// the list is sized for the whole 64K space.
+	// the ring is sized for the whole 64K space.
 	if ( m_Count < SCPU_WRITEBUF_CAPACITY )
-		m_List[ m_Count++ ] = addr;
+	{
+		m_List[ ( m_Head + m_Count ) & ( SCPU_WRITEBUF_CAPACITY - 1 ) ] = addr;
+		m_Count++;
+	}
 }
 
 void CWriteBuffer::invalidateRange( u16 addr, u32 length )
@@ -151,6 +154,7 @@ u32 CWriteBuffer::flushUpTo( u32 maxBytes )
 		// No bus attached (host tests): drop the queue rather than grow forever.
 		clearDirty();
 		m_Count = 0;
+	m_Head = 0;
 		return 0;
 	}
 
@@ -162,12 +166,13 @@ u32 CWriteBuffer::flushUpTo( u32 maxBytes )
 		if ( n > SCPU_WRITEBUF_CHUNK )     n = SCPU_WRITEBUF_CHUNK;
 		if ( n > ( maxBytes - sent ) )     n = maxBytes - sent;
 
-		// Emit from the tail so the surviving prefix stays contiguous.
-		u32 first = m_Count - n;
-
+		// Consume from the HEAD: oldest dirty address first. See the note on
+		// m_List -- flushing newest-first starves the head under continuous
+		// re-dirtying, which shows up as regions of the real screen frozen at
+		// stale contents while the rest updates.
 		for ( u32 i = 0; i < n; i++ )
 		{
-			u16 a = m_List[ first + i ];
+			u16 a = m_List[ ( m_Head + i ) & ( SCPU_WRITEBUF_CAPACITY - 1 ) ];
 			m_Burst[ i ].addr  = a;
 			m_Burst[ i ].value = m_RAM[ a ];
 		}
@@ -176,10 +181,11 @@ u32 CWriteBuffer::flushUpTo( u32 maxBytes )
 
 		for ( u32 i = 0; i < n; i++ )
 		{
-			u16 a = m_List[ first + i ];
+			u16 a = m_List[ ( m_Head + i ) & ( SCPU_WRITEBUF_CAPACITY - 1 ) ];
 			m_Dirty[ a >> 6 ] &= ~( 1ULL << ( a & 63 ) );
 		}
 
+		m_Head  = ( m_Head + n ) & ( SCPU_WRITEBUF_CAPACITY - 1 );
 		m_Count -= n;
 		sent    += n;
 	}

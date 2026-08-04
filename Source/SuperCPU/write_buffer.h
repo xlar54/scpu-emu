@@ -141,7 +141,16 @@ private:
 
 	// Dirty set: bitmap for O(1) membership, list for O(n) iteration.
 	u64 m_Dirty[ 0x10000 / 64 ];
+	// A RING, consumed oldest-first. It used to be a stack flushed from the
+	// tail, which is one line simpler -- and starves. A program that
+	// continuously re-dirties memory (a scrolling PRINT loop rewrites the
+	// whole screen every line) keeps feeding the tail, the tail keeps getting
+	// flushed first, and the head entries never drain: parts of the real
+	// screen track the shadow while others stay frozen at whatever they held
+	// minutes ago. FIFO makes every dirty byte reach the C64 in bounded time.
+	// Capacity covers the whole address space and m_Head wraps with a mask.
 	u16 m_List[ SCPU_WRITEBUF_CAPACITY ];
+	u32 m_Head;
 	u32 m_Count;
 
 	// Scratch used to build the burst handed to the bus.

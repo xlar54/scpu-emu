@@ -108,6 +108,11 @@ bool CSuperCPU::init( IC64Bus *bus, SCPUCoreType core, u32 simmMB )
 	// raster interrupts ever misbehave in a way that points here, this is the
 	// first thing to flip. See Docs/research/65816-reference.md section 6 and U2.
 
+	// Measure the interpreter before pacing is armed at a real rate --
+	// reset() below re-seeds bank 1 over the top of the benchmark loop.
+	if ( core == SCPU_CORE_65816 )
+		benchmark65816();
+
 	// Hold the emulated CPU to real time. Without this a cycle count is not a
 	// duration, and everything that measures time by counting -- IEC transfers,
 	// CIA-timed loops, raster-chasing code -- behaves wrongly.
@@ -194,6 +199,45 @@ void CSuperCPU::reset()
 
 	if ( m_CPU )
 		m_CPU->reset();
+}
+
+void CSuperCPU::benchmark65816()
+{
+	// A representative emulation-mode loop, placed in bank 1 so neither the
+	// fetches nor the data ever leave the Pi: immediate, ALU, absolute store
+	// and load (DBR=1 keeps them in bank 1), index, taken branch.
+	static const u8 loop[] = {
+		0xA2, 0x00,				// LDX #$00
+		0xA9, 0x55,				// LDA #$55
+		0x49, 0xFF,				// EOR #$FF      <- loop
+		0x8D, 0x00, 0xF1,		// STA $F100     (DBR=1 -> $01F100)
+		0xAD, 0x00, 0xF1,		// LDA $F100
+		0xE8,					// INX
+		0xD0, 0xF5,				// BNE loop
+		0x4C, 0x02, 0xF0		// JMP $F002
+	};
+	for ( u32 i = 0; i < sizeof( loop ); i++ )
+		m_MemoryMap.m_Bank1[ 0xF000 + i ] = loop[ i ];
+
+	// Pacing at an unreachable rate: the pacer never binds, and the interrupt
+	// cache samples the GPIO only once per 200 emulated cycles, so neither
+	// contaminates the measurement. reset() rearms the real rate afterwards.
+	m_Memory.setPacing( m_Bus->hostCyclesPerSec(), 200000000u );
+
+	m_Core65816.m_E   = true;
+	m_Core65816.m_P   = (u8)( W65_M | W65_X | W65_I );	// I set: IRQs masked
+	m_Core65816.m_PBR = 0x01;
+	m_Core65816.m_DBR = 0x01;
+	m_Core65816.m_PC  = 0xF000;
+	m_Core65816.m_S   = 0x01FD;
+
+	const u64 c0 = m_Core65816.cycles();
+	const u64 h0 = m_Bus->hostCycles();
+	m_Core65816.run( 2000000 );
+	const u64 dh = m_Bus->hostCycles() - h0;
+	const u64 dc = m_Core65816.cycles() - c0;
+
+	m_BenchArmPerEmuCycle = dc ? (u32)( dh / dc ) : 0;
 }
 
 u32 CSuperCPU::currentClockHz() const

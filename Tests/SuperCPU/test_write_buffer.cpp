@@ -272,3 +272,29 @@ TEST( writebuf_never_mirrors_the_io_window )
 	CHECK_EQ( f.bus.m_Cycles, 0 );
 	CHECK( f.wb.m_IOWindowSuppressed >= 2 );
 }
+
+TEST( writebuf_partial_flush_cannot_starve_old_entries )
+{
+	// The regression that showed as a half-frozen screen on real hardware. A
+	// scrolling PRINT loop re-dirties the whole screen faster than the border
+	// windows drain it; with the queue flushed newest-first, the OLDEST entries
+	// never went out at all, and their screen cells stayed at whatever the C64
+	// held minutes earlier. Oldest-first delivery is the property under test:
+	// every dirty byte must reach the machine in bounded time.
+	WBFixture f;
+	f.wb.setOptMode( SCPU_OPT_NONE );
+
+	// Dirty $0400-$04FF once, then keep re-dirtying $0500-$05FF while draining
+	// in small budgets -- the re-dirtied range plays the scrolling program.
+	for ( u32 a = 0x0400; a < 0x0500; a++ ) f.poke( (u16)a, 0x11 );
+
+	for ( int round = 0; round < 32; round++ )
+	{
+		for ( u32 a = 0x0500; a < 0x0600; a++ ) f.poke( (u16)a, (u8)round );
+		f.wb.flushUpTo( 64 );	// far less than the dirty set per round
+	}
+
+	// The original block was queued first, so it must have drained long ago.
+	for ( u32 a = 0x0400; a < 0x0500; a++ )
+		CHECK_EQ( f.bus.m_Memory[ a ], 0x11 );
+}

@@ -385,6 +385,12 @@ void scpuBootRun( CLogger *logger )
 
 	actLED.Blink( 3 );		// milestone: bus acquired
 
+	// The pure-interpreter figure, no bus and no scheduler: 70 means 20MHz.
+	if ( superCPU.benchArmPerEmuCycle() )
+		logger->Write( "SCPU", LogNotice,
+		               "interpreter: %u arm/emucycle pure (70 = 20MHz)",
+		               (unsigned)superCPU.benchArmPerEmuCycle() );
+
 	const C64Signals &sig = radBus.signals();
 	logger->Write( "SCPU", LogNotice, "SuperRAM: %u MB%s",
 	               (unsigned)superCPU.fastRAM().sizeMB(),

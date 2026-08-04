@@ -78,6 +78,14 @@ public:
 
 	void reset();
 
+	// ARM cycles per emulated cycle for a pure interpreter workload, measured
+	// at init() time by running a small loop entirely inside bank 1 -- no C64
+	// bus involvement at all. This number isolates interpreter changes from
+	// everything the frame scheduler, pacer and raster flushing add on top,
+	// so build-to-build comparisons stay honest even when those change.
+	// 0 when the 65816 core is not in use.
+	u32 benchArmPerEmuCycle() const { return m_BenchArmPerEmuCycle; }
+
 	// Run the accelerator for approximately one C64 frame's worth of emulated
 	// time, then flush pending mirrored writes. Returns cycles executed.
 	u64 runFrame();
@@ -119,6 +127,9 @@ private:
 	IC64Bus *m_Bus;
 	bool     m_Running;
 	bool     m_BootmapEnabled;
+	u32      m_BenchArmPerEmuCycle = 0;
+
+	void benchmark65816();
 	FrameHook m_FrameHook;
 	void     *m_FrameHookCtx;
 };
