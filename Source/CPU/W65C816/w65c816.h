@@ -182,6 +182,8 @@ public:
 
 	// Statistics.
 	u64 m_NativeInstructions;
+	u64 m_IRQsTaken = 0;
+	u64 m_NMIsTaken = 0;
 
 private:
 	ICpuBus            *m_Bus;

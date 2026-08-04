@@ -108,6 +108,8 @@ public:
 	CWriteBuffer       &writeBuffer() { return m_WriteBuffer; }
 	CSuperCPURegisters &registers()   { return m_Registers; }
 	ICpu               *cpu()         { return m_CPU; }
+	// Null unless the 65816 core is driving. For diagnostics only.
+	CW65C816           *core65816()   { return ( m_CPU == &m_Core65816 ) ? &m_Core65816 : 0; }
 
 	// Emulated 65816 cycles per second for each speed setting. The real
 	// hardware is 20MHz in turbo and drops to the host's own 1MHz (2MHz on a

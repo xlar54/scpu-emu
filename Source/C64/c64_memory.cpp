@@ -194,7 +194,7 @@ u8 CC64Memory::read8( scpu_addr_t addr )
 			// SuperCPU mirrors asynchronously and has the same property.
 			m_IOReads++;
 			v = m_C64 ? m_C64->read( a ) : 0xFF;
-			m_IOLog[ m_IOLogPos++ & 15 ] = (u32)a | ( (u32)v << 16 );
+			m_IOLog[ m_IOLogPos++ & 63 ] = (u32)a | ( (u32)v << 16 );
 			if ( a == 0xDD00 )
 			{
 				m_LastCIA2PortA = v;
@@ -230,7 +230,14 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 	if ( c64WriteIsIO( a, m_BankMode ) )
 	{
 		if ( m_IO && m_IO->ioWrite( a, value ) )
+		{
+			// Intercepted SuperCPU-register writes are logged too, tagged with
+			// bit 25 -- the freeze forensics need to see the WHOLE conversation,
+			// and CMD's idle loops are made almost entirely of these.
+			m_IOLog[ m_IOLogPos++ & 63 ] = (u32)a | ( (u32)value << 16 )
+			                             | ( 1u << 24 ) | ( 1u << 25 );
 			return;
+		}
 
 		// Flushing before just these restores program order where it is
 		// visible -- but only when the bits that CHANGE WHAT THE VIC LOOKS AT
@@ -326,7 +333,7 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 		//
 
 		m_IOWrites++;
-		m_IOLog[ m_IOLogPos++ & 15 ] = (u32)a | ( (u32)value << 16 ) | ( 1u << 24 );
+		m_IOLog[ m_IOLogPos++ & 63 ] = (u32)a | ( (u32)value << 16 ) | ( 1u << 24 );
 		if ( m_C64 ) m_C64->write( a, value );
 		return;
 	}

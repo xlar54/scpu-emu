@@ -252,6 +252,7 @@ u32 CW65C816::step()
 	{
 		m_NMIPending = false;
 		m_Waiting = false;
+		m_NMIsTaken++;
 		const u32 c = m_E ? 7 : 8;
 		serviceInterrupt( W65_VEC_NATIVE_NMI, W65_VEC_EMU_NMI, false );
 		m_Cycles += c;
@@ -276,6 +277,7 @@ u32 CW65C816::step()
 
 	if ( irq && !( m_P & W65_I ) )
 	{
+		m_IRQsTaken++;
 		const u32 c = m_E ? 7 : 8;
 		serviceInterrupt( W65_VEC_NATIVE_IRQ, W65_VEC_EMU_IRQ, false );
 		m_Cycles += c;

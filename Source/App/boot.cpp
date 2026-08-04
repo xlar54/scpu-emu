@@ -94,6 +94,23 @@ static bool scpuCheckButton( void *ctx )
 			               (unsigned)pc, (unsigned)sp,
 			               (unsigned)scpu->cpu()->cycles() );
 
+			// The interrupt picture, which is what an idle-loop freeze is
+			// about: P says whether IRQs are masked, the taken-counters say
+			// whether delivery ever stopped, and the live line sample says
+			// whether the hardware is even asking.
+			if ( CW65C816 *core = scpu->core65816() )
+			{
+				bool liveIRQ = false, liveNMI = false;
+				radBus.sampleInterrupts( liveIRQ, liveNMI );
+				s_Logger->Write( "SCPU", LogNotice,
+				               "  P=$%02X (I=%u) E=%u  irqsTaken=%u nmisTaken=%u  line: IRQ=%u NMI=%u",
+				               core->m_P, ( core->m_P & W65_I ) ? 1 : 0,
+				               core->m_E ? 1 : 0,
+				               (unsigned)core->m_IRQsTaken,
+				               (unsigned)core->m_NMIsTaken,
+				               liveIRQ ? 1 : 0, liveNMI ? 1 : 0 );
+			}
+
 			// 16 stack bytes upward from S (the return addresses).
 			char line[ 128 ]; int n = 0;
 			for ( u32 i = 1; i <= 16; i++ )
@@ -115,18 +132,23 @@ static bool scpuCheckButton( void *ctx )
 			}
 
 			// Last 16 I/O accesses, oldest first: rWADDR=VAL.
-			n = 0;
-			for ( u32 i = 0; i < 16; i++ )
+			// 64 accesses, oldest first, 16 per line. Lower-case = went to the
+			// real machine; upper-case W = intercepted SuperCPU register.
+			for ( u32 row = 0; row < 4; row++ )
 			{
-				const u32 e = scpu->memory().m_IOLog[ ( scpu->memory().m_IOLogPos + i ) & 15 ];
-				line[ n++ ] = ( e >> 24 ) ? 'w' : 'r';
-				n += scpuHexByte( line + n, (u8)( ( e >> 8 ) & 0xFF ) ) - 1;
-				n += scpuHexByte( line + n, (u8)( e & 0xFF ) ) - 1;
-				line[ n++ ] = '=';
-				n += scpuHexByte( line + n, (u8)( ( e >> 16 ) & 0xFF ) );
+				n = 0;
+				for ( u32 i = 0; i < 16; i++ )
+				{
+					const u32 e = scpu->memory().m_IOLog[ ( scpu->memory().m_IOLogPos + row * 16 + i ) & 63 ];
+					line[ n++ ] = ( e & ( 1u << 25 ) ) ? 'W' : ( ( e >> 24 ) ? 'w' : 'r' );
+					n += scpuHexByte( line + n, (u8)( ( e >> 8 ) & 0xFF ) ) - 1;
+					n += scpuHexByte( line + n, (u8)( e & 0xFF ) ) - 1;
+					line[ n++ ] = '=';
+					n += scpuHexByte( line + n, (u8)( ( e >> 16 ) & 0xFF ) );
+				}
+				line[ n ] = 0;
+				s_Logger->Write( "SCPU", LogNotice, "  io%u: %s", row, line );
 			}
-			line[ n ] = 0;
-			s_Logger->Write( "SCPU", LogNotice, "  io: %s", line );
 		}
 
 		// Wait for release so one press is one reset, then restart the

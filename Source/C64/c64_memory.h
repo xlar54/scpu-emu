@@ -353,8 +353,8 @@ public:
 	// exists so a frozen machine can say what it last did to the hardware. A
 	// freeze is almost always a wait for an I/O event that never came, and the
 	// last few accesses name the conversation that died.
-	u32 m_IOLog[ 16 ];
-	u8  m_IOLogPos;
+	u32 m_IOLog[ 64 ];
+	u8  m_IOLogPos;		// wraps at 64
 private:
 	u8   m_HaveVICControl;			// bitmask of which of those have a baseline
 	TimingHook m_TimingHook;
