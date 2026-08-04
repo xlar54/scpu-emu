@@ -122,6 +122,12 @@ bool CSuperCPU::init( IC64Bus *bus, SCPUCoreType core, u32 simmMB )
 		CSuperCPU *self = (CSuperCPU *)ctx;
 		self->m_Memory.setPacing( self->m_Bus->hostCyclesPerSec(),
 		                          self->currentClockHz() );
+		if ( self->m_CPU ) self->m_CPU->requestRunBreak();
+	}, this );
+	m_Memory.setTimingHook( []( void *ctx )
+	{
+		CSuperCPU *self = (CSuperCPU *)ctx;
+		if ( self->m_CPU ) self->m_CPU->requestRunBreak();
 	}, this );
 
 	reset();
@@ -207,16 +213,28 @@ u64 CSuperCPU::runFrame()
 	const u64 c64CyclesPerFrame =
 		(u64)c64CyclesPerLine( sig.video ) * (u64)c64RasterLines( sig.video );
 
-	const u32 clockHz = currentClockHz();
-	const u64 budget  = c64CyclesPerFrame * ( clockHz / SCPU_NORMAL_HZ );
+	// Account in 20MHz ticks: a turbo CPU cycle consumes one, while a 1MHz
+	// cycle consumes twenty. A speed-register write breaks run() after its
+	// current instruction, allowing the remainder to be recalculated instead
+	// of finishing a turbo-sized frame budget at 1MHz.
+	const u64 frameTicks = c64CyclesPerFrame * ( SCPU_TURBO_HZ / SCPU_NORMAL_HZ );
+	u64 ticksUsed = 0;
+	u64 executed = 0;
+	while ( ticksUsed < frameTicks )
+	{
+		const u32 selectedClockHz = currentClockHz();
+		if ( m_Registers.consumeSpeedChanged() )
+			m_Memory.setPacing( m_Bus->hostCyclesPerSec(), selectedClockHz );
 
-	// A write to $D07A/$D07B changes how long an emulated cycle is worth in
-	// real time, so the pacer has to be told. This is what finally makes the
-	// SuperCPU's speed selection mean something.
-	if ( m_Registers.consumeSpeedChanged() )
-		m_Memory.setPacing( m_Bus->hostCyclesPerSec(), clockHz );
-
-	u64 executed = m_CPU->run( budget );
+		const u32 clockHz = m_Memory.iecThrottleActive()
+		                  ? SCPU_NORMAL_HZ : selectedClockHz;
+		const u32 ticksPerCycle = SCPU_TURBO_HZ / clockHz;
+		const u64 ticksLeft = frameTicks - ticksUsed;
+		const u64 budget = ( ticksLeft + ticksPerCycle - 1 ) / ticksPerCycle;
+		const u64 ran = m_CPU->run( budget );
+		executed += ran;
+		ticksUsed += ran * ticksPerCycle;
+	}
 
 	// --- raster-scheduled mirroring ----------------------------------------
 	// Mirrored writes must not be pushed across the visible display. While the

@@ -52,6 +52,10 @@ public:
 	// which may overshoot by up to one instruction.
 	virtual u64 run( u64 nCycles ) = 0;
 
+	// End the current run() slice after the instruction in progress. This lets
+	// hardware events change timing without interrupting an instruction.
+	virtual void requestRunBreak() = 0;
+
 	// Total cycles executed since reset.
 	virtual u64 cycles() const = 0;
 

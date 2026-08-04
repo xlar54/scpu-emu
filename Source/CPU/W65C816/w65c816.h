@@ -99,6 +99,7 @@ public:
 	void reset() override;
 	u32  step() override;
 	u64  run( u64 nCycles ) override;
+	void requestRunBreak() override { m_RunBreak = true; }
 	u64  cycles() const override { return m_Cycles; }
 	scpu_addr_t pc() const override { return ( (u32)m_PBR << 16 ) | m_PC; }
 	const char *name() const override { return "WDC 65C816"; }
@@ -193,6 +194,7 @@ private:
 	inline bool busNMI();
 	inline void busTick( u32 n );
 	u64      m_Cycles;
+	bool     m_RunBreak;
 	bool     m_NMIPrevLevel;
 	bool     m_NMIPending;
 

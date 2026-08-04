@@ -210,7 +210,10 @@ public:
 	// is reused here; at 1MHz that is every cycle, i.e. the old behaviour.
 	inline void refreshInterruptsIfDue()
 	{
-		if ( m_IntCredit >= m_PacingCheckCycles && m_C64 )
+		// Under automatic IEC throttling, a nominal 20MHz cycle lasts one
+		// microsecond. Use the effective rate so the cache does not become 20us.
+		const u32 threshold = m_IECHoldCycles ? 1 : m_PacingCheckCycles;
+		if ( m_IntCredit >= threshold && m_C64 )
 		{
 			m_C64->sampleInterrupts( m_CachedIRQ, m_CachedNMI );
 			m_IntCredit = 0;
@@ -230,8 +233,17 @@ public:
 
 		const bool iecActive = ( m_IECHoldCycles != 0 );
 		if ( iecActive )
+			m_IECThrottledCycles += nCycles;
+		if ( iecActive || ( m_SelectedEmulatedHz != 0
+		                   && m_SelectedEmulatedHz <= 1000000u ) )
+			m_SlowPacedCycles += nCycles;
+		if ( iecActive )
+		{
 			m_IECHoldCycles = ( m_IECHoldCycles > nCycles )
 			                ? ( m_IECHoldCycles - nCycles ) : 0;
+			if ( m_IECHoldCycles == 0 && m_TimingHook )
+				m_TimingHook( m_TimingHookCtx );
+		}
 
 		if ( m_HostPerEmuQ16 == 0 || !m_C64 )
 			return;
@@ -297,10 +309,15 @@ public:
 	// the accelerator is nominally set to.
 	void setIECThrottle( bool enabled ) { m_IECThrottleEnabled = enabled; }
 	bool iecThrottleActive() const { return m_IECHoldCycles > 0; }
+	typedef void (*TimingHook)( void *ctx );
+	void setTimingHook( TimingHook hook, void *ctx ) { m_TimingHook = hook; m_TimingHookCtx = ctx; }
 	u64  m_IECThrottleEvents;
 
 	u64 m_PacingDebtCycles;		// emulated cycles run but not yet paid for in real time
 	u32 m_PacingCheckCycles;	// emulated cycles between consulting the host clock
+	u64 m_PacerWaitHostCycles;	// host cycles deliberately spent waiting
+	u64 m_SlowPacedCycles;		// cycles selected or forced to the 1MHz rate
+	u64 m_IECThrottledCycles;	// subset forced slow by the IEC heuristic
 public:
 	// Interrupt cache; public so the inline accessors above can live in the
 	// class body without friend gymnastics.
@@ -323,9 +340,14 @@ private:
 	u64 m_HostPerEmuQ16;		// host cycles per emulated cycle, 16.16
 	u64 m_HostPerEmuQ16Slow;	// the same at 1MHz, for IEC hold-off
 	u64 m_PacingAnchor;
+	u32 m_SelectedEmulatedHz;
 
 	bool m_IECThrottleEnabled;
 	u32  m_IECHoldCycles;		// emulated cycles left at forced 1MHz
+	u8   m_LastCIA2PortA;
+	bool m_HaveCIA2PortA;
+	TimingHook m_TimingHook;
+	void      *m_TimingHookCtx;
 };
 
 #endif

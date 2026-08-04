@@ -34,7 +34,7 @@ CW65C816::CW65C816()
 	  m_P( W65_M | W65_X | W65_I ), m_E( true ),
 	  m_Stopped( false ), m_Waiting( false ),
 	  m_NativeInstructions( 0 ),
-	  m_Bus( 0 ), m_FastBus( 0 ), m_Cycles( 0 ),
+	  m_Bus( 0 ), m_FastBus( 0 ), m_Cycles( 0 ), m_RunBreak( false ),
 	  m_NMIPrevLevel( false ), m_NMIPending( false ),
 	  m_PageCross( false ), m_BranchTaken( false ), m_EABank0( false )
 {
@@ -60,6 +60,7 @@ void CW65C816::reset()
 	m_Waiting = false;
 	m_NMIPrevLevel = false;
 	m_NMIPending = false;
+	m_RunBreak = false;
 	m_Cycles = 0;
 	m_NativeInstructions = 0;
 	m_PageCross = false;
@@ -851,7 +852,8 @@ u32 CW65C816::step()
 u64 CW65C816::run( u64 nCycles )
 {
 	const u64 start = m_Cycles;
-	while ( m_Cycles - start < nCycles )
+	m_RunBreak = false;
+	while ( m_Cycles - start < nCycles && !m_RunBreak )
 	{
 		step();
 		if ( m_Stopped )

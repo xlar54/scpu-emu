@@ -58,6 +58,7 @@ public:
 	void reset() override;
 	u32  step() override;
 	u64  run( u64 nCycles ) override;
+	void requestRunBreak() override { m_RunBreak = true; }
 	u64  cycles() const override { return m_Cycles; }
 	scpu_addr_t pc() const override { return m_PC; }
 	const char *name() const override { return "MOS 6502"; }
@@ -85,6 +86,7 @@ public:
 private:
 	ICpuBus *m_Bus;
 	u64      m_Cycles;
+	bool     m_RunBreak;
 
 	// NMI is edge triggered: remember the previous line level so that a level
 	// held low does not re-trigger every instruction.

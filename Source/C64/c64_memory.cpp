@@ -29,10 +29,14 @@ CC64Memory::CC64Memory()
 	  m_IOReads( 0 ), m_IOWrites( 0 ), m_RamWrites( 0 ),
 	  m_IECThrottleEvents( 0 ),
 	  m_PacingDebtCycles( 0 ), m_PacingCheckCycles( 1 ),
+	  m_PacerWaitHostCycles( 0 ), m_SlowPacedCycles( 0 ), m_IECThrottledCycles( 0 ),
 	  m_C64( 0 ), m_Mirror( 0 ), m_IO( 0 ), m_BootmapROM( 0 ), m_ROMShadow( 0 ),
 	  m_HasBasic( false ), m_HasKernal( false ), m_HasChar( false ),
 	  m_HostPerEmuQ16( 0 ), m_HostPerEmuQ16Slow( 0 ), m_PacingAnchor( 0 ),
-	  m_IECThrottleEnabled( true ), m_IECHoldCycles( 0 )
+	  m_SelectedEmulatedHz( 0 ),
+	  m_IECThrottleEnabled( true ), m_IECHoldCycles( 0 ),
+	  m_LastCIA2PortA( 0 ), m_HaveCIA2PortA( false ),
+	  m_TimingHook( 0 ), m_TimingHookCtx( 0 )
 {
 	c64BankingInit();
 
@@ -49,6 +53,11 @@ void CC64Memory::reset()
 	m_Port00 = 0x2F;
 	m_Port01 = 0x37;
 	m_IOReads = m_IOWrites = m_RamWrites = 0;
+	m_PacerWaitHostCycles = m_SlowPacedCycles = m_IECThrottledCycles = 0;
+	m_IECHoldCycles = 0;
+	m_HaveCIA2PortA = false;
+	m_IntCredit = 0xFFFFF;
+	m_CachedIRQ = m_CachedNMI = false;
 
 	for ( u32 i = 0; i < C64_RAM_SIZE; i++ )
 		m_RAM[ i ] = 0;
@@ -182,7 +191,13 @@ u8 CC64Memory::read8( scpu_addr_t addr )
 			// points the VIC at it may show stale data for one frame. The real
 			// SuperCPU mirrors asynchronously and has the same property.
 			m_IOReads++;
-			return m_C64 ? m_C64->read( a ) : 0xFF;
+			v = m_C64 ? m_C64->read( a ) : 0xFF;
+			if ( a == 0xDD00 )
+			{
+				m_LastCIA2PortA = v;
+				m_HaveCIA2PortA = true;
+			}
+			return v;
 		}
 
 	case REG_OPEN:
@@ -215,19 +230,32 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 			return;
 
 		// $DD00 is CIA2 port A, which carries ATN, CLK and DATA for the serial
-		// bus as well as the VIC bank select. A write here means either the
-		// KERNAL is talking to a drive or it is changing the VIC bank; arming
-		// the hold-off on both is harmless, because a bank switch is a single
-		// write and the hold-off simply lapses.
-		if ( m_IECThrottleEnabled && a == 0xDD00 )
+		// bus as well as the VIC bank select. Only IEC-line changes arm the
+		// fallback; an ordinary VIC bank change must remain at turbo speed.
+		if ( a == 0xDD00 )
 		{
-			if ( m_IECHoldCycles == 0 )
-				m_IECThrottleEvents++;
+			// Bits 0-1 select the VIC bank; bits 3-5 drive the IEC lines. A VIC
+			// bank change must not impose a 100ms serial-bus slowdown. A preceding
+			// read supplies the usual baseline; otherwise the first write does.
+			const bool iecChanged = m_HaveCIA2PortA
+			                     && ( ( m_LastCIA2PortA ^ value ) & 0x38 ) != 0;
+			m_LastCIA2PortA = value;
+			m_HaveCIA2PortA = true;
 
-			// Long enough to cover the gaps between bytes in a transfer, short
-			// enough that the machine returns to full speed promptly once the
-			// drive goes quiet. 100000 cycles is a tenth of a second at 1MHz.
-			m_IECHoldCycles = 100000;
+			// CMD's KERNAL explicitly uses $D07A/$D07B. The automatic hold is a
+			// fallback for code touching IEC while still nominally in fast mode;
+			// it must not leave a slow tail after explicit control restores turbo.
+			const bool explicitlySlow = m_SelectedEmulatedHz != 0
+			                         && m_SelectedEmulatedHz <= 1000000u;
+			if ( m_IECThrottleEnabled && iecChanged && !explicitlySlow )
+			{
+				const bool wasInactive = m_IECHoldCycles == 0;
+				if ( wasInactive )
+					m_IECThrottleEvents++;
+				m_IECHoldCycles = 100000;
+				if ( wasInactive && m_TimingHook )
+					m_TimingHook( m_TimingHookCtx );
+			}
 		}
 
 		// Mirroring is normally asynchronous -- see the note in read8() -- which
@@ -280,6 +308,15 @@ bool CC64Memory::nmiAsserted()
 
 void CC64Memory::setPacing( u64 hostCyclesPerSecond, u32 emulatedHz )
 {
+	m_SelectedEmulatedHz = emulatedHz;
+	m_PacingCheckCycles = emulatedHz / 1000000u;
+	if ( m_PacingCheckCycles < 1 ) m_PacingCheckCycles = 1;
+
+	// An explicit slow request supersedes any heuristic hold, so a later $D07B
+	// can restore turbo immediately rather than inheriting a 100ms tail.
+	if ( emulatedHz != 0 && emulatedHz <= 1000000u )
+		m_IECHoldCycles = 0;
+
 	if ( hostCyclesPerSecond == 0 || emulatedHz == 0 )
 	{
 		m_HostPerEmuQ16 = 0;			// pacing off
@@ -292,12 +329,6 @@ void CC64Memory::setPacing( u64 hostCyclesPerSecond, u32 emulatedHz )
 
 	// The rate to fall back to while the serial bus is busy.
 	m_HostPerEmuQ16Slow = ( hostCyclesPerSecond << 16 ) / 1000000ULL;
-
-	// How often it is worth consulting the host clock: about once per
-	// microsecond of emulated time. At 20MHz that is every 20 emulated cycles;
-	// at 1MHz it is every cycle, which is what it always used to be.
-	m_PacingCheckCycles = emulatedHz / 1000000u;
-	if ( m_PacingCheckCycles < 1 ) m_PacingCheckCycles = 1;
 
 	resyncPacing();
 }
@@ -344,9 +375,11 @@ void CC64Memory::tickSettle( bool iecActive )
 
 	// Ahead of schedule: wait out the difference. This is what makes a cycle
 	// count mean a duration.
+	const u64 waitStart = now;
 	do {
 		now = m_C64->hostCycles();
 	} while ( ( now - m_PacingAnchor ) < owed );
+	m_PacerWaitHostCycles += now - waitStart;
 
 	m_PacingAnchor = now;
 	m_PacingDebtCycles = 0;

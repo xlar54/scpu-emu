@@ -11,6 +11,7 @@
 #include "../../Source/CPU/M6502/m6502.h"
 #include "../../Source/SuperCPU/write_buffer.h"
 #include "../../Source/SuperCPU/registers.h"
+#include "../../Source/SuperCPU/supercpu.h"
 #include "../../Source/Bus/Host/host_bus.h"
 
 struct SystemFixture
@@ -565,30 +566,37 @@ TEST( integration_cia2_port_a_write_arms_the_iec_throttle )
 	// has the same problem and CMD document that it always drops to 1MHz for
 	// disk access; this reproduces that.
 	SystemFixture f;
-	const u8 code[] = { 0xA9, 0x07, 0x8D, 0x00, 0xDD };	// LDA #$07 / STA $DD00
+	const u8 code[] = { 0xA9, 0x07, 0x8D, 0x00, 0xDD,
+	                    0xA9, 0x17, 0x8D, 0x00, 0xDD };	// then change IEC CLK
 	f.installKernal( 0xE000, code, sizeof( code ), 0xE000 );
 	f.start();
 
 	CHECK( !f.mem.iecThrottleActive() );
 
 	f.cpu.step();		// LDA
-	f.cpu.step();		// STA $DD00 -- CIA2 port A, carries ATN/CLK/DATA
+	f.cpu.step();		// first STA establishes the CIA2 output baseline
+	CHECK( !f.mem.iecThrottleActive() );
+	f.cpu.step();
+	f.cpu.step();		// IEC bit change arms the fallback
 
 	CHECK( f.mem.iecThrottleActive() );
 	CHECK_EQ( f.mem.m_IECThrottleEvents, 1 );
 
 	// The write still reaches the real chip; throttling is a side effect, not a
 	// substitution.
-	CHECK_EQ( f.bus.m_Memory[ 0xDD00 ], 0x07 );
+	CHECK_EQ( f.bus.m_Memory[ 0xDD00 ], 0x17 );
 }
 
 TEST( integration_iec_throttle_lapses_after_the_bus_goes_quiet )
 {
 	SystemFixture f;
-	const u8 code[] = { 0xA9, 0x07, 0x8D, 0x00, 0xDD, 0xEA };
+	const u8 code[] = { 0xA9, 0x07, 0x8D, 0x00, 0xDD,
+	                    0xA9, 0x17, 0x8D, 0x00, 0xDD, 0xEA };
 	f.installKernal( 0xE000, code, sizeof( code ), 0xE000 );
 	f.start();
 
+	f.cpu.step();
+	f.cpu.step();
 	f.cpu.step();
 	f.cpu.step();
 	CHECK( f.mem.iecThrottleActive() );
@@ -602,12 +610,160 @@ TEST( integration_iec_throttle_lapses_after_the_bus_goes_quiet )
 TEST( integration_iec_throttle_can_be_disabled )
 {
 	SystemFixture f;
-	const u8 code[] = { 0xA9, 0x07, 0x8D, 0x00, 0xDD };
+	const u8 code[] = { 0xA9, 0x07, 0x8D, 0x00, 0xDD,
+	                    0xA9, 0x17, 0x8D, 0x00, 0xDD };
 	f.installKernal( 0xE000, code, sizeof( code ), 0xE000 );
 	f.start();
 	f.mem.setIECThrottle( false );
 
 	f.cpu.step();
 	f.cpu.step();
+	f.cpu.step();
+	f.cpu.step();
 	CHECK( !f.mem.iecThrottleActive() );
+}
+
+TEST( integration_vic_bank_changes_do_not_arm_iec_throttle )
+{
+	SystemFixture f;
+	const u8 code[] = { 0xA9, 0x37, 0x8D, 0x00, 0xDD,
+	                    0xA9, 0x36, 0x8D, 0x00, 0xDD };
+	f.installKernal( 0xE000, code, sizeof( code ), 0xE000 );
+	f.start();
+	f.cpu.run( 12 );
+
+	CHECK( !f.mem.iecThrottleActive() );
+	CHECK_EQ( f.mem.m_IECThrottleEvents, 0 );
+}
+
+TEST( integration_cia2_read_provides_iec_throttle_baseline )
+{
+	SystemFixture f;
+	f.start();
+	f.bus.m_Memory[ 0xDD00 ] = 0x17;
+	CHECK_EQ( f.mem.read8( 0xDD00 ), 0x17 );
+	f.mem.write8( 0xDD00, 0x07 );
+
+	CHECK( f.mem.iecThrottleActive() );
+}
+
+TEST( integration_explicit_slow_mode_supersedes_iec_fallback )
+{
+	SystemFixture f;
+	f.start();
+	f.mem.setPacing( 0, SCPU_NORMAL_HZ );
+	f.mem.write8( 0xDD00, 0x07 );
+	f.mem.write8( 0xDD00, 0x17 );
+
+	CHECK( !f.mem.iecThrottleActive() );
+}
+
+TEST( integration_iec_throttle_uses_effective_interrupt_sample_rate )
+{
+	struct CountingBus : CHostBus
+	{
+		u32 samples = 0;
+		void sampleInterrupts( bool &irq, bool &nmi ) override
+		{
+			samples++;
+			irq = m_IRQ;
+			nmi = m_NMI;
+		}
+	} bus;
+
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.setPacing( 0, SCPU_TURBO_HZ );
+	mem.reset();
+	mem.irqAsserted();
+	CHECK_EQ( bus.samples, 1 );
+
+	mem.tickFast( 1 );
+	mem.irqAsserted();
+	CHECK_EQ( bus.samples, 1 );		// nominal turbo cache interval is 20 cycles
+
+	mem.write8( 0xDD00, 0x07 );
+	mem.write8( 0xDD00, 0x17 );
+	CHECK( mem.iecThrottleActive() );
+	mem.irqAsserted();
+	CHECK_EQ( bus.samples, 2 );		// effective 1MHz interval is one cycle
+}
+
+TEST( integration_reset_expires_iec_and_refreshes_interrupt_cache )
+{
+	struct CountingBus : CHostBus
+	{
+		u32 samples = 0;
+		void sampleInterrupts( bool &irq, bool &nmi ) override
+		{
+			samples++;
+			irq = m_IRQ;
+			nmi = m_NMI;
+		}
+	} bus;
+
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	bus.m_NMI = true;
+	CHECK( mem.nmiAsserted() );
+	mem.write8( 0xDD00, 0x07 );
+	mem.write8( 0xDD00, 0x17 );
+	CHECK( mem.iecThrottleActive() );
+
+	bus.m_NMI = false;
+	mem.reset();
+	CHECK( !mem.iecThrottleActive() );
+	CHECK( !mem.nmiAsserted() );
+	CHECK_EQ( bus.samples, 2 );
+}
+
+TEST( integration_frame_budget_recalculates_after_speed_change )
+{
+	CHostBus bus;
+	CSuperCPU scpu;
+	u8 basic[ C64_BASIC_SIZE ];
+	u8 kernal[ C64_KERNAL_SIZE ];
+	std::memset( basic, 0xEA, sizeof( basic ) );
+	std::memset( kernal, 0xEA, sizeof( kernal ) );
+
+	const u8 code[] = { 0xA9, 0x00,			// LDA #$00
+	                    0x8D, 0x7A, 0xD0,	// STA $D07A -- switch to 1MHz
+	                    0x4C, 0x05, 0xE0 };	// JMP $E005
+	std::memcpy( kernal, code, sizeof( code ) );
+	kernal[ 0x1FFC ] = 0x00;
+	kernal[ 0x1FFD ] = 0xE0;
+	scpu.setBasicROM( basic );
+	scpu.setKernalROM( kernal );
+	CHECK( scpu.init( &bus, SCPU_CORE_65816, 0 ) );
+
+	const u64 ran = scpu.runFrame();
+	CHECK( !scpu.registers().fastMode() );
+	CHECK( ran > 19000 );
+	CHECK( ran < 21000 );	// old stale turbo budget ran about 393,000 cycles
+}
+
+TEST( integration_frame_budget_counts_automatic_iec_throttle_as_slow )
+{
+	CHostBus bus;
+	CSuperCPU scpu;
+	u8 basic[ C64_BASIC_SIZE ];
+	u8 kernal[ C64_KERNAL_SIZE ];
+	std::memset( basic, 0xEA, sizeof( basic ) );
+	std::memset( kernal, 0xEA, sizeof( kernal ) );
+
+	const u8 code[] = { 0xA9, 0x07, 0x8D, 0x00, 0xDD,
+	                    0xA9, 0x17, 0x8D, 0x00, 0xDD,
+	                    0x4C, 0x0A, 0xE0 };
+	std::memcpy( kernal, code, sizeof( code ) );
+	kernal[ 0x1FFC ] = 0x00;
+	kernal[ 0x1FFD ] = 0xE0;
+	scpu.setBasicROM( basic );
+	scpu.setKernalROM( kernal );
+	CHECK( scpu.init( &bus, SCPU_CORE_6502, 0 ) );
+
+	const u64 ran = scpu.runFrame();
+	CHECK( scpu.registers().fastMode() );
+	CHECK( scpu.memory().iecThrottleActive() );
+	CHECK( ran > 19000 );
+	CHECK( ran < 21000 );
 }

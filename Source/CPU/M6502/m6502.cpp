@@ -23,7 +23,7 @@
 CM6502::CM6502()
 	: m_A( 0 ), m_X( 0 ), m_Y( 0 ), m_S( 0xFD ), m_P( M6502_U | M6502_I ),
 	  m_PC( 0 ), m_Jammed( false ), m_RMWDummyWrite( true ),
-	  m_Bus( 0 ), m_Cycles( 0 ),
+	  m_Bus( 0 ), m_Cycles( 0 ), m_RunBreak( false ),
 	  m_NMIPrevLevel( false ), m_NMIPending( false )
 {
 }
@@ -36,6 +36,7 @@ void CM6502::reset()
 	m_Jammed = false;
 	m_NMIPrevLevel = false;
 	m_NMIPending = false;
+	m_RunBreak = false;
 	m_Cycles = 0;
 	m_PC = rd16( M6502_VEC_RESET );
 }
@@ -524,7 +525,8 @@ u32 CM6502::step()
 u64 CM6502::run( u64 nCycles )
 {
 	u64 start = m_Cycles;
-	while ( m_Cycles - start < nCycles )
+	m_RunBreak = false;
+	while ( m_Cycles - start < nCycles && !m_RunBreak )
 	{
 		step();
 		if ( m_Jammed )

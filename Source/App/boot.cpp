@@ -77,9 +77,12 @@ static bool scpuCheckButton( void *ctx )
 		// so the PC alone usually says whether IEC is the suspect.
 		if ( s_Logger && scpu && scpu->cpu() )
 			s_Logger->Write( "SCPU", LogNotice,
-			               "reset pressed: PC was $%06X after %u cycles",
+			               "reset pressed: PC=$%06X cycles=%llu speed=%uK IEC=%s A4/A5=%02X/%02X",
 			               (unsigned)scpu->cpu()->pc(),
-			               (unsigned)scpu->cpu()->cycles() );
+			               (unsigned long long)scpu->cpu()->cycles(),
+			               (unsigned)( scpu->currentClockHz() / 1000 ),
+			               scpu->memory().iecThrottleActive() ? "slow" : "idle",
+			               scpu->memory().m_RAM[ 0xA4 ], scpu->memory().m_RAM[ 0xA5 ] );
 
 		// Wait for release so one press is one reset, then restart the
 		// emulated machine from its reset vector. The Pi keeps running and the
@@ -226,9 +229,9 @@ static void scpuDumpEmulatedScreen( CLogger *logger, CSuperCPU &scpu )
 	}
 
 	logger->Write( "SCPU", LogNotice,
-	               "PC=$%04X  cycles=%u  memtop($37/$38)=$%02X%02X",
+	               "PC=$%06X  cycles=%llu  memtop($37/$38)=$%02X%02X",
 	               (unsigned)scpu.cpu()->pc(),
-	               (unsigned)scpu.cpu()->cycles(),
+	               (unsigned long long)scpu.cpu()->cycles(),
 	               ram[ 0x38 ], ram[ 0x37 ] );
 
 	// Achieved speed. The selected speed is only a request: if the interpreter
@@ -240,6 +243,9 @@ static void scpuDumpEmulatedScreen( CLogger *logger, CSuperCPU &scpu )
 		const u64 h0 = radBus.hostCycles();
 		const u64 io0 = scpu.memory().m_IOReads + scpu.memory().m_IOWrites;
 		const u64 mir0 = scpu.writeBuffer().m_BytesFlushed;
+		const u64 wait0 = scpu.memory().m_PacerWaitHostCycles;
+		const u64 slow0 = scpu.memory().m_SlowPacedCycles;
+		const u64 iec0 = scpu.memory().m_IECThrottledCycles;
 
 		for ( u32 i = 0; i < 60; i++ ) scpu.runFrame();
 
@@ -247,15 +253,25 @@ static void scpuDumpEmulatedScreen( CLogger *logger, CSuperCPU &scpu )
 		const u64 dh  = radBus.hostCycles() - h0;
 		const u64 dio = ( scpu.memory().m_IOReads + scpu.memory().m_IOWrites ) - io0;
 		const u64 dmir = scpu.writeBuffer().m_BytesFlushed - mir0;
+		const u64 dwait = scpu.memory().m_PacerWaitHostCycles - wait0;
+		const u64 dslow = scpu.memory().m_SlowPacedCycles - slow0;
+		const u64 diec = scpu.memory().m_IECThrottledCycles - iec0;
+		const u64 dfast = dc > dslow ? dc - dslow : 0;
 
 		const u32 achievedKHz = dh ? (u32)( ( dc * ( SCPU_ARM_CLOCK_HZ / 1000 ) ) / dh ) : 0;
+		const u64 expectedHost = dfast * ( SCPU_ARM_CLOCK_HZ / SCPU_TURBO_HZ )
+		                       + dslow * ( SCPU_ARM_CLOCK_HZ / SCPU_NORMAL_HZ );
 
 		logger->Write( "SCPU", LogNotice,
-		               "speed: asked for %u kHz, achieving %u kHz (%s)",
-		               (unsigned)( scpu.currentClockHz() / 1000 ),
+		               "speed: aggregate %u kHz, schedule %llu%% (%s)",
 		               (unsigned)achievedKHz,
-		               ( achievedKHz * 100 >= ( scpu.currentClockHz() / 1000 ) * 90 )
+		               (unsigned long long)( dh ? ( expectedHost * 100 ) / dh : 0 ),
+		               ( expectedHost * 100 >= dh * 90 )
 		                   ? "keeping up" : "FALLING BEHIND -- timing will drift" );
+		logger->Write( "SCPU", LogNotice,
+		               "  modes: %llu turbo + %llu slow cycles (%llu IEC-forced)",
+		               (unsigned long long)dfast, (unsigned long long)dslow,
+		               (unsigned long long)diec );
 
 		// Where the time actually went. Without this the speed figure says only
 		// THAT we are behind, never WHY, and the two candidate explanations --
@@ -272,6 +288,10 @@ static void scpuDumpEmulatedScreen( CLogger *logger, CSuperCPU &scpu )
 		               "  %llu emu cycles in %llu arm cycles = %llu arm/emucycle",
 		               (unsigned long long)dc, (unsigned long long)dh,
 		               (unsigned long long)( dc ? dh / dc : 0 ) );
+		logger->Write( "SCPU", LogNotice,
+		               "  pacer waited %llu arm cycles; excluding waits: %llu arm/emucycle",
+		               (unsigned long long)dwait,
+		               (unsigned long long)( dc && dh > dwait ? ( dh - dwait ) / dc : 0 ) );
 		logger->Write( "SCPU", LogNotice,
 		               "  bus: %llu io + %llu mirrored = %llu accesses, ~%llu%% of the time",
 		               (unsigned long long)dio, (unsigned long long)dmir,
