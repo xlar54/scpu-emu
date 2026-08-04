@@ -24,7 +24,9 @@ CC64Memory::CC64Memory()
 	  m_IOReads( 0 ), m_IOWrites( 0 ), m_RamWrites( 0 ),
 	  m_PacingDebtCycles( 0 ),
 	  m_C64( 0 ), m_Mirror( 0 ), m_IO( 0 ),
-	  m_HostPerEmuQ16( 0 ), m_PacingAnchor( 0 ),
+	  m_IECThrottleEvents( 0 ),
+	  m_HostPerEmuQ16( 0 ), m_HostPerEmuQ16Slow( 0 ), m_PacingAnchor( 0 ),
+	  m_IECThrottleEnabled( true ), m_IECHoldCycles( 0 ),
 	  m_HasBasic( false ), m_HasKernal( false ), m_HasChar( false )
 {
 	c64BankingInit();
@@ -196,6 +198,22 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 		if ( m_IO && m_IO->ioWrite( a, value ) )
 			return;
 
+		// $DD00 is CIA2 port A, which carries ATN, CLK and DATA for the serial
+		// bus as well as the VIC bank select. A write here means either the
+		// KERNAL is talking to a drive or it is changing the VIC bank; arming
+		// the hold-off on both is harmless, because a bank switch is a single
+		// write and the hold-off simply lapses.
+		if ( m_IECThrottleEnabled && a == 0xDD00 )
+		{
+			if ( m_IECHoldCycles == 0 )
+				m_IECThrottleEvents++;
+
+			// Long enough to cover the gaps between bytes in a transfer, short
+			// enough that the machine returns to full speed promptly once the
+			// drive goes quiet. 100000 cycles is a tenth of a second at 1MHz.
+			m_IECHoldCycles = 100000;
+		}
+
 		// No flush here either -- see the note in read8().
 		m_IOWrites++;
 		if ( m_C64 ) m_C64->write( a, value );
@@ -232,6 +250,9 @@ void CC64Memory::setPacing( u64 hostCyclesPerSecond, u32 emulatedHz )
 	// 1MHz emulated that is 1400.0; at 20MHz it is 70.0.
 	m_HostPerEmuQ16 = ( hostCyclesPerSecond << 16 ) / (u64)emulatedHz;
 
+	// The rate to fall back to while the serial bus is busy.
+	m_HostPerEmuQ16Slow = ( hostCyclesPerSecond << 16 ) / 1000000ULL;
+
 	resyncPacing();
 }
 
@@ -244,13 +265,25 @@ void CC64Memory::resyncPacing()
 
 void CC64Memory::tick( u32 nCycles )
 {
+	// The serial-bus hold-off counts down whether or not pacing is armed, so
+	// that its lifetime is a property of the emulated machine rather than of
+	// how the host happens to be configured. The host tests run unpaced.
+	const bool iecActive = ( m_IECHoldCycles != 0 );
+	if ( iecActive )
+		m_IECHoldCycles = ( m_IECHoldCycles > nCycles )
+		                ? ( m_IECHoldCycles - nCycles ) : 0;
+
 	if ( m_HostPerEmuQ16 == 0 || !m_C64 )
 		return;
 
 	m_PacingDebtCycles += nCycles;
 
+	// While the serial bus is active, run at 1MHz whatever speed is selected --
+	// the KERNAL's bit timing depends on it. See setIECThrottle().
+	const u64 rate = iecActive ? m_HostPerEmuQ16Slow : m_HostPerEmuQ16;
+
 	// How much real time those emulated cycles were supposed to take.
-	const u64 owed = ( m_PacingDebtCycles * m_HostPerEmuQ16 ) >> 16;
+	const u64 owed = ( m_PacingDebtCycles * rate ) >> 16;
 	const u64 spent = m_C64->hostCycles() - m_PacingAnchor;
 
 	if ( spent >= owed )

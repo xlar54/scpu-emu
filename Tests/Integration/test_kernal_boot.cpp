@@ -512,3 +512,58 @@ TEST( integration_hardware_registers_gate_the_optimisation_selects )
 	f.regs.ioWrite( SCPU_REG_SOFT_1MHZ_OFF, 0 );
 	CHECK( f.regs.fastMode() );
 }
+
+TEST( integration_cia2_port_a_write_arms_the_iec_throttle )
+{
+	// The KERNAL times its serial-bus bits by counting cycles, and those counts
+	// assume a 1MHz CPU. At 20MHz every pulse is twenty times too short and no
+	// drive answers -- which presents as DEVICE NOT PRESENT. A real SuperCPU
+	// has the same problem and CMD document that it always drops to 1MHz for
+	// disk access; this reproduces that.
+	SystemFixture f;
+	const u8 code[] = { 0xA9, 0x07, 0x8D, 0x00, 0xDD };	// LDA #$07 / STA $DD00
+	f.installKernal( 0xE000, code, sizeof( code ), 0xE000 );
+	f.start();
+
+	CHECK( !f.mem.iecThrottleActive() );
+
+	f.cpu.step();		// LDA
+	f.cpu.step();		// STA $DD00 -- CIA2 port A, carries ATN/CLK/DATA
+
+	CHECK( f.mem.iecThrottleActive() );
+	CHECK_EQ( f.mem.m_IECThrottleEvents, 1 );
+
+	// The write still reaches the real chip; throttling is a side effect, not a
+	// substitution.
+	CHECK_EQ( f.bus.m_Memory[ 0xDD00 ], 0x07 );
+}
+
+TEST( integration_iec_throttle_lapses_after_the_bus_goes_quiet )
+{
+	SystemFixture f;
+	const u8 code[] = { 0xA9, 0x07, 0x8D, 0x00, 0xDD, 0xEA };
+	f.installKernal( 0xE000, code, sizeof( code ), 0xE000 );
+	f.start();
+
+	f.cpu.step();
+	f.cpu.step();
+	CHECK( f.mem.iecThrottleActive() );
+
+	// It is a countdown in emulated cycles, so quiet time lets it expire and
+	// the machine returns to full speed rather than being stuck slow.
+	f.cpu.run( 200000 );
+	CHECK( !f.mem.iecThrottleActive() );
+}
+
+TEST( integration_iec_throttle_can_be_disabled )
+{
+	SystemFixture f;
+	const u8 code[] = { 0xA9, 0x07, 0x8D, 0x00, 0xDD };
+	f.installKernal( 0xE000, code, sizeof( code ), 0xE000 );
+	f.start();
+	f.mem.setIECThrottle( false );
+
+	f.cpu.step();
+	f.cpu.step();
+	CHECK( !f.mem.iecThrottleActive() );
+}

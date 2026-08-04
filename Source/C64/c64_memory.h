@@ -140,6 +140,20 @@ public:
 	void setPacing( u64 hostCyclesPerSecond, u32 emulatedHz );
 	void resyncPacing();
 
+	// --- automatic 1MHz for serial bus activity ---------------------------
+	// The KERNAL's IEC routines count cycles to time the bits they bang out on
+	// the serial lines, and those counts assume a 1MHz CPU. Run them at 20MHz
+	// and every pulse is twenty times too short, so no drive ever answers.
+	//
+	// A real SuperCPU has exactly this problem and solves it the same way: CMD
+	// document that it "always throttles to 1MHz for disk access regardless of
+	// the speed setting". Writing to CIA2 port A -- which carries ATN, CLK and
+	// DATA -- arms a hold-off, during which pacing runs at 1MHz whatever speed
+	// the accelerator is nominally set to.
+	void setIECThrottle( bool enabled ) { m_IECThrottleEnabled = enabled; }
+	bool iecThrottleActive() const { return m_IECHoldCycles > 0; }
+	u64  m_IECThrottleEvents;
+
 	u64 m_PacingDebtCycles;		// emulated cycles run but not yet paid for in real time
 
 private:
@@ -151,8 +165,12 @@ private:
 	// Pacing state. m_HostPerEmuQ16 is host cycles per emulated cycle in 16.16
 	// fixed point, so the common case is a multiply and a shift rather than a
 	// division per instruction.
-	u64 m_HostPerEmuQ16;
+	u64 m_HostPerEmuQ16;		// host cycles per emulated cycle, 16.16
+	u64 m_HostPerEmuQ16Slow;	// the same at 1MHz, for IEC hold-off
 	u64 m_PacingAnchor;
+
+	bool m_IECThrottleEnabled;
+	u32  m_IECHoldCycles;		// emulated cycles left at forced 1MHz
 };
 
 #endif
