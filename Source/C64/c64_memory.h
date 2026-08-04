@@ -233,6 +233,15 @@ public:
 		if ( m_IntCredit < 0x100000 )
 			m_IntCredit += nCycles;
 
+		// The serial-activity window counts down here. Without this decrement
+		// the flag armed at CMD's boot-time drive probe and never expired:
+		// mirror flushing stayed suppressed forever, the splash blanked the
+		// real screen and drew into shadow that never went out -- a machine
+		// running perfectly behind a black display.
+		if ( m_IECActivityCycles )
+			m_IECActivityCycles = ( m_IECActivityCycles > nCycles )
+			                    ? ( m_IECActivityCycles - nCycles ) : 0;
+
 		const bool iecActive = ( m_IECHoldCycles != 0 );
 		if ( iecActive )
 			m_IECThrottledCycles += nCycles;

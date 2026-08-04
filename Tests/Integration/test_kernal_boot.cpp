@@ -804,3 +804,27 @@ TEST( integration_serial_toggles_on_dd00_do_not_flush )
 	f.wb.flush();
 	CHECK_EQ( f.bus.m_Memory[ 0x0400 ], 0x41 );
 }
+
+TEST( integration_iec_activity_window_expires )
+{
+	// The black-screen regression, pinned. The serial-activity window
+	// suppresses mirror flushing during a transaction; if it never counts
+	// down, one boot-time serial probe suppresses mirroring FOREVER and the
+	// machine runs perfectly behind a blank display. Arm it, run emulated
+	// time past the window, and require it to expire.
+	SystemFixture f;
+	const u8 code[] = { 0xEA, 0x4C, 0x00, 0xE0 };	// NOP / JMP loop
+	f.installKernal( 0xE000, code, sizeof( code ), 0xE000 );
+	f.start();
+
+	// Seed the baseline, then a serial-line transition arms the window.
+	f.mem.read8( 0xDD00 );
+	u8 v = f.bus.m_Memory[ 0xDD00 ];
+	f.mem.write8( 0xDD00, (u8)( v ^ 0x08 ) );
+	CHECK( f.mem.iecBusActive() );
+
+	// The same transition also arms the 100000-cycle speed hold, and
+	// iecBusActive() covers both -- so run past the LONGER window.
+	for ( u32 i = 0; i < 110000; i++ ) f.mem.tickFast( 1 );
+	CHECK( !f.mem.iecBusActive() );
+}
