@@ -86,11 +86,17 @@ triggered and IRQ level triggered, as on real silicon.
 
 ## Known gaps
 
-- The 65816 core is not written yet; milestone 1 runs the 6502 core. Banks other
-  than 0 therefore do not exist yet.
-- Cycle *pacing* is not implemented: `runFrame()` computes a budget but nothing
-  yet holds the emulated CPU to real time, so raster-dependent code will not
-  behave until `SuperCPU/timing` lands.
+- The 65816 core has not yet driven physical hardware — only the 6502 core has.
+  `CPU_CORE` in `scpu.cfg` selects between them.
+- `MVN`/`MVP` into shadowed bank 0 produce one mirrored write per byte. A 64KB
+  block move is a single instruction that dirties the whole bank, and the write
+  buffer needs a range-invalidate path rather than 65536 individual entries.
+- Two questions about the chip are open rather than settled, and both are
+  testable on hardware in minutes: whether the direct-page pointer of `(d)`,
+  `(d,X)` and `(d),Y` wraps in-page in emulation mode, and whether the
+  SuperCPU's gate array forwards the emulation-mode read-modify-write dummy
+  write. See [research/65816-reference.md](research/65816-reference.md)
+  section 1.3.
 - The character ROM cannot be snapshotted off the machine — see
   [research/supercpu-memory-map.md](research/supercpu-memory-map.md).
 - None of the hardware paths have been run on real hardware yet. See

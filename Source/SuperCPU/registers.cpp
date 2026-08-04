@@ -26,7 +26,7 @@ CSuperCPURegisters::CSuperCPURegisters()
 	  m_SwitchSlow( false ), m_SwitchJiffy( false ),
 	  m_HWRegsEnabled( false ), m_Bootmap( false ),
 	  m_DOSExt( false ), m_RAMLink( false ),
-	  m_EmulationMode( true ), m_SpeedChanged( true ),
+	  m_EmulationMode( true ), m_EmulationFlag( 0 ), m_SpeedChanged( true ),
 	  m_Optim( SCPU_OPTIM_NONE ), m_SIMMConfig( 0 )
 {
 	reset();
@@ -136,7 +136,10 @@ bool CSuperCPURegisters::ioRead( u16 addr, u8 &value )
 		break;
 
 	case SCPU_REG_PROCMODE:
-		v = m_EmulationMode ? SCPU_PROC_EMULATION : 0x00;
+		{
+			const bool emu = m_EmulationFlag ? *m_EmulationFlag : m_EmulationMode;
+			v = emu ? SCPU_PROC_EMULATION : 0x00;
+		}
 		break;
 
 	case SCPU_REG_SPEEDFLAGS:

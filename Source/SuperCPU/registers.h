@@ -126,9 +126,15 @@ public:
 
 	bool speedSwitchAllowsTurbo() const { return !m_SwitchSlow; }
 
-	// Emulation vs native mode, reported at $D0B6. The 65816 core drives this
-	// from its E flag; the 6502 core is always in emulation mode.
+	// Emulation vs native mode, reported at $D0B6. The 6502 core is always in
+	// emulation mode, so setEmulationMode() is enough for it.
 	void setEmulationMode( bool emulation ) { m_EmulationMode = emulation; }
+
+	// The 65816 changes mode with a single XCE, and software can read $D0B6 in
+	// the very next instruction -- so a per-frame snapshot would be stale. Point
+	// this at the core's E flag instead and the register reports the live state.
+	// Null with the 6502 core, which falls back to setEmulationMode().
+	void trackEmulationMode( const bool *emulationFlag ) { m_EmulationFlag = emulationFlag; }
 
 	void reset();
 
@@ -175,6 +181,7 @@ private:
 	bool m_DOSExt;
 	bool m_RAMLink;
 	bool m_EmulationMode;
+	const bool *m_EmulationFlag;
 	bool m_SpeedChanged;
 
 	u8   m_Optim;			// bits 7-6 mode; bits 2-0 OR'd into every $D0Bx read

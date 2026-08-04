@@ -241,7 +241,16 @@ void scpuBootRun( CLogger *logger )
 
 	radBus.setLogger( logger );
 
-	if ( !superCPU.init( &radBus, SCPU_CORE_6502, SCPU_SIMM_16MB ) )
+	// Which core: the 65816 is the real accelerator, the 6502 is milestone-1
+	// scaffolding kept as a fallback. CPU_CORE in scpu.cfg decides, so a bad run
+	// can be backed out by editing one line on the SD card.
+	const SCPUCoreType core = ( cfgCPUCore == SCPU_CFG_CORE_6502 )
+	                        ? SCPU_CORE_6502 : SCPU_CORE_65816;
+
+	logger->Write( "SCPU", LogNotice, "CPU core: %s",
+	               ( core == SCPU_CORE_6502 ) ? "MOS 6502 (fallback)" : "WDC 65C816" );
+
+	if ( !superCPU.init( &radBus, core, SCPU_SIMM_16MB ) )
 	{
 		// init() releases /DMA on every failure path, so the C64 is running its
 		// own CPU again and is usable -- it simply has no accelerator.

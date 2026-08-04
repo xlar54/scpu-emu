@@ -64,27 +64,49 @@ bool CSuperCPU::init( IC64Bus *bus, SCPUCoreType core, u32 simmMB )
 		return false;
 	}
 
+	// Which core, and -- just as importantly -- what it is attached to.
+	//
+	// The 65816 goes on the 24-bit memory map, so bank 0 is the C64 and
+	// everything above it is SuperRAM. The 6502 goes straight to CC64Memory
+	// instead: it has no way to name an address above $FFFF, so the map would be
+	// a dispatch on the hot path that could never take its second branch.
 	switch ( core )
 	{
 	case SCPU_CORE_65816:
-		// Not yet implemented -- fall back rather than run with no core.
-		// See Docs/roadmap.md.
-		m_CPU = &m_Core6502;
+		m_CPU = &m_Core65816;
+		m_CPU->attachBus( &m_MemoryMap );
+		m_Registers.trackEmulationMode( &m_Core65816.m_E );
 		break;
 
 	case SCPU_CORE_6502:
 	default:
 		m_CPU = &m_Core6502;
+		m_CPU->attachBus( &m_Memory );
+		m_Registers.trackEmulationMode( 0 );
+		m_Registers.setEmulationMode( true );
 		break;
 	}
 
-	// The accelerator's CPU is a 65816, which runs an internal cycle where an
-	// NMOS 6510 emits a dummy write of the original byte. Suppress the dummy
-	// write so the milestone-1 core behaves like the chip we are standing in
-	// for -- and so an RMW against I/O does not cost a second ~1us bus cycle.
-	m_Core6502.m_RMWDummyWrite = false;
-
-	m_CPU->attachBus( &m_Memory );
+	// Leave m_RMWDummyWrite alone -- i.e. ON, the NMOS 6510 behaviour.
+	//
+	// It is tempting to switch it off on the grounds that a 65816 runs an
+	// internal cycle where a 6510 emits a dummy write of the original byte. But
+	// the 65816 does that only in NATIVE mode. In EMULATION mode -- the mode a
+	// C64 boots in, and the mode CM6502 is standing in for -- it emits the dummy
+	// write exactly like a 6510, deliberately, because that is what a drop-in
+	// 6502 replacement has to do. Measured 10000/10000 on INC abs, and VICE
+	// gates the same behaviour on reg_emul.
+	//
+	// It matters: INC $D019 and LSR $D019 are the two standard VIC-II interrupt
+	// acknowledgements. INC $D019 reads $81 and writes $82, and bit 0 of $82 is
+	// clear -- so without the dummy write of the ORIGINAL $81 the raster latch
+	// is never cleared and the handler re-enters forever. That is a hang, worth
+	// far more than the ~1us the extra bus cycle costs.
+	//
+	// The flag stays as a knob for one open hardware question: whether the
+	// SuperCPU's gate array forwards a cycle with VDA and VPA both low. If
+	// raster interrupts ever misbehave in a way that points here, this is the
+	// first thing to flip. See Docs/research/65816-reference.md section 6 and U2.
 
 	// Hold the emulated CPU to real time. Without this a cycle count is not a
 	// duration, and everything that measures time by counting -- IEC transfers,

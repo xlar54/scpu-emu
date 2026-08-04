@@ -12,14 +12,19 @@ Derived from [RAD-Doom](https://github.com/frntc/RAD-Doom) by Carsten
 Dachsbacher, which established that a Pi can replace a C64's CPU over the
 expansion port. GPLv3.
 
-> **Status: early.** The host-testable half — CPU core, banking, memory model,
-> mirroring, registers — passes 1203 checks on a PC and boots a real Commodore
-> KERNAL to the BASIC prompt. The firmware compiles to a `kernel8.img`.
+> **Status: it works, and it is early.** A real C64 boots to a normal screen
+> with the Pi as its CPU. The WDC 65C816 core is in, along with 16MB of
+> SuperRAM, the 24-bit address space, per-instruction cycle pacing and the
+> SuperCPU register block.
 >
-> It is **not a SuperCPU yet**: there is no 65816 core (milestone 1 runs a 6502),
-> no SuperRAM, and no cycle pacing, so speed control has no effect on real
-> timing. Nothing has been run on physical hardware. See
-> [Docs/roadmap.md](Docs/roadmap.md).
+> On the host side a genuine Commodore KERNAL boots to the BASIC prompt through
+> the 65816, and in emulation mode that core agrees with the 6502 core
+> instruction for instruction — registers, flags, cycle counts and every byte of
+> bus traffic — across half a million checks.
+>
+> What is **not** proven: the 65816 has not yet driven a physical machine, only
+> the 6502 core has. `CPU_CORE` in `scpu.cfg` picks between them, so backing out
+> takes one line on the SD card. See [Docs/roadmap.md](Docs/roadmap.md).
 
 ## Hardware
 

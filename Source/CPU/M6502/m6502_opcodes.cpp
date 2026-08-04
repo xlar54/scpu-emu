@@ -42,7 +42,12 @@ const u8 m6502ModeLength[ AM_MODES ] =
 
 const M6502OpcodeInfo m6502Opcodes[ 256 ] =
 {
-	/* 00 */ D("BRK",AM_IMP,7), D("ORA",AM_IZX,6), U("JAM",AM_IMP,0), U("SLO",AM_IZX,8),
+	// BRK is AM_IMM, not AM_IMP: it is a TWO-byte instruction. It skips a
+	// signature byte, which is why CM6502::step() does m_PC++ before pushing.
+	// Listing it as implied would leave the disassembler one byte behind for the
+	// rest of the stream, and would be the same class of bug as deriving 65816
+	// lengths from this table -- see w65c816_opcodes.h.
+	/* 00 */ D("BRK",AM_IMM,7), D("ORA",AM_IZX,6), U("JAM",AM_IMP,0), U("SLO",AM_IZX,8),
 	/* 04 */ U("NOP",AM_ZP ,3), D("ORA",AM_ZP ,3), D("ASL",AM_ZP ,5), U("SLO",AM_ZP ,5),
 	/* 08 */ D("PHP",AM_IMP,3), D("ORA",AM_IMM,2), D("ASL",AM_ACC,2), U("ANC",AM_IMM,2),
 	/* 0C */ U("NOP",AM_ABS,4), D("ORA",AM_ABS,4), D("ASL",AM_ABS,6), U("SLO",AM_ABS,6),

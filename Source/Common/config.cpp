@@ -80,6 +80,8 @@ int getNextLine()
 
 int timingValues[ TIMING_NAMES ] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
+int cfgCPUCore = SCPU_CFG_CORE_DEFAULT;
+
 char cfg[ 65536 ];
 
 int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
@@ -92,6 +94,8 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 		return 0;
 
 	cfgPos = cfg;
+
+	bool cpuCoreSeen = false;
 
 	while ( *cfgPos != 0 )
 	{
@@ -111,6 +115,7 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 					if ( strcmp( ptr, timingNames[ i ] ) == 0 && ( ptr = strtok_r( 0, "\"", &rest ) ) )
 					{
 						timingValues[ i ] = atoi( ptr );
+						if ( i == 21 ) cpuCoreSeen = true;
 						while ( *ptr == '\t' || *ptr == ' ' ) ptr++;
 					#ifdef DEBUG_OUT
 						logger->Write( "RaspiMenu", LogNotice, "  %s >%d< (%s)", timingNames[ i ], timingValues[ i ], ptr );
@@ -144,6 +149,12 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	if ( timingValues[ 18 ] ) CACHING_L1_WINDOW_KB = timingValues[ 18 ];
 	if ( timingValues[ 19 ] ) CACHING_L2_OFFSET_KB = timingValues[ 19 ];
 	if ( timingValues[ 20 ] ) CACHING_L2_PRELOADS_PER_CYCLE = timingValues[ 20 ];
+
+	// CPU_CORE is the one key where 0 is a meaningful value rather than
+	// "unset", so it cannot use the "if non-zero" idiom above. A line reading
+	// CPU_CORE 0 has to be able to select the 6502.
+	if ( cpuCoreSeen )
+		cfgCPUCore = ( timingValues[ 21 ] != 0 ) ? SCPU_CFG_CORE_65816 : SCPU_CFG_CORE_6502;
 
 	return 1;
 }

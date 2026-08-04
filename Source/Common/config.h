@@ -29,7 +29,7 @@
 #define _config_h
 
 
-#define TIMING_NAMES 21
+#define TIMING_NAMES 22
 const char timingNames[TIMING_NAMES][32] = {
 	"WAIT_FOR_SIGNALS", 
 	"WAIT_CYCLE_READ", 
@@ -55,8 +55,21 @@ const char timingNames[TIMING_NAMES][32] = {
 	"WAIT_BA_SIGNAL_AVAIL",
 	"CACHING_L1_WINDOW_KB",
 	"CACHING_L2_OFFSET_KB",
-	"CACHING_L2_PRELOADS_PER_CYCLE"
+	"CACHING_L2_PRELOADS_PER_CYCLE",
+	// Not a timing: 0 selects the 6502 core, 1 the 65816. It rides in the same
+	// table because that is the whole config mechanism, and having it on the SD
+	// card means switching cores -- or falling back after a bad run -- needs no
+	// rebuild and no toolchain.
+	"CPU_CORE"
 };
+
+// Which CPU core boot.cpp should install. Set from CPU_CORE in the config file;
+// SCPU_CFG_CORE_DEFAULT applies when the key is absent.
+extern int cfgCPUCore;
+
+#define SCPU_CFG_CORE_6502      0
+#define SCPU_CFG_CORE_65816     1
+#define SCPU_CFG_CORE_DEFAULT   SCPU_CFG_CORE_65816
 
 extern int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME );
 

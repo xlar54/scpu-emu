@@ -22,6 +22,8 @@ OBJS = \
 	App/boot.o \
 	CPU/M6502/m6502.o \
 	CPU/M6502/m6502_opcodes.o \
+	CPU/W65C816/w65c816.o \
+	CPU/W65C816/w65c816_opcodes.o \
 	C64/banking.o \
 	C64/c64_memory.o \
 	SuperCPU/supercpu.o \
@@ -56,6 +58,7 @@ include ../Rules.mk
 -include $(DEPS)
 
 # Rules.mk's clean only sweeps the current directory; ours are in subdirectories.
-EXTRACLEAN = App/*.o App/*.d CPU/M6502/*.o CPU/M6502/*.d C64/*.o C64/*.d \
+EXTRACLEAN = App/*.o App/*.d CPU/M6502/*.o CPU/M6502/*.d \
+             CPU/W65C816/*.o CPU/W65C816/*.d C64/*.o C64/*.d \
              SuperCPU/*.o SuperCPU/*.d Bus/RAD/*.o Bus/RAD/*.d \
              Common/*.o Common/*.d

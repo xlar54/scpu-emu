@@ -27,6 +27,8 @@ BUILDDIR  = build/host
 HOST_SRCS = \
 	Source/CPU/M6502/m6502.cpp \
 	Source/CPU/M6502/m6502_opcodes.cpp \
+	Source/CPU/W65C816/w65c816.cpp \
+	Source/CPU/W65C816/w65c816_opcodes.cpp \
 	Source/C64/banking.cpp \
 	Source/C64/c64_memory.cpp \
 	Source/SuperCPU/write_buffer.cpp \
@@ -39,10 +41,13 @@ HOST_SRCS = \
 TEST_SRCS = \
 	Tests/test_main.cpp \
 	Tests/CPU/test_m6502.cpp \
+	Tests/CPU/test_w65c816.cpp \
+	Tests/CPU/test_w65c816_diff.cpp \
 	Tests/C64/test_banking.cpp \
 	Tests/SuperCPU/test_write_buffer.cpp \
 	Tests/Integration/test_kernal_boot.cpp \
 	Tests/Integration/test_real_kernal.cpp \
+	Tests/Integration/test_kernal_65816.cpp \
 	Tests/SuperCPU/test_memory_map.cpp
 
 HOST_OBJS = $(HOST_SRCS:%.cpp=$(BUILDDIR)/%.o)

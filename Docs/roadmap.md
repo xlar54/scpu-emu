@@ -19,7 +19,7 @@ KERNAL with the Pi as the CPU.
 - [x] MOS 6502 core, all 151 documented opcodes, NMOS decimal mode
 - [x] Write buffer with coalescing and optimization modes
 - [x] SuperCPU register block
-- [x] Host test suite (1203 checks)
+- [x] Host test suite
 - [x] **A genuine C64 KERNAL boots to the BASIC READY prompt** through the core,
       banking model and shadow memory, on the host bus:
 
@@ -36,23 +36,50 @@ KERNAL with the Pi as the CPU.
 - [x] **Firmware compiles.** `make firmware` fetches the AArch64 toolchain and
       Circle 44.3, applies RAD's Circle settings and produces a ~156KB
       `kernel8.img`. `make sdcard` stages a complete card.
-- [ ] **Runs on real hardware.** Nothing below this line is meaningful until a
-      physical C64 reaches that prompt with the Pi driving it. The host bus is
-      not a C64: it has no CIAs, no real VIC-II (only a synthesised raster
-      counter), and no timing.
+- [x] **Runs on real hardware.** A physical C64 boots to a normal screen with
+      the Pi as its CPU. The bus self-test passes: reads are live, single
+      read/write is stable 20/20, bursts are clean, and every address line
+      verifies. The fix that finally made the display hold was suppressing
+      mirrored writes to `$D000-$DFFF` — that window is chip registers on the
+      real machine, and mirroring RAM shadow bytes onto live VIC-II registers
+      is what produced the rolling picture.
+- [x] Cycle pacing so raster code behaves, plus the IEC auto-throttle on
+      `$DD00` writes
 - [ ] Timing constants validated per Pi model
-- [ ] Cycle pacing (`SuperCPU/timing`) so raster code behaves
 
-## Milestone 2 — the 65816
+## Milestone 2 — the 65816 *(code complete, untested on hardware)*
 
-- [ ] `CW65C816`: emulation and native modes, 8/16-bit M and X, the full
-      addressing-mode set, bank wrapping, decimal mode
-- [ ] Differential testing against `CM6502` — in emulation mode the two cores
-      must agree instruction for instruction, which is what
-      `Tools/trace_compare` is for
-- [ ] Banks 1+ and the SuperRAM model (`SuperCPU/fast_ram`, `memory_map`)
-- [ ] Long addressing, `MVN`/`MVP` block moves with range invalidation into the
-      write buffer
+- [x] **Reference data derived and cross-checked before writing any code.**
+      `Docs/research/65816-reference.md` — the WDC datasheet, Bruce Clark's
+      *65C816 Opcodes*, VICE's `65816core.c` and SingleStepTests, reconciled,
+      with the disagreements recorded as open questions rather than papered
+      over. Three of its findings contradicted what was already in the repo.
+- [x] `CW65C816`: emulation and native modes, 8/16-bit M and X, the full
+      addressing-mode set, bank wrapping, 65C02-style decimal mode
+- [x] Its own opcode table (`w65c816_opcodes.cpp`), never derived from the
+      6502's. 50 of the 105 encodings the 6502 leaves undocumented have a
+      *different length* on a 65816, and getting one wrong desynchronises the
+      instruction stream into corruption a long way from its cause.
+- [x] Differential testing against `CM6502` — in emulation mode the two cores
+      agree instruction for instruction on registers, flags, cycle counts and
+      every byte of bus traffic. The exemption list is explicit
+      (`Tests/CPU/test_w65c816_diff.cpp`); anything not on it that differs is a
+      bug.
+- [x] Banks 1+ and the SuperRAM model (`SuperCPU/fast_ram`, `memory_map`)
+- [x] Long addressing, `MVN`/`MVP` block moves
+- [x] **A genuine C64 KERNAL boots to READY with the 65816 driving**, then
+      switches to native mode and reaches 8MB up in SuperRAM without touching
+      the expansion port (`Tests/Integration/test_kernal_65816.cpp`).
+- [x] Selectable from the SD card via `CPU_CORE` in `scpu.cfg`, so a bad run can
+      be backed out without a rebuild. Defaults to the 65816.
+- [ ] **Runs on real hardware.**
+- [ ] `MVN`/`MVP` range invalidation into the write buffer. A block move into
+      shadowed bank 0 can dirty 64KB in one instruction; the buffer currently
+      handles that as 65536 individual mirrored writes.
+- [ ] The open questions in the reference doc, section 1.3 — chiefly **U1**
+      (the direct-page pointer wrap, decided one way and pinned by a test) and
+      **U2** (whether the SuperCPU's gate array forwards the emulation-mode RMW
+      dummy write). Both are testable on hardware in minutes.
 
 ## Milestone 3 — fidelity
 

@@ -35,13 +35,15 @@
 #include "../C64/c64_memory.h"
 #include "../CPU/cpu.h"
 #include "../CPU/M6502/m6502.h"
+#include "../CPU/W65C816/w65c816.h"
 #include "write_buffer.h"
 #include "registers.h"
 #include "fast_ram.h"
 #include "memory_map.h"
 
-// Which core drives the machine. Milestone 1 uses the 6502; the 65816 takes
-// over once it lands (see Docs/roadmap.md).
+// Which core drives the machine. The 65816 is the real thing; the 6502 stays
+// available as milestone-1 scaffolding and as the oracle the 65816 is tested
+// against in emulation mode (see Tests/CPU/test_w65c816_diff.cpp).
 enum SCPUCoreType
 {
 	SCPU_CORE_6502 = 0,
@@ -56,8 +58,8 @@ public:
 	// Wire up a bus and bring the accelerator to its reset state. Returns
 	// false if the bus could not be acquired or no usable ROMs were obtained.
 	// simmMB: SuperRAM to fit, in megabytes. 0/1/4/8/16, as the real card
-	// accepts. Only reachable once the 65816 core lands -- a 6502 has no way to
-	// name an address above $FFFF.
+	// accepts. Reachable only by the 65816 core -- a 6502 has no way to name an
+	// address above $FFFF, so with SCPU_CORE_6502 the SIMM is fitted but idle.
 	bool init( IC64Bus *bus, SCPUCoreType core = SCPU_CORE_6502,
 	           u32 simmMB = SCPU_SIMM_16MB );
 
@@ -102,6 +104,7 @@ private:
 	CWriteBuffer       m_WriteBuffer;
 	CSuperCPURegisters m_Registers;
 	CM6502             m_Core6502;
+	CW65C816           m_Core65816;
 	CFastRAM           m_FastRAM;
 	CSuperCPUMemoryMap m_MemoryMap;
 

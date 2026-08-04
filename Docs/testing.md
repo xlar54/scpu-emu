@@ -4,7 +4,9 @@
 make tests
 ```
 
-1203 checks across five areas, all running on the host with no hardware.
+Around 530,000 checks, all running on the host with no hardware. The bulk of
+that is the differential test, which runs both CPU cores over the same programs
+and compares everything they do.
 
 | Suite | Covers |
 |---|---|
@@ -12,7 +14,11 @@ make tests
 | `Tests/C64/test_banking.cpp` | the PLA table for every interesting `$01` value, Ultimax, DDR-dependent port readback |
 | `Tests/SuperCPU/test_write_buffer.cpp` | coalescing, each optimization mode, flush-on-mode-change, auto-flush |
 | `Tests/Integration/test_kernal_boot.cpp` | the seams: ROM execution costing zero bus cycles, I/O reaching the machine, flush-before-I/O ordering, register interception, partial ROM snapshotting |
-| `Tests/Integration/test_real_kernal.cpp` | boots a **genuine Commodore KERNAL** to the BASIC READY prompt, checks the RAM test finds 38911 bytes free, and asserts the whole cold start stays under 100k bus cycles. Reports as skipped when the ROM images are absent — see [../ROMs/README.md](../ROMs/README.md) |
+| `Tests/CPU/test_w65c816.cpp` | everything that makes a 65816 not a 6502: XCE and the mode invariants, each address-wrapping rule, the emulation-mode old/new stack split, `MVN`/`MVP`, 16-bit decimal, the read-modify-write behaviours, `WAI`/`STP` |
+| `Tests/CPU/test_w65c816_diff.cpp` | runs `CW65C816` and `CM6502` over the same programs and compares registers, flags, cycle counts and every byte of bus traffic — see below |
+| `Tests/SuperCPU/test_memory_map.cpp` | the 24-bit space: bank 0 delegation, private SRAM, SIMM sizing and aliasing, open bus |
+| `Tests/Integration/test_real_kernal.cpp` | boots a **genuine Commodore KERNAL** to the BASIC READY prompt on the 6502 core, checks the RAM test finds 38911 bytes free, and asserts the whole cold start stays under 100k bus cycles. Reports as skipped when the ROM images are absent — see [../ROMs/README.md](../ROMs/README.md) |
+| `Tests/Integration/test_kernal_65816.cpp` | the same boot with the **65816** driving and the full 24-bit map underneath, then switches the booted machine into native mode and reaches 8MB up in SuperRAM |
 
 ## What the tests actually assert
 
@@ -29,6 +35,23 @@ CHECK_EQ( f.bus.m_Cycles, 1 );   // 1000 writes, one bus cycle
 
 `CHostBus` logs every access, so ordering can be asserted directly — which is how
 the flush-before-I/O rule is pinned down.
+
+## The differential test
+
+In emulation mode a 65816 *is* a 6502, so the two cores must agree instruction
+for instruction. `test_w65c816_diff.cpp` generates random programs of documented
+opcodes, runs both cores over identical memory, and after every instruction
+compares registers, flags, cycle count, the full 64K, and the exact sequence of
+writes. That is a far stronger check than any hand-written expectation, because
+it exercises paths nobody thought to write a test for.
+
+The agreement is not total, and the differences are real hardware behaviour
+rather than tolerance — decimal `ADC` sets N by the 65C02's rule, interrupts
+clear the D flag, `abs,X` carries into the next bank, `JMP ($xxFF)` is fixed. Each
+is an **explicit exemption** with its own targeted test asserting that it
+*does* differ; anything not on that list that differs is a bug. The list, and the
+evidence behind each entry, is in
+[research/65816-reference.md](research/65816-reference.md) section 10.
 
 ## What is not covered
 
