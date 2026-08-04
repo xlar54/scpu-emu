@@ -55,6 +55,29 @@ LIBS += $(CIRCLEHOME)/addon/SDCard/libsdcard.a \
 
 include ../Rules.mk
 
+# Rules.mk appends "$(OPTIMIZE) -g" AFTER our CFLAGS, and the LAST -O flag
+# wins -- so despite the -Ofast above, every object in this tree has always
+# compiled at -O2. (Upstream RAD has the identical ordering, so its shipped
+# bus timings were tuned at -O2 too; the comment above claiming -Ofast is
+# wrong, and is left as history.) That accident is also why it is SAFE to
+# leave Bus/RAD, App and Common exactly as they are: they keep building at
+# the flags the working hardware timings were actually tuned with.
+#
+# The interpreter is different: measured on hardware it runs at ~0.3
+# instructions per clock, stall-bound, with step() compiling to ~41KB against
+# a 32K two-way L1I. Smaller code IS faster code here, so the dispatch unit
+# gets -Os -- measured to shrink step() to ~17KB, comfortably inside the
+# cache -- and the small hot memory/banking units get -O3. Target-specific
+# appends land after Rules.mk's -O2 on the command line, so they win.
+CPU/W65C816/w65c816.o:        CPPFLAGS += -Os
+CPU/W65C816/w65c816_opcodes.o: CPPFLAGS += -O3
+CPU/M6502/m6502.o:            CPPFLAGS += -O3
+C64/c64_memory.o:             CPPFLAGS += -O3
+C64/banking.o:                CPPFLAGS += -O3
+SuperCPU/memory_map.o:        CPPFLAGS += -O3
+SuperCPU/write_buffer.o:      CPPFLAGS += -O3
+SuperCPU/supercpu.o:          CPPFLAGS += -O3
+
 -include $(DEPS)
 
 # Rules.mk's clean only sweeps the current directory; ours are in subdirectories.

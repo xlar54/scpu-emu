@@ -220,6 +220,19 @@ u64 CSuperCPU::runFrame()
 	const u64 frameTicks = c64CyclesPerFrame * ( SCPU_TURBO_HZ / SCPU_NORMAL_HZ );
 	u64 ticksUsed = 0;
 	u64 executed = 0;
+
+	// The frame is run in slices rather than one call, for two reasons. A
+	// speed change breaks run() so the remainder can be re-budgeted at the new
+	// rate. And the mirror buffer gets a flush OPPORTUNITY between slices: when
+	// the machine falls behind real time, frame boundaries drift out of phase
+	// with the real raster, and a flush attempted only at the boundary lands in
+	// the safe border window by luck -- roughly a third of the time. Screen
+	// writes then reach the C64 in visible ~quarter-second bursts. Eight
+	// chances per frame instead of one makes hitting the border a near
+	// certainty, at the cost of one raster read per slice.
+	const u64 sliceTicks = frameTicks / 8;
+	const u32 perLine = c64CyclesPerLine( sig.video );
+
 	while ( ticksUsed < frameTicks )
 	{
 		const u32 selectedClockHz = currentClockHz();
@@ -230,10 +243,30 @@ u64 CSuperCPU::runFrame()
 		                  ? SCPU_NORMAL_HZ : selectedClockHz;
 		const u32 ticksPerCycle = SCPU_TURBO_HZ / clockHz;
 		const u64 ticksLeft = frameTicks - ticksUsed;
-		const u64 budget = ( ticksLeft + ticksPerCycle - 1 ) / ticksPerCycle;
+		u64 budget = ( ticksLeft + ticksPerCycle - 1 ) / ticksPerCycle;
+
+		const u64 sliceBudget = ( sliceTicks + ticksPerCycle - 1 ) / ticksPerCycle;
+		if ( budget > sliceBudget ) budget = sliceBudget;
+
 		const u64 ran = m_CPU->run( budget );
 		executed += ran;
 		ticksUsed += ran * ticksPerCycle;
+
+		// Opportunistic flush: one raster read, and only drain what fits in
+		// the border time remaining. Never during the visible display.
+		if ( !m_WriteBuffer.empty() && ticksUsed < frameTicks )
+		{
+			const u16 line = m_Bus->rasterLine();
+			if ( line != 0xFFFF
+			     && c64RasterIsSafeForBulkTransfer( sig.video, line ) )
+			{
+				const u32 lines = c64RasterLines( sig.video );
+				u32 linesLeft = ( line > c64DisplayLastLine( sig.video ) )
+				              ? ( lines - line ) + c64DisplayFirstLine( sig.video )
+				              : c64DisplayFirstLine( sig.video ) - line;
+				m_WriteBuffer.flushUpTo( ( linesLeft * perLine * 3 ) / 4 );
+			}
+		}
 	}
 
 	// --- raster-scheduled mirroring ----------------------------------------
