@@ -2,7 +2,8 @@
    SCPU-EMU - CMD SuperCPU emulation for the C64/C128 using a RAD Expansion Unit
    Copyright (c) 2026 SCPU-EMU contributors
 
-   SuperCPU hardware registers.
+   SuperCPU hardware registers. Written against VICE's SCPU64 emulation; see the
+   note at the top of registers.h.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -20,40 +21,42 @@
 #include "registers.h"
 
 CSuperCPURegisters::CSuperCPURegisters()
-	: m_RegWrites( 0 ), m_WriteBuffer( 0 ),
-	  m_Version( SCPU_V2 ), m_C128Mode( false ),
-	  m_Turbo( true ), m_HWRegsEnabled( false ), m_SpeedChanged( false ),
-	  m_SwitchAllowsTurbo( true ), m_JiffyDOSSwitch( false ), m_EnhancedOpt( 0x80 )
+	: m_RegWrites( 0 ), m_WriteBuffer( 0 ), m_Version( SCPU_V2 ),
+	  m_Sys1MHz( false ), m_Soft1MHz( false ),
+	  m_SwitchSlow( false ), m_SwitchJiffy( false ),
+	  m_HWRegsEnabled( false ), m_Bootmap( false ),
+	  m_DOSExt( false ), m_RAMLink( false ),
+	  m_EmulationMode( true ), m_SpeedChanged( true ),
+	  m_Optim( SCPU_OPTIM_NONE ), m_SIMMConfig( 0 )
 {
 	reset();
 }
 
-void CSuperCPURegisters::setSpeedSwitchAllowsTurbo( bool allow )
-{
-	m_SwitchAllowsTurbo = allow;
-
-	// Moving the switch to NORMAL drops the machine to 1MHz immediately; moving
-	// it to TURBO only permits software to ask, it does not accelerate on its own.
-	if ( !allow && m_Turbo )
-	{
-		m_Turbo = false;
-		m_SpeedChanged = true;
-	}
-}
-
 void CSuperCPURegisters::reset()
 {
-	// A SuperCPU powers up in turbo with its register bank closed, so that a
-	// program which happens to touch $D074 does not silently change the
-	// mirroring policy.
-	m_Turbo         = m_SwitchAllowsTurbo;
+	// Nothing requesting 1MHz, register bank closed. A program that happens to
+	// touch $D074 must not silently change the mirroring policy.
+	m_Sys1MHz       = false;
+	m_Soft1MHz      = false;
 	m_HWRegsEnabled = false;
+	m_Bootmap       = false;
+	m_DOSExt        = false;
+	m_RAMLink       = false;
 	m_SpeedChanged  = true;
 	m_RegWrites     = 0;
-	m_EnhancedOpt   = 0x80;	// documented default: Z = 1, B = 0
+	m_Optim         = SCPU_OPTIM_NONE;
+	m_SIMMConfig    = 0;
 
 	for ( u32 i = 0; i < SCPU_SYSRAM_SIZE; i++ )  m_SysRAM[ i ]  = 0;
 	for ( u32 i = 0; i < SCPU_USERRAM_SIZE; i++ ) m_UserRAM[ i ] = 0;
+
+	applyOptimisation();
+}
+
+void CSuperCPURegisters::noteSpeedChange( bool wasFast )
+{
+	if ( fastMode() != wasFast )
+		m_SpeedChanged = true;
 }
 
 bool CSuperCPURegisters::consumeSpeedChanged()
@@ -63,11 +66,30 @@ bool CSuperCPURegisters::consumeSpeedChanged()
 	return c;
 }
 
-void CSuperCPURegisters::selectOptMode( SCPUOptMode mode )
+void CSuperCPURegisters::setSpeedSwitchAllowsTurbo( bool allow )
 {
-	if ( m_WriteBuffer )
-		m_WriteBuffer->setOptMode( mode );
+	bool wasFast = fastMode();
+	m_SwitchSlow = !allow;
+	noteSpeedChange( wasFast );
 }
+
+void CSuperCPURegisters::applyOptimisation()
+{
+	if ( !m_WriteBuffer )
+		return;
+
+	// Bits 7-6 select which region stays coherent with the VIC-II.
+	switch ( m_Optim & 0xC0 )
+	{
+	case SCPU_OPTIM_VICBANK2: m_WriteBuffer->setOptMode( SCPU_OPT_VICBANK2 ); break;
+	case SCPU_OPTIM_VICBANK1: m_WriteBuffer->setOptMode( SCPU_OPT_VICBANK1 ); break;
+	case SCPU_OPTIM_BASIC:    m_WriteBuffer->setOptMode( SCPU_OPT_BASIC );    break;
+	case SCPU_OPTIM_NONE:
+	default:                  m_WriteBuffer->setOptMode( SCPU_OPT_NONE );     break;
+	}
+}
+
+// ---------------------------------------------------------------------------
 
 bool CSuperCPURegisters::ioRead( u16 addr, u8 &value )
 {
@@ -83,84 +105,70 @@ bool CSuperCPURegisters::ioRead( u16 addr, u8 &value )
 		return true;
 	}
 
-	// The $D0B0-$D0BF status block. Each address carries distinct flags -- it is
-	// not a mirrored register. Layout from the SuperCPU 128 register list; see
-	// Docs/research/supercpu-registers.md for the sources and what is inferred.
+	if ( addr < SCPU_REG_STATUS_FIRST || addr > SCPU_REG_STATUS_LAST )
+		return false;			// $D07x is write-only; let it fall through
+
+	u8 v = 0x00;
+
 	switch ( addr )
 	{
-	case SCPU_REG_MODE:
-		value = ( m_Version == SCPU_V1 )
-		      ? SCPU_MODE_V1_OR_OFF
-		      : ( m_C128Mode ? SCPU_MODE_V2_128 : SCPU_MODE_V2_64 );
-		return true;
+	case SCPU_REG_VERSION:
+		v = ( m_Version == SCPU_V2 ) ? SCPU_VERSION_V2 : SCPU_VERSION_V1;
+		break;
 
 	case SCPU_REG_STATUS:
-		value = (u8)( ( m_HWRegsEnabled ? SCPU_STATUS_HWREGS : 0 )
-		            | ( m_Turbo ? 0 : SCPU_STATUS_1MHZ ) );
-		return true;
+		v = (u8)( ( m_HWRegsEnabled ? SCPU_STATUS_HWREGS : 0 )
+		        | ( m_Sys1MHz ? SCPU_STATUS_SYS_1MHZ : 0 ) );
+		break;
 
-	case SCPU_REG_ENHANCED_OPT:
-		// v2 only. Readable always, writable once the register bank is open.
-		// The bit encoding is only partly documented -- we keep the byte and
-		// report the documented power-on default (Z=1, B=0) rather than
-		// pretending to decode it.
-		value = ( m_Version == SCPU_V2 ) ? m_EnhancedOpt : 0xFF;
-		return true;
+	case SCPU_REG_OPTIM_V2:
+		if ( m_Version == SCPU_V2 )
+			v = (u8)( m_Optim & 0xC0 );
+		break;
 
-	case SCPU_REG_OPTFLAGS:
-		switch ( m_WriteBuffer ? m_WriteBuffer->optMode() : SCPU_OPT_NONE )
-		{
-		case SCPU_OPT_VICBANK2: value = SCPU_OPTFLAG_VICBANK2; break;
-		case SCPU_OPT_VICBANK1: value = SCPU_OPTFLAG_VICBANK1; break;
-		case SCPU_OPT_BASIC:    value = SCPU_OPTFLAG_BASIC;    break;
-		default:
-			// DEFAULT, NONE and the v2-only bank 0/3 and FULL modes have no
-			// encoding in these two bits; report "no optimization".
-			value = SCPU_OPTFLAG_NONE;
-			break;
-		}
-		return true;
+	case SCPU_REG_OPTIM:
+		v = (u8)( m_Optim & 0xC0 );
+		break;
 
 	case SCPU_REG_SWITCHES:
-		value = (u8)( ( m_JiffyDOSSwitch ? SCPU_SWITCH_JIFFYDOS : 0 )
-		            | ( m_SwitchAllowsTurbo ? 0 : SCPU_SWITCH_SPEED_NORMAL ) );
-		return true;
+		v = (u8)( ( m_SwitchJiffy ? SCPU_SWITCH_JIFFYDOS : 0 )
+		        | ( m_SwitchSlow ? SCPU_SWITCH_1MHZ : 0 ) );
+		break;
 
-	case SCPU_REG_PROCFLAGS:
-		// Milestone 1 runs a 6502, so the 65816 is effectively always in
-		// emulation mode. The 65816 core will drive this from its E flag.
-		value = SCPU_PROC_EMULATION;
-		return true;
+	case SCPU_REG_PROCMODE:
+		v = m_EmulationMode ? SCPU_PROC_EMULATION : 0x00;
+		break;
 
 	case SCPU_REG_SPEEDFLAGS:
-		value = (u8)( ( m_Turbo ? 0 : SCPU_SPEEDFLAG_SW_NORMAL )
-		            | ( ( m_Turbo && m_SwitchAllowsTurbo ) ? 0 : SCPU_SPEEDFLAG_MASTER_NORMAL ) );
-		return true;
+	case SCPU_REG_SPEEDFLAGS_ALT:
+		// bit 6 is the combined answer: is anything holding us at 1MHz? Note
+		// the switch only counts while the register bank is closed, matching
+		// fastMode().
+		v = (u8)( ( m_Soft1MHz ? SCPU_SPEED_SOFT_1MHZ : 0 )
+		        | ( ( m_Soft1MHz || ( m_SwitchSlow && !m_HWRegsEnabled ) || m_Sys1MHz )
+		            ? SCPU_SPEED_ANY_1MHZ : 0 ) );
+		break;
 
-	case SCPU_REG_DOSFLAGS:
-		// This is the detection register: bit 7 reads 1 on a stock machine
-		// because nothing decodes the address, and 0 here because we do.
-		// Both remaining flags (DOS extension mode, RAMLink registers) are off.
-		value = 0x00;
-		return true;
+	case SCPU_REG_DOSEXT:
+	case SCPU_REG_DOSEXT_ALT:
+	case SCPU_REG_DOSEXT_ON:
+	case SCPU_REG_DOSEXT_OFF:
+		// This is also the detection register: bit 7 reads as 1 on a stock
+		// machine because nothing decodes the address, and as the DOS extension
+		// flag (normally 0) here because we do.
+		v = (u8)( ( m_DOSExt ? SCPU_DOS_EXTENSION : 0 )
+		        | ( m_RAMLink ? SCPU_DOS_RAMLINK : 0 ) );
+		break;
 
 	default:
+		// $D0B1, $D0B7, $D0BA, $D0BB: decoded, no flags of their own.
 		break;
 	}
 
-	// Any other address in the block is decoded but carries no documented
-	// flags. Answering keeps bit 7 clear so detection still succeeds if a
-	// program probes a neighbouring address.
-	if ( addr > SCPU_REG_MODE && addr <= SCPU_REG_STATUS_LAST )
-	{
-		value = 0x00;
-		return true;
-	}
-
-	// The optimization and speed selects are write-only. Reading them on real
-	// hardware returns open bus; let the access fall through to the C64 so the
-	// value matches whatever the machine would have produced.
-	return false;
+	// The low three bits of the optimization register appear in every read of
+	// this block, whichever register was addressed.
+	value = (u8)( v | ( m_Optim & 0x07 ) );
+	return true;
 }
 
 bool CSuperCPURegisters::ioWrite( u16 addr, u8 value )
@@ -177,68 +185,114 @@ bool CSuperCPURegisters::ioWrite( u16 addr, u8 value )
 		return true;
 	}
 
-	// $D0B3 is the one genuinely writable register, and only while the bank is
-	// open. Everything else below is write-sensitive: the value is irrelevant.
-	if ( addr == SCPU_REG_ENHANCED_OPT && m_HWRegsEnabled && m_Version == SCPU_V2 )
-	{
-		m_EnhancedOpt = value;
-		m_RegWrites++;
-		return true;
-	}
+	const bool inD07x = ( addr >= SCPU_REG_D071 && addr <= SCPU_REG_HWREGS_DISABLE );
+	const bool inD0Bx = ( addr >= SCPU_REG_STATUS_FIRST && addr <= SCPU_REG_STATUS_LAST );
+
+	if ( !inD07x && !inD0Bx )
+		return false;
+
+	const bool wasFast = fastMode();
+	m_RegWrites++;
 
 	switch ( addr )
 	{
-	case SCPU_REG_HWREGS_ENABLE:
-		m_HWRegsEnabled = true;
-		m_RegWrites++;
-		return true;
+	// --- speed, always available whether or not the bank is open -----------
+	case SCPU_REG_SYS_1MHZ_ON:   m_Sys1MHz  = true;  break;
+	case SCPU_REG_SYS_1MHZ_OFF:  m_Sys1MHz  = false; break;
+	case SCPU_REG_SOFT_1MHZ_ON:  m_Soft1MHz = true;  break;
+	case SCPU_REG_SOFT_1MHZ_ALT:
+	case SCPU_REG_SOFT_1MHZ_OFF: m_Soft1MHz = false; break;
 
-	case SCPU_REG_HWREGS_DISABLE:
-		m_HWRegsEnabled = false;
-		m_RegWrites++;
-		return true;
+	// --- register bank -----------------------------------------------------
+	case SCPU_REG_HWREGS_ENABLE:  m_HWRegsEnabled = true;  break;
+	case SCPU_REG_HWREGS_ALT:
+	case SCPU_REG_HWREGS_DISABLE: m_HWRegsEnabled = false; break;
 
-	// Speed selection works whether or not the register bank is open -- this
-	// is what makes POKE 53370,0 usable straight from BASIC.
-	case SCPU_REG_SPEED_NORMAL:
-		if ( m_Turbo ) { m_Turbo = false; m_SpeedChanged = true; }
-		m_RegWrites++;
-		return true;
+	// --- optimization: needs the bank open ---------------------------------
+	case SCPU_REG_OPT_VICBANK2:
+	case SCPU_REG_OPT_VICBANK1:
+	case SCPU_REG_OPT_BASIC:
+	case SCPU_REG_OPT_NONE:
+		if ( m_HWRegsEnabled )
+		{
+			// The mode lives in bits 7-6 and comes from the low two bits of the
+			// address: $D074 -> 00, $D075 -> 01, $D076 -> 10, $D077 -> 11.
+			m_Optim = (u8)( ( m_Optim & 0x3F ) | ( ( addr & 3 ) << 6 ) );
+			applyOptimisation();
+		}
+		break;
 
-	case SCPU_REG_SPEED_TURBO:
-		// The switch gates this. In the NORMAL position the request is accepted
-		// and discarded -- the machine stays at 1MHz -- which is what lets a
-		// user force compatibility for software that asks for turbo regardless.
-		if ( m_SwitchAllowsTurbo && !m_Turbo ) { m_Turbo = true; m_SpeedChanged = true; }
-		m_RegWrites++;
-		return true;
+	case SCPU_REG_SIMM_CONFIG:
+		if ( m_HWRegsEnabled )
+			m_SIMMConfig = value;
+		break;
+
+	case SCPU_REG_D071:
+	case SCPU_REG_D07C:
+		break;					// decoded, no effect
+
+	// --- $D0Bx writes ------------------------------------------------------
+	case SCPU_REG_STATUS:
+		// Sets the system 1MHz request, and clearing bit 7 closes the bank.
+		if ( m_HWRegsEnabled )
+		{
+			m_Sys1MHz = ( value & SCPU_STATUS_SYS_1MHZ ) != 0;
+			if ( !( value & SCPU_STATUS_HWREGS ) )
+				m_HWRegsEnabled = false;
+		}
+		break;
+
+	case SCPU_REG_OPTIM_V2:
+		if ( m_HWRegsEnabled && m_Version == SCPU_V2 )
+		{
+			m_Optim = (u8)( ( m_Optim & 0x38 ) | ( value & 0xC7 ) );
+			applyOptimisation();
+		}
+		break;
+
+	case SCPU_REG_OPTIM:
+		if ( m_HWRegsEnabled )
+		{
+			m_Optim = (u8)( ( m_Optim & 0x3F ) | ( value & 0xC0 ) );
+			applyOptimisation();
+		}
+		break;
+
+	case SCPU_REG_PROCMODE:		// write side: disable bootmap
+		if ( m_HWRegsEnabled )
+			m_Bootmap = false;
+		break;
+
+	case SCPU_REG_BOOTMAP_ON:
+		if ( m_HWRegsEnabled )
+			m_Bootmap = true;
+		break;
+
+	case SCPU_REG_SPEEDFLAGS:
+		if ( m_HWRegsEnabled )
+			m_Soft1MHz = ( value & SCPU_SPEED_SOFT_1MHZ ) != 0;
+		break;
+
+	case SCPU_REG_DOSEXT:
+		if ( m_HWRegsEnabled )
+			m_DOSExt = ( value & SCPU_DOS_EXTENSION ) != 0;
+		break;
+
+	case SCPU_REG_DOSEXT_ON:
+		if ( m_HWRegsEnabled )
+			m_DOSExt = true;
+		break;
+
+	case SCPU_REG_DOSEXT_ALT:
+	case SCPU_REG_DOSEXT_OFF:
+		// Note: no hwenable check here, matching VICE.
+		m_DOSExt = false;
+		break;
 
 	default:
-		break;
+		break;				// $D0B0, $D0B1, $D0B9, $D0BA, $D0BB: no write effect
 	}
 
-	// The optimization selects require the register bank to be open.
-	if ( m_HWRegsEnabled )
-	{
-		switch ( addr )
-		{
-		case SCPU_REG_OPT_VICBANK2: selectOptMode( SCPU_OPT_VICBANK2 ); m_RegWrites++; return true;
-		case SCPU_REG_OPT_VICBANK1: selectOptMode( SCPU_OPT_VICBANK1 ); m_RegWrites++; return true;
-		case SCPU_REG_OPT_BASIC:    selectOptMode( SCPU_OPT_BASIC );    m_RegWrites++; return true;
-		case SCPU_REG_OPT_NONE:     selectOptMode( SCPU_OPT_NONE );     m_RegWrites++; return true;
-
-		// V2-only. Inferred assignment -- see the note in registers.h.
-		case SCPU_REG_OPT_VICBANK0:
-			if ( m_Version == SCPU_V2 ) { selectOptMode( SCPU_OPT_VICBANK0 ); m_RegWrites++; return true; }
-			break;
-		case SCPU_REG_OPT_VICBANK3:
-			if ( m_Version == SCPU_V2 ) { selectOptMode( SCPU_OPT_VICBANK3 ); m_RegWrites++; return true; }
-			break;
-
-		default:
-			break;
-		}
-	}
-
-	return false;
+	noteSpeedChange( wasFast );
+	return true;
 }

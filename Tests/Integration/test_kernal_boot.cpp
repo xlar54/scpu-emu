@@ -333,7 +333,7 @@ TEST( integration_detection_answers_on_both_documented_addresses )
 
 	// $D0B0 is the version/mode register, not the presence flag.
 	CHECK( f.regs.ioRead( 0xD0B0, v ) );
-	CHECK_EQ( v, SCPU_MODE_V2_64 );
+	CHECK_EQ( v, SCPU_VERSION_V2 );
 
 	// None of it reaches the machine.
 	CHECK_EQ( f.bus.m_Cycles, 0 );
@@ -341,34 +341,40 @@ TEST( integration_detection_answers_on_both_documented_addresses )
 
 TEST( integration_speed_switch_gates_turbo_rather_than_forcing_it )
 {
-	// Per the 1541 Ultimate report, the physical switch is "force 1MHz, or
-	// merely ALLOW 20MHz" -- it does not accelerate the machine by itself, and
-	// in the NORMAL position a request for turbo is simply discarded.
+	// The physical switch is "force 1MHz, or merely ALLOW 20MHz" -- it never
+	// accelerates the machine by itself.
+	//
+	// VICE adds a wrinkle worth knowing: the switch is honoured only while the
+	// hardware registers are DISABLED. Software that opens the register bank
+	// takes the switch out of circuit entirely.
 	SystemFixture f;
-	const u8 code[] = { 0x8D, 0x7B, 0xD0 };	// STA $D07B -- ask for turbo
+	const u8 code[] = { 0xEA };
 	f.installKernal( 0xE000, code, sizeof( code ), 0xE000 );
 
-	f.regs.setSpeedSwitchAllowsTurbo( false );
+	f.regs.setSpeedSwitchAllowsTurbo( false );		// switch selects 1MHz
 	f.start();
+	f.regs.setSpeedSwitchAllowsTurbo( false );
 
-	CHECK( !f.regs.turboEnabled() );		// locked at 1MHz after reset
-	f.cpu.step();
-	CHECK( !f.regs.turboEnabled() );		// and the request was ignored
+	CHECK( !f.regs.fastMode() );					// held at 1MHz by the switch
 
-	// $D0B5 bit 6 reports the switch, bit 7 still says "accelerator present".
+	// $D0B5 bit 6 reports the switch position.
 	u8 v;
 	CHECK( f.regs.ioRead( 0xD0B5, v ) );
-	CHECK_EQ( v & 0x40, SCPU_SWITCH_SPEED_NORMAL );
-	CHECK_EQ( v & 0x80, 0x00 );
+	CHECK_EQ( v & SCPU_SWITCH_1MHZ, SCPU_SWITCH_1MHZ );
 
-	// Flip the switch to TURBO: permitted, but not automatic.
+	// Opening the register bank takes the switch out of circuit.
+	f.regs.ioWrite( SCPU_REG_HWREGS_ENABLE, 0 );
+	CHECK( f.regs.fastMode() );
+
+	// ...and closing it puts the switch back in charge.
+	f.regs.ioWrite( SCPU_REG_HWREGS_DISABLE, 0 );
+	CHECK( !f.regs.fastMode() );
+
+	// Flipping the switch to turbo permits speed, but software still decides.
 	f.regs.setSpeedSwitchAllowsTurbo( true );
+	CHECK( f.regs.fastMode() );
 	CHECK( f.regs.ioRead( 0xD0B5, v ) );
-	CHECK_EQ( v & 0x40, 0x00 );
-
-	f.cpu.m_PC = 0xE000;
-	f.cpu.step();
-	CHECK( f.regs.turboEnabled() );
+	CHECK_EQ( v & SCPU_SWITCH_1MHZ, 0x00 );
 }
 
 TEST( integration_moving_switch_to_normal_drops_speed_immediately )
@@ -386,6 +392,7 @@ TEST( integration_moving_switch_to_normal_drops_speed_immediately )
 TEST( integration_status_block_reports_distinct_flags )
 {
 	// $D0B0-$D0BF is not a mirrored block: each address carries its own flags.
+	// Layout verified against VICE's SCPU64 emulation.
 	SystemFixture f;
 	const u8 code[] = { 0xEA };
 	f.installKernal( 0xE000, code, sizeof( code ), 0xE000 );
@@ -393,29 +400,40 @@ TEST( integration_status_block_reports_distinct_flags )
 
 	u8 v;
 
-	// $D0B2: bit7 hardware registers enabled, bit6 system running at 1MHz.
+	// $D0B0: hardware version.
+	CHECK( f.regs.ioRead( 0xD0B0, v ) );
+	CHECK_EQ( v & 0xC0, SCPU_VERSION_V2 );
+
+	// $D0B2: bit7 register bank open, bit6 system 1MHz. Both clear after reset.
 	CHECK( f.regs.ioRead( 0xD0B2, v ) );
-	CHECK_EQ( v & SCPU_STATUS_HWREGS, 0x00 );		// bank closed after reset
-	CHECK_EQ( v & SCPU_STATUS_1MHZ,   0x00 );		// and in turbo
+	CHECK_EQ( v & SCPU_STATUS_HWREGS,   0x00 );
+	CHECK_EQ( v & SCPU_STATUS_SYS_1MHZ, 0x00 );
 
 	f.regs.ioWrite( SCPU_REG_HWREGS_ENABLE, 0 );
-	f.regs.ioWrite( SCPU_REG_SPEED_NORMAL, 0 );
 	CHECK( f.regs.ioRead( 0xD0B2, v ) );
 	CHECK_EQ( v & SCPU_STATUS_HWREGS, SCPU_STATUS_HWREGS );
-	CHECK_EQ( v & SCPU_STATUS_1MHZ,   SCPU_STATUS_1MHZ );
+
+	// System 1MHz is a separate request from software 1MHz.
+	f.regs.ioWrite( SCPU_REG_SYS_1MHZ_ON, 0 );
+	CHECK( f.regs.ioRead( 0xD0B2, v ) );
+	CHECK_EQ( v & SCPU_STATUS_SYS_1MHZ, SCPU_STATUS_SYS_1MHZ );
+	CHECK( !f.regs.fastMode() );
+	f.regs.ioWrite( SCPU_REG_SYS_1MHZ_OFF, 0 );
+	CHECK( f.regs.fastMode() );
 
 	// $D0B4: current optimization mode in bits 7-6.
 	f.regs.ioWrite( SCPU_REG_OPT_BASIC, 0 );
 	CHECK( f.regs.ioRead( 0xD0B4, v ) );
-	CHECK_EQ( v & 0xC0, SCPU_OPTFLAG_BASIC );
+	CHECK_EQ( v & 0xC0, SCPU_OPTIM_BASIC );
+	CHECK_EQ( f.wb.optMode(), SCPU_OPT_BASIC );
 
 	f.regs.ioWrite( SCPU_REG_OPT_VICBANK2, 0 );		// the GEOS setting
 	CHECK( f.regs.ioRead( 0xD0B4, v ) );
-	CHECK_EQ( v & 0xC0, SCPU_OPTFLAG_VICBANK2 );
+	CHECK_EQ( v & 0xC0, SCPU_OPTIM_VICBANK2 );
 
 	f.regs.ioWrite( SCPU_REG_OPT_NONE, 0 );
 	CHECK( f.regs.ioRead( 0xD0B4, v ) );
-	CHECK_EQ( v & 0xC0, SCPU_OPTFLAG_NONE );
+	CHECK_EQ( v & 0xC0, SCPU_OPTIM_NONE );
 
 	// $D0B5: JiffyDOS switch in bit 7.
 	f.regs.setJiffyDOSSwitch( true );
@@ -426,13 +444,71 @@ TEST( integration_status_block_reports_distinct_flags )
 	CHECK( f.regs.ioRead( 0xD0B6, v ) );
 	CHECK_EQ( v & SCPU_PROC_EMULATION, SCPU_PROC_EMULATION );
 
-	// $D0B3 is the one writable register, and only while the bank is open.
-	CHECK( f.regs.ioWrite( 0xD0B3, 0x5A ) );
-	CHECK( f.regs.ioRead( 0xD0B3, v ) );
-	CHECK_EQ( v, 0x5A );
+	// $D0B8 and its mirror $D0B9 (decimal 53433) report the software request in
+	// bit 7 and the combined "anything asking for 1MHz" in bit 6.
+	f.regs.ioWrite( SCPU_REG_SOFT_1MHZ_ON, 0 );
+	CHECK( f.regs.ioRead( 0xD0B8, v ) );
+	CHECK_EQ( v & SCPU_SPEED_SOFT_1MHZ, SCPU_SPEED_SOFT_1MHZ );
+	CHECK_EQ( v & SCPU_SPEED_ANY_1MHZ,  SCPU_SPEED_ANY_1MHZ );
 
-	f.regs.ioWrite( SCPU_REG_HWREGS_DISABLE, 0 );
-	CHECK( !f.regs.ioWrite( 0xD0B3, 0x11 ) );		// refused with the bank closed
+	u8 mirrored;
+	CHECK( f.regs.ioRead( 0xD0B9, mirrored ) );
+	CHECK_EQ( mirrored, v );						// $D0B9 mirrors $D0B8
+
+	f.regs.ioWrite( SCPU_REG_SOFT_1MHZ_OFF, 0 );
+	CHECK( f.regs.ioRead( 0xD0B8, v ) );
+	CHECK_EQ( v & SCPU_SPEED_SOFT_1MHZ, 0x00 );
+
+	// $D0B3 is writable on v2 while the bank is open.
+	CHECK( f.regs.ioWrite( 0xD0B3, 0x40 ) );
 	CHECK( f.regs.ioRead( 0xD0B3, v ) );
-	CHECK_EQ( v, 0x5A );							// still readable, unchanged
+	CHECK_EQ( v & 0xC0, 0x40 );
+}
+
+TEST( integration_low_optim_bits_appear_in_every_status_read )
+{
+	// VICE ORs the low three bits of the optimization register into every read
+	// of the $D0Bx block, whichever register was addressed.
+	SystemFixture f;
+	const u8 code[] = { 0xEA };
+	f.installKernal( 0xE000, code, sizeof( code ), 0xE000 );
+	f.start();
+
+	f.regs.ioWrite( SCPU_REG_HWREGS_ENABLE, 0 );
+	f.regs.ioWrite( 0xD0B3, 0x05 );			// sets low bits 0 and 2
+
+	u8 a, b, c;
+	CHECK( f.regs.ioRead( 0xD0B0, a ) );
+	CHECK( f.regs.ioRead( 0xD0B5, b ) );
+	CHECK( f.regs.ioRead( 0xD0BC, c ) );
+
+	CHECK_EQ( a & 0x07, 0x05 );
+	CHECK_EQ( b & 0x07, 0x05 );
+	CHECK_EQ( c & 0x07, 0x05 );
+}
+
+TEST( integration_hardware_registers_gate_the_optimisation_selects )
+{
+	SystemFixture f;
+	const u8 code[] = { 0xEA };
+	f.installKernal( 0xE000, code, sizeof( code ), 0xE000 );
+	f.start();
+
+	// Bank closed: the optimisation select is decoded but does nothing.
+	SCPUOptMode before = f.wb.optMode();
+	f.regs.ioWrite( SCPU_REG_OPT_BASIC, 0 );
+	CHECK_EQ( f.wb.optMode(), before );
+
+	// Bank open: it takes effect.
+	f.regs.ioWrite( SCPU_REG_HWREGS_ENABLE, 0 );
+	f.regs.ioWrite( SCPU_REG_OPT_BASIC, 0 );
+	CHECK_EQ( f.wb.optMode(), SCPU_OPT_BASIC );
+
+	// Speed selection is NOT gated -- that is what makes POKE 53370,0 work
+	// straight from BASIC without opening the bank first.
+	f.regs.ioWrite( SCPU_REG_HWREGS_DISABLE, 0 );
+	f.regs.ioWrite( SCPU_REG_SOFT_1MHZ_ON, 0 );
+	CHECK( !f.regs.fastMode() );
+	f.regs.ioWrite( SCPU_REG_SOFT_1MHZ_OFF, 0 );
+	CHECK( f.regs.fastMode() );
 }

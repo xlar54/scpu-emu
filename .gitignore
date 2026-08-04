@@ -110,3 +110,6 @@ Desktop.ini
 /_toolchain/
 /_radmain/
 Source/kernel8.img
+
+# Local reference checkout of VICE, for its SCPU64 emulation.
+/_vice/

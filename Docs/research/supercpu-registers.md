@@ -1,10 +1,24 @@
 # CMD SuperCPU — register reference
 
-What SCPU-EMU implements, and how confident we are in each entry. Anything
-marked **inferred** should be confirmed against real hardware or VICE before it
-is relied on.
+**Source of truth: VICE's SCPU64 emulation** (`vice/src/scpu64/scpu64mem.c`,
+`scpu64_hardware_read` / `scpu64_hardware_store`), which is exercised by real
+SuperCPU software. A local copy is in `_vice/` (git-ignored).
 
-Implemented in `Source/SuperCPU/registers.cpp`.
+This document was originally derived from manuals and community documentation
+and was **wrong in several places**. Corrections, all confirmed against VICE:
+
+| Address | Was documented here as | Actually |
+|---|---|---|
+| `$D078` | VIC bank 0 optimization *(inferred)* | **SIMM configuration** — takes a value |
+| `$D079` | VIC bank 3 optimization *(inferred)* | **mirror of `$D07B`** (software 1MHz disable) |
+| `$D072` / `$D073` | absent | **system 1MHz enable / disable** |
+| `$D07D` | absent | mirror of `$D07F` |
+| `$D0Bx` | one mirrored status byte | **each address distinct, and several are writable** |
+| speed | one turbo flag | **three independent 1MHz requests** |
+
+The two I had marked *inferred* were the two that were wrong, which is at least
+the uncertainty landing where it belonged. Everything previously marked
+*confirmed* held up.
 
 ## Write-sensitive switches
 
@@ -23,13 +37,15 @@ hardware register bank to be open (`$D07E`).
 | `$D075` | 53365 | VIC bank 1 (`$4000-$7FFF`) | **confirmed** |
 | `$D076` | 53366 | BASIC — mirror only `$0400-$07FF` | **confirmed** |
 | `$D077` | 53367 | No optimization — mirror everything | **confirmed** |
-| `$D078` | 53368 | VIC bank 0 (`$0000-$3FFF`), V2 only | **inferred** |
-| `$D079` | 53369 | VIC bank 3 (`$C000-$FFFF`), V2 only | **inferred** |
+| `$D078` | 53368 | **SIMM configuration** — takes a value, not a switch | **VICE** |
+| `$D079` | 53369 | **mirror of `$D07B`** — software 1MHz disable | **VICE** |
 
-V2 hardware is documented as adding VIC banks 0 and 3 plus per-bank and full
-optimization with granular zero-page/stack control via a "Z flag". That the two
-new banks landed at `$D078`/`$D079` is the obvious reading but is not stated
-outright in the sources consulted.
+There are only four optimization selects, not six. The mode is held in bits 7-6
+of an internal optimization register, taken from the low two bits of the
+address: `$D074` -> `00`, `$D075` -> `01`, `$D076` -> `10`, `$D077` -> `11`. The
+same register is readable and writable at `$D0B3` (v2) and `$D0B4`, and its low
+three bits — the "Z" and "B" flags — are OR'd into **every** read of the
+`$D0Bx` block, whichever address was used.
 
 The documented mode semantics, which drive `CWriteBuffer`:
 
@@ -42,12 +58,28 @@ The documented mode semantics, which drive `CWriteBuffer`:
 
 ### Speed select
 
-Always available, whether or not the register bank is open.
+Always available, whether or not the register bank is open — which is what makes
+`POKE 53370,0` usable straight from BASIC.
 
-| Address | Decimal | Function | Confidence |
-|---|---|---|---|
-| `$D07A` | 53370 | Normal — 1MHz (2MHz in C128 fast mode) | **confirmed** |
-| `$D07B` | 53371 | Turbo — 20MHz | **confirmed** |
+| Address | Decimal | Function |
+|---|---|---|
+| `$D072` | 53362 | system 1MHz **enable** |
+| `$D073` | 53363 | system 1MHz **disable** |
+| `$D07A` | 53370 | software 1MHz **enable** (slow) |
+| `$D079`, `$D07B` | 53369, 53371 | software 1MHz **disable** (fast) |
+
+**There are three independent requests for 1MHz**, not one turbo flag: the
+system request, the software request, and the physical switch. The machine runs
+fast only when none of them is asserting:
+
+```
+fast = !( sys1MHz || soft1MHz || ( switchSlow && !hwRegsEnabled ) )
+```
+
+Note the last term. **The physical speed switch is honoured only while the
+hardware registers are disabled.** Software that opens the register bank takes
+the switch out of circuit entirely — a detail no manual mentions and which no
+amount of reading documentation would have produced.
 
 ### Register bank enable
 

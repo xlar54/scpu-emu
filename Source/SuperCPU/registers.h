@@ -8,17 +8,20 @@
    reaches the C64 -- nothing on the machine decodes $D074 and a stray write
    would simply be lost.
 
-   Almost all of them are "write-sensitive switches": storing *any* value
-   triggers the action, the value itself is ignored, and the location cannot be
-   read back. That is why BASIC code toggles speed with POKE 53370,0 /
-   POKE 53371,0 -- the 0 is meaningless.
+   SOURCE OF TRUTH: written against VICE's SCPU64 emulation
+   (vice/src/scpu64/scpu64mem.c, scpu64_hardware_read / scpu64_hardware_store),
+   which is exercised by real SuperCPU software. An earlier version of this file
+   was derived from manuals and community documentation and got several things
+   wrong: $D078 is SIMM configuration rather than an optimization mode, $D079 is
+   a mirror of $D07B rather than an optimization mode, $D072/$D073 were missing
+   entirely, and most of the $D0Bx block turned out to be readable AND writable
+   with distinct meanings rather than a single status byte. Where documentation
+   and VICE disagree, VICE wins.
 
-   Confidence note. The $D07x switches and the whole $D0Bx status block are
-   corroborated by the CMD SuperCPU 128 V2 user's guide, the SuperCPU 128
-   register list and the compatibility notes. $D078/$D079 (VIC banks 0 and 3 on
-   V2 hardware) are documented as existing but their exact assignment is
-   inferred, and the bit encoding of $D0B3 is only partly known. Both are
-   flagged in Docs/research/supercpu-registers.md.
+   The $D07x registers are "write-sensitive switches": storing any value
+   triggers the action and the value is ignored. That is why BASIC toggles speed
+   with POKE 53370,0 -- the 0 carries no meaning. The $D0Bx block is different:
+   genuinely readable, and several entries take meaningful bit values on write.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -40,65 +43,68 @@
 #include "../C64/c64_memory.h"
 #include "write_buffer.h"
 
-// --- optimization mode selects (write-sensitive) ---------------------------
-#define SCPU_REG_OPT_VICBANK2   0xD074	// "GEOS optimization"
-#define SCPU_REG_OPT_VICBANK1   0xD075
-#define SCPU_REG_OPT_BASIC      0xD076
-#define SCPU_REG_OPT_NONE       0xD077
-#define SCPU_REG_OPT_VICBANK0   0xD078	// V2 only, assignment inferred
-#define SCPU_REG_OPT_VICBANK3   0xD079	// V2 only, assignment inferred
+// --- $D07x, write-sensitive ------------------------------------------------
+#define SCPU_REG_D071           0xD071	// decoded, no effect
+#define SCPU_REG_SYS_1MHZ_ON    0xD072	// system 1MHz enable
+#define SCPU_REG_SYS_1MHZ_OFF   0xD073	// system 1MHz disable
+#define SCPU_REG_OPT_VICBANK2   0xD074	// "GEOS optimization" -> optim bits 7-6 = 00
+#define SCPU_REG_OPT_VICBANK1   0xD075	//                     -> 01
+#define SCPU_REG_OPT_BASIC      0xD076	//                     -> 10
+#define SCPU_REG_OPT_NONE       0xD077	//                     -> 11
+#define SCPU_REG_SIMM_CONFIG    0xD078	// SIMM configuration; takes a value
+#define SCPU_REG_SOFT_1MHZ_ALT  0xD079	// mirror of $D07B
+#define SCPU_REG_SOFT_1MHZ_ON   0xD07A	// 53370: software 1MHz enable  (slow)
+#define SCPU_REG_SOFT_1MHZ_OFF  0xD07B	// 53371: software 1MHz disable (fast)
+#define SCPU_REG_D07C           0xD07C	// decoded, no effect
+#define SCPU_REG_HWREGS_ALT     0xD07D	// mirror of $D07F
+#define SCPU_REG_HWREGS_ENABLE  0xD07E	// 53374
+#define SCPU_REG_HWREGS_DISABLE 0xD07F	// 53375
 
-// --- speed select (write-sensitive) ----------------------------------------
-#define SCPU_REG_SPEED_NORMAL   0xD07A	// 53370: 1MHz (2MHz in C128 fast mode)
-#define SCPU_REG_SPEED_TURBO    0xD07B	// 53371: 20MHz
-
-// --- register bank enable (write-sensitive) --------------------------------
-#define SCPU_REG_HWREGS_ENABLE  0xD07E
-#define SCPU_REG_HWREGS_DISABLE 0xD07F
-
-// --- status block, $D0B0-$D0BF (read) --------------------------------------
-// Each address carries distinct flags; this is not a mirrored block.
-#define SCPU_REG_MODE           0xD0B0	// version / 64-vs-128 mode
-#define SCPU_REG_STATUS         0xD0B2	// bit7 hw-regs enabled, bit6 system 1MHz
-#define SCPU_REG_ENHANCED_OPT   0xD0B3	// v2 enhanced optimization (read/write)
-#define SCPU_REG_OPTFLAGS       0xD0B4	// bits 7-6: current optimization mode
-#define SCPU_REG_SWITCHES       0xD0B5	// bit7 JiffyDOS switch, bit6 speed switch
-#define SCPU_REG_PROCFLAGS      0xD0B6	// bit7 emulation mode, bit6 reset switch (v1)
-#define SCPU_REG_SPEEDFLAGS     0xD0B8	// bit7 software speed, bit6 master speed
-#define SCPU_REG_DOSFLAGS       0xD0BC	// bit7 DOS extension, bit6 RAMLink regs
+// --- $D0Bx, readable and partly writable -----------------------------------
+#define SCPU_REG_VERSION        0xD0B0	// bits 7-6: hardware version
+#define SCPU_REG_STATUS         0xD0B2	// b7 hwregs enabled, b6 system 1MHz
+#define SCPU_REG_OPTIM_V2       0xD0B3	// v2 only: optimization, read/write
+#define SCPU_REG_OPTIM          0xD0B4	// optimization mode, read/write
+#define SCPU_REG_SWITCHES       0xD0B5	// b7 JiffyDOS switch, b6 speed switch
+#define SCPU_REG_PROCMODE       0xD0B6	// read: b7 emulation mode. write: bootmap off
+#define SCPU_REG_BOOTMAP_ON     0xD0B7	// write: bootmap on
+#define SCPU_REG_SPEEDFLAGS     0xD0B8	// b7 software 1MHz, b6 1MHz from any source
+#define SCPU_REG_SPEEDFLAGS_ALT 0xD0B9	// 53433: mirror of $D0B8
+#define SCPU_REG_DOSEXT         0xD0BC	// b7 DOS extension, b6 RAMLink
+#define SCPU_REG_DOSEXT_ALT     0xD0BD	// mirror of $D0BF
+#define SCPU_REG_DOSEXT_ON      0xD0BE
+#define SCPU_REG_DOSEXT_OFF     0xD0BF
+#define SCPU_REG_STATUS_FIRST   0xD0B0
 #define SCPU_REG_STATUS_LAST    0xD0BF
 
-// Detection: bit 7 of $D0BC reads 1 on a stock machine and 0 on a SuperCPU.
-#define SCPU_DETECT_BIT         0x80
+// $D0B0 bits 7-6. The SCPU64 reports only "v2" or "not v2"; the 64-vs-128
+// distinction belongs to the SuperCPU 128's own register set.
+#define SCPU_VERSION_V2         0x40
+#define SCPU_VERSION_V1         0xC0
 
-// $D0B5
-#define SCPU_SWITCH_JIFFYDOS    0x80	// 1 = JiffyDOS switch enabled
-#define SCPU_SWITCH_SPEED_NORMAL 0x40	// 1 = switch in NORMAL, locked to 1MHz
+#define SCPU_STATUS_HWREGS      0x80	// $D0B2
+#define SCPU_STATUS_SYS_1MHZ    0x40
 
-// $D0B2
-#define SCPU_STATUS_HWREGS      0x80
-#define SCPU_STATUS_1MHZ        0x40
+// $D0B5 -- note the polarity: the bit is SET when the switch selects 1MHz.
+#define SCPU_SWITCH_JIFFYDOS    0x80
+#define SCPU_SWITCH_1MHZ        0x40
 
-// $D0B4 optimization encoding, bits 7-6
-#define SCPU_OPTFLAG_VICBANK2   0x00
-#define SCPU_OPTFLAG_VICBANK1   0x40
-#define SCPU_OPTFLAG_BASIC      0x80
-#define SCPU_OPTFLAG_NONE       0xC0
+#define SCPU_PROC_EMULATION     0x80	// $D0B6
 
-// $D0B6
-#define SCPU_PROC_EMULATION     0x80
+#define SCPU_SPEED_SOFT_1MHZ    0x80	// $D0B8
+#define SCPU_SPEED_ANY_1MHZ     0x40
 
-// $D0B8
-#define SCPU_SPEEDFLAG_SW_NORMAL     0x80
-#define SCPU_SPEEDFLAG_MASTER_NORMAL 0x40
+#define SCPU_DOS_EXTENSION      0x80	// $D0BC
+#define SCPU_DOS_RAMLINK        0x40
 
-// $D0B0 bit 7/6 encoding
-#define SCPU_MODE_V2_128        0x00	// 00xxxxxx
-#define SCPU_MODE_V2_64         0x40	// 01xxxxxx
-#define SCPU_MODE_V1_OR_OFF     0xC0	// 11xxxxxx
+// Optimization mode, bits 7-6 of the optimization register.
+#define SCPU_OPTIM_VICBANK2     0x00	// GEOS
+#define SCPU_OPTIM_VICBANK1     0x40
+#define SCPU_OPTIM_BASIC        0x80
+#define SCPU_OPTIM_NONE         0xC0
 
 // --- private RAM windows ---------------------------------------------------
-#define SCPU_SYSRAM_BASE        0xD200	// $D200-$D2FF, reserved for the SCPU DOS
+#define SCPU_SYSRAM_BASE        0xD200	// $D200-$D2FF, SuperCPU DOS scratch
 #define SCPU_SYSRAM_SIZE        0x0100
 #define SCPU_USERRAM_BASE       0xD300	// $D300-$D3FF, free for user programs
 #define SCPU_USERRAM_SIZE       0x0100
@@ -113,16 +119,16 @@ public:
 	void attach( CWriteBuffer *writeBuffer ) { m_WriteBuffer = writeBuffer; }
 
 	void setHardwareVersion( SCPUHardwareVersion v ) { m_Version = v; }
-	void setC128Mode( bool c128 ) { m_C128Mode = c128; }
 
-	// Position of the physical speed switch. True (the default) is the TURBO
-	// position, which permits software to select 20MHz; false is NORMAL, which
-	// locks the machine to 1MHz and makes writes to $D07B a no-op.
-	void setSpeedSwitchAllowsTurbo( bool allow );
-	bool speedSwitchAllowsTurbo() const { return m_SwitchAllowsTurbo; }
+	// Physical switch positions on the cartridge.
+	void setSpeedSwitchAllowsTurbo( bool allow );	// false = switch selects 1MHz
+	void setJiffyDOSSwitch( bool on ) { m_SwitchJiffy = on; }
 
-	// Position of the JiffyDOS switch, reported in $D0B5 bit 7.
-	void setJiffyDOSSwitch( bool on ) { m_JiffyDOSSwitch = on; }
+	bool speedSwitchAllowsTurbo() const { return !m_SwitchSlow; }
+
+	// Emulation vs native mode, reported at $D0B6. The 65816 core drives this
+	// from its E flag; the 6502 core is always in emulation mode.
+	void setEmulationMode( bool emulation ) { m_EmulationMode = emulation; }
 
 	void reset();
 
@@ -131,32 +137,57 @@ public:
 	bool ioWrite( u16 addr, u8 value ) override;
 
 	// --- state ------------------------------------------------------------
-	bool turboEnabled() const      { return m_Turbo; }
-	bool hardwareRegsEnabled() const { return m_HWRegsEnabled; }
+	// The machine runs fast only when nothing is asking for 1MHz. Three
+	// independent sources, and this is VICE's rule verbatim -- note that the
+	// physical switch is honoured only while the hardware registers are
+	// DISABLED, so software that opens the register bank takes the switch out
+	// of circuit.
+	bool fastMode() const
+	{
+		return !( m_Sys1MHz || m_Soft1MHz || ( m_SwitchSlow && !m_HWRegsEnabled ) );
+	}
 
-	// Set when software last switched speed, so the timing layer can pick up
-	// the change without polling.
+	bool turboEnabled() const        { return fastMode(); }
+	bool hardwareRegsEnabled() const { return m_HWRegsEnabled; }
+	bool bootmapEnabled() const      { return m_Bootmap; }
+	bool dosExtensionEnabled() const { return m_DOSExt; }
+	u8   simmConfig() const          { return m_SIMMConfig; }
+	u8   optimRegister() const       { return m_Optim; }
+
+	// Set when anything changed the speed, so the pacer can be re-armed.
 	bool consumeSpeedChanged();
 
-	u64 m_RegWrites;	// statistics
+	u64 m_RegWrites;
 
 private:
 	CWriteBuffer *m_WriteBuffer;
 
 	SCPUHardwareVersion m_Version;
-	bool m_C128Mode;
 
-	bool m_Turbo;
+	// The three independent 1MHz requests, plus the physical switches.
+	bool m_Sys1MHz;			// $D072 / $D073 / $D0B2
+	bool m_Soft1MHz;		// $D07A / $D07B / $D0B8
+	bool m_SwitchSlow;		// physical speed switch in the 1MHz position
+	bool m_SwitchJiffy;		// physical JiffyDOS switch
+
 	bool m_HWRegsEnabled;
+	bool m_Bootmap;
+	bool m_DOSExt;
+	bool m_RAMLink;
+	bool m_EmulationMode;
 	bool m_SpeedChanged;
-	bool m_SwitchAllowsTurbo;
-	bool m_JiffyDOSSwitch;
-	u8   m_EnhancedOpt;
 
-	u8 m_SysRAM[ SCPU_SYSRAM_SIZE ];
-	u8 m_UserRAM[ SCPU_USERRAM_SIZE ];
+	u8   m_Optim;			// bits 7-6 mode; bits 2-0 OR'd into every $D0Bx read
+	u8   m_SIMMConfig;
 
-	void selectOptMode( SCPUOptMode mode );
+	u8   m_SysRAM[ SCPU_SYSRAM_SIZE ];
+	u8   m_UserRAM[ SCPU_USERRAM_SIZE ];
+
+	void applyOptimisation();
+
+	// Call around anything that can change speed; records a change if the
+	// effective fast/slow state actually moved.
+	void noteSpeedChange( bool wasFast );
 };
 
 #endif
