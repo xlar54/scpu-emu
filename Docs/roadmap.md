@@ -72,7 +72,14 @@ KERNAL with the Pi as the CPU.
       the expansion port (`Tests/Integration/test_kernal_65816.cpp`).
 - [x] Selectable from the SD card via `CPU_CORE` in `scpu.cfg`, so a bad run can
       be backed out without a rebuild. Defaults to the 65816.
-- [ ] **Runs on real hardware.**
+- [x] **Runs on real hardware.** The full stack: the CMD splash animation
+      (double-buffered, raster-interrupt driven), the SuperCPU DOS banner with
+      JiffyDOS, 16MB detected by CMD's own sizing code, a stable display, and
+      WORKING IEC DISK ACCESS against both a JiffyDOS FD-4000 and a stock 1571.
+      The disk chain alone consumed eleven firmware builds; the fixes that
+      mattered: the $D0B2 kernal-window trampoline, immediate speed-register
+      pacing, serial-activity-gated mirror suppression (pauses have protocol
+      meaning: >200us means EOI), and border-synchronised display flips.
 - [ ] `MVN`/`MVP` range invalidation into the write buffer. A block move into
       shadowed bank 0 can dirty 64KB in one instruction; the buffer currently
       handles that as 65536 individual mirrored writes.
