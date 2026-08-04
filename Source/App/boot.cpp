@@ -133,6 +133,36 @@ static bool scpuCheckButton( void *ctx )
 			}
 
 			// Last 16 I/O accesses, oldest first: rWADDR=VAL.
+			// The CIA conversation, which the idle loop cannot flood: the DDR
+			// and interrupt-mask setup, then every ATN/CLK/DATA toggle. This is
+			// the serial transaction itself, however long ago it stalled.
+			for ( u32 row = 0; row < 4; row++ )
+			{
+				n = 0;
+				for ( u32 i = 0; i < 16; i++ )
+				{
+					const u32 e = scpu->memory().m_CIALog[ ( scpu->memory().m_CIALogPos + row * 16 + i ) & 63 ];
+					line[ n++ ] = ( e >> 24 ) ? 'w' : 'r';
+					n += scpuHexByte( line + n, (u8)( ( e >> 8 ) & 0xFF ) ) - 1;
+					n += scpuHexByte( line + n, (u8)( e & 0xFF ) ) - 1;
+					line[ n++ ] = '=';
+					n += scpuHexByte( line + n, (u8)( ( e >> 16 ) & 0xFF ) );
+				}
+				line[ n ] = 0;
+				s_Logger->Write( "SCPU", LogNotice, "  cia%u: %s", row, line );
+			}
+
+			// Live serial line state, read once, non-destructively ($DD0D is
+			// deliberately NOT read -- reading the ICR clears it).
+			if ( scpu->memory().read8( 0x0001 ) != 0 )	// cheap always-true guard
+			{
+				const u8 dd00 = scpu->memory().read8( 0xDD00 );
+				const u8 dd02 = scpu->memory().read8( 0xDD02 );
+				s_Logger->Write( "SCPU", LogNotice,
+				               "  live: $DD00=$%02X (DATAin=%u CLKin=%u) $DD02=$%02X",
+				               dd00, ( dd00 >> 7 ) & 1, ( dd00 >> 6 ) & 1, dd02 );
+			}
+
 			// 64 accesses, oldest first, 16 per line. Lower-case = went to the
 			// real machine; upper-case W = intercepted SuperCPU register.
 			for ( u32 row = 0; row < 4; row++ )

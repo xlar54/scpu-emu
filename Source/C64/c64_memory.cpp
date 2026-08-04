@@ -37,7 +37,7 @@ CC64Memory::CC64Memory()
 	  m_IECThrottleEnabled( true ), m_IECHoldCycles( 0 ),
 	  m_LastCIA2PortA( 0 ), m_HaveCIA2PortA( false ),
 	  m_LastVICControl{ 0, 0, 0 }, m_HaveVICControl( 0 ),
-	  m_IOLog{ 0 }, m_IOLogPos( 0 ),
+	  m_IOLog{ 0 }, m_IOLogPos( 0 ), m_CIALog{ 0 }, m_CIALogPos( 0 ),
 	  m_TimingHook( 0 ), m_TimingHookCtx( 0 )
 {
 	c64BankingInit();
@@ -195,6 +195,8 @@ u8 CC64Memory::read8( scpu_addr_t addr )
 			m_IOReads++;
 			v = m_C64 ? m_C64->read( a ) : 0xFF;
 			m_IOLog[ m_IOLogPos++ & 63 ] = (u32)a | ( (u32)v << 16 );
+			if ( ( a & 0xFE00 ) == 0xDC00 )
+				m_CIALog[ m_CIALogPos++ & 63 ] = (u32)a | ( (u32)v << 16 );
 			if ( a == 0xDD00 )
 			{
 				m_LastCIA2PortA = v;
@@ -334,6 +336,8 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 
 		m_IOWrites++;
 		m_IOLog[ m_IOLogPos++ & 63 ] = (u32)a | ( (u32)value << 16 ) | ( 1u << 24 );
+		if ( ( a & 0xFE00 ) == 0xDC00 )
+			m_CIALog[ m_CIALogPos++ & 63 ] = (u32)a | ( (u32)value << 16 ) | ( 1u << 24 );
 		if ( m_C64 ) m_C64->write( a, value );
 		return;
 	}

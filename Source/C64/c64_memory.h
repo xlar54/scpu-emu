@@ -355,6 +355,13 @@ public:
 	// last few accesses name the conversation that died.
 	u32 m_IOLog[ 64 ];
 	u8  m_IOLogPos;		// wraps at 64
+
+	// A second ring for CIA traffic only ($DC00-$DDFF). The general ring gets
+	// flooded by whatever loop the machine is in; the CIA conversation -- DDR
+	// setup, interrupt mask writes, ATN/CLK/DATA toggles -- is the part a
+	// serial post-mortem actually needs, and it must survive the flood.
+	u32 m_CIALog[ 64 ];
+	u8  m_CIALogPos;
 private:
 	u8   m_HaveVICControl;			// bitmask of which of those have a baseline
 	TimingHook m_TimingHook;
