@@ -196,7 +196,10 @@ u8 CC64Memory::read8( scpu_addr_t addr )
 			v = m_C64 ? m_C64->read( a ) : 0xFF;
 			m_IOLog[ m_IOLogPos++ & 63 ] = (u32)a | ( (u32)v << 16 );
 			if ( ( a & 0xFE00 ) == 0xDC00 )
+			{
+				m_CIALogCyc[ m_CIALogPos & 63 ] = (u32)m_EmuCycles;
 				m_CIALog[ m_CIALogPos++ & 63 ] = (u32)a | ( (u32)v << 16 );
+			}
 			if ( a == 0xDD00 )
 			{
 				m_LastCIA2PortA = v;
@@ -349,7 +352,10 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 		m_IOWrites++;
 		m_IOLog[ m_IOLogPos++ & 63 ] = (u32)a | ( (u32)value << 16 ) | ( 1u << 24 );
 		if ( ( a & 0xFE00 ) == 0xDC00 )
+		{
+			m_CIALogCyc[ m_CIALogPos & 63 ] = (u32)m_EmuCycles;
 			m_CIALog[ m_CIALogPos++ & 63 ] = (u32)a | ( (u32)value << 16 ) | ( 1u << 24 );
+		}
 		if ( m_C64 ) m_C64->write( a, value );
 		return;
 	}

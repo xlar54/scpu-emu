@@ -229,6 +229,7 @@ public:
 	// call. The clock work itself is in tickSettle(), out of line.
 	inline void tickFast( u32 nCycles )
 	{
+		m_EmuCycles += nCycles;
 		if ( m_IntCredit < 0x100000 )
 			m_IntCredit += nCycles;
 
@@ -362,7 +363,13 @@ public:
 	// setup, interrupt mask writes, ATN/CLK/DATA toggles -- is the part a
 	// serial post-mortem actually needs, and it must survive the flood.
 	u32 m_CIALog[ 64 ];
+	u32 m_CIALogCyc[ 64 ];		// emulated-cycle stamp per entry: at 1MHz, 1 = 1us
 	u8  m_CIALogPos;
+
+	// Free-running emulated cycle counter, for timestamping. Incremented in
+	// tickFast, so it costs one add on a path that already runs per
+	// instruction.
+	u64 m_EmuCycles = 0;
 private:
 	u8   m_HaveVICControl;			// bitmask of which of those have a baseline
 	TimingHook m_TimingHook;

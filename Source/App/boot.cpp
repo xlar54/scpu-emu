@@ -166,6 +166,38 @@ static bool scpuCheckButton( void *ctx )
 				s_Logger->Write( "SCPU", LogNotice, "  cia%u: %s", row, line );
 			}
 
+			// The same entries as INTERVALS, emulated microseconds at 1MHz --
+			// the pulse widths and gaps the DRIVE actually experienced. This
+			// is the protocol timing itself: an ACK shorter than ~20us or a
+			// ready-gap beyond ~200us names the desync directly. Only writes
+			// are shown; w@+NNN means "this write came NNN us after the
+			// previous CIA access".
+			n = 0;
+			u32 shown = 0;
+			for ( u32 i = 1; i < 64 && shown < 16; i++ )
+			{
+				const u32 idx  = ( scpu->memory().m_CIALogPos + i ) & 63;
+				const u32 prev = ( scpu->memory().m_CIALogPos + i - 1 ) & 63;
+				const u32 e = scpu->memory().m_CIALog[ idx ];
+				if ( !( e >> 24 ) ) continue;		// writes only
+				u32 dt = scpu->memory().m_CIALogCyc[ idx ] - scpu->memory().m_CIALogCyc[ prev ];
+				if ( dt > 99999 ) dt = 99999;
+				line[ n++ ] = 'w';
+				n += scpuHexByte( line + n, (u8)( ( e >> 8 ) & 0xFF ) ) - 1;
+				n += scpuHexByte( line + n, (u8)( e & 0xFF ) ) - 1;
+				line[ n++ ] = '=';
+				n += scpuHexByte( line + n, (u8)( ( e >> 16 ) & 0xFF ) ) - 1;
+				line[ n++ ] = '+';
+				// decimal microseconds
+				char tmp[ 8 ]; int tn = 0;
+				do { tmp[ tn++ ] = (char)( '0' + dt % 10 ); dt /= 10; } while ( dt );
+				while ( tn ) line[ n++ ] = tmp[ --tn ];
+				line[ n++ ] = ' ';
+				shown++;
+			}
+			line[ n ] = 0;
+			s_Logger->Write( "SCPU", LogNotice, "  ciaT: %s", line );
+
 			// Live serial line state, read once, non-destructively ($DD0D is
 			// deliberately NOT read -- reading the ICR clears it).
 			if ( scpu->memory().read8( 0x0001 ) != 0 )	// cheap always-true guard
