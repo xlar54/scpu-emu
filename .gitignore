@@ -1,0 +1,112 @@
+# Build directories
+/build/
+/out/
+/dist/
+/cmake-build-*/
+
+# CMake and generated build-system files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile.user
+compile_commands.json
+
+# C/C++ compiler and linker output
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dll
+*.dylib
+*.exe
+*.elf
+*.axf
+*.map
+*.lst
+*.d
+*.su
+*.gcda
+*.gcno
+*.gcov
+
+# Raspberry Pi / bare-metal firmware output
+*.bin
+*.img
+*.hex
+*.uf2
+*.dtb
+*.dtbo
+kernel*.img
+
+# Generated test and diagnostic output
+/Testing/
+/test-results/
+/coverage/
+/logs/
+/traces/generated/
+*.log
+*.trace
+*.profraw
+*.profdata
+
+# Local ROM and cartridge images (do not commit copyrighted binaries)
+/ROMs/*
+!/ROMs/README.md
+!/ROMs/manifest.example.json
+!/ROMs/.gitkeep
+*.rom
+*.crt
+
+# Local configuration and secrets
+*.local
+*.local.*
+.env
+.env.*
+!.env.example
+
+# Editor and IDE state
+.vscode/
+.idea/
+.vs/
+*.code-workspace
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.swp
+*.swo
+*~
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Temporary and backup files
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+.#*
+
+# Local reference checkout; keep upstream RAD-Doom separate from project code
+/_radclone/
+
+# Raspberry Pi boot firmware. Freely redistributable, but 3MB of binary that is
+# better fetched than vendored -- see Firmware/RaspberryPi/README.md.
+/Firmware/RaspberryPi/*
+!/Firmware/RaspberryPi/README.md
+!/Firmware/RaspberryPi/config.txt
+
+# Staged SD card contents, assembled by "make sdcard" from files already
+# tracked or fetched elsewhere.
+/SDCard/
+
+# Downloaded build chain (toolchain + Circle) and upstream reference clones.
+/_toolchain/
+/_radmain/
+Source/kernel8.img

@@ -1,0 +1,224 @@
+/*
+   SCPU-EMU - CMD SuperCPU emulation for the C64/C128 using a RAD Expansion Unit
+   Copyright (c) 2026 SCPU-EMU contributors
+
+   Bank 0: the C64-visible 64K address space, served from the Raspberry Pi.
+
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+#include "c64_memory.h"
+
+CC64Memory::CC64Memory()
+	: m_Port00( 0x2F ), m_Port01( 0x37 ), m_BankMode( 0 ),
+	  m_IOReads( 0 ), m_IOWrites( 0 ), m_RamWrites( 0 ),
+	  m_C64( 0 ), m_Mirror( 0 ), m_IO( 0 ),
+	  m_HasBasic( false ), m_HasKernal( false ), m_HasChar( false )
+{
+	c64BankingInit();
+
+	for ( u32 i = 0; i < C64_RAM_SIZE; i++ )      m_RAM[ i ] = 0;
+	for ( u32 i = 0; i < C64_BASIC_SIZE; i++ )    m_Basic[ i ] = 0xFF;
+	for ( u32 i = 0; i < C64_KERNAL_SIZE; i++ )   m_Kernal[ i ] = 0xFF;
+	for ( u32 i = 0; i < C64_CHARROM_SIZE; i++ )  m_CharROM[ i ] = 0;
+
+	updateBankMode();
+}
+
+void CC64Memory::reset()
+{
+	m_Port00 = 0x2F;
+	m_Port01 = 0x37;
+	m_IOReads = m_IOWrites = m_RamWrites = 0;
+
+	for ( u32 i = 0; i < C64_RAM_SIZE; i++ )
+		m_RAM[ i ] = 0;
+
+	updateBankMode();
+}
+
+void CC64Memory::updateBankMode()
+{
+	C64BankConfig cfg;
+	cfg.port01 = c64PortEffective( m_Port00, m_Port01 );
+
+	if ( m_C64 )
+	{
+		const C64Signals &s = m_C64->signals();
+		cfg.game  = s.gameAsserted  ? 0 : 1;
+		cfg.exrom = s.exromAsserted ? 0 : 1;
+	} else
+	{
+		cfg.game = cfg.exrom = 1;	// nothing plugged in
+	}
+
+	m_BankMode = c64BankMode( &cfg );
+}
+
+void CC64Memory::setBasicROM( const u8 *data )
+{
+	for ( u32 i = 0; i < C64_BASIC_SIZE; i++ ) m_Basic[ i ] = data[ i ];
+	m_HasBasic = true;
+}
+
+void CC64Memory::setKernalROM( const u8 *data )
+{
+	for ( u32 i = 0; i < C64_KERNAL_SIZE; i++ ) m_Kernal[ i ] = data[ i ];
+	m_HasKernal = true;
+}
+
+void CC64Memory::setCharROM( const u8 *data )
+{
+	for ( u32 i = 0; i < C64_CHARROM_SIZE; i++ ) m_CharROM[ i ] = data[ i ];
+	m_HasChar = true;
+}
+
+bool CC64Memory::snapshotROMsFromBus()
+{
+	if ( !m_C64 )
+		return false;
+
+	// Only fill in what the caller did not already supply. Overwriting an image
+	// that was deliberately loaded from a file would silently discard it -- and
+	// the two ROMs are chosen independently, so "KERNAL from a file, BASIC from
+	// the machine" has to work.
+	if ( m_HasBasic && m_HasKernal )
+		return true;
+
+	// Sanity check: the machine must currently have its ROMs banked in. The
+	// reset vector lives in the KERNAL and must point back into it; if it does
+	// not, the halted 6510 left $01 somewhere unhelpful and everything we read
+	// would be DRAM rather than ROM.
+	u16 resetVec = (u16)( m_C64->read( 0xFFFC ) | ( (u16)m_C64->read( 0xFFFD ) << 8 ) );
+	m_IOReads += 2;
+	if ( resetVec < 0xE000 )
+		return false;
+
+	if ( !m_HasKernal )
+	{
+		m_C64->readBlock( 0xE000, m_Kernal, C64_KERNAL_SIZE );
+		m_HasKernal = true;
+	}
+
+	if ( !m_HasBasic )
+	{
+		m_C64->readBlock( 0xA000, m_Basic, C64_BASIC_SIZE );
+		m_HasBasic = true;
+	}
+
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+
+u8 CC64Memory::read8( scpu_addr_t addr )
+{
+	const u16 a = (u16)( addr & 0xFFFF );
+
+	// The 6510's on-chip port shadows the first two bytes of address space.
+	// $0001 must return the whole port, not just the three banking bits --
+	// software reads the cassette sense and motor lines through here too.
+	if ( a <= 1 )
+		return ( a == 0 ) ? m_Port00 : c64PortRead( m_Port00, m_Port01 );
+
+	switch ( c64MapRead( a, m_BankMode ) )
+	{
+	case REG_RAM:
+		return m_RAM[ a ];
+
+	case REG_BASIC:
+		return m_Basic[ a - 0xA000 ];
+
+	case REG_KERNAL:
+		return m_Kernal[ a - 0xE000 ];
+
+	case REG_CHARROM:
+		return m_CharROM[ a - 0xD000 ];
+
+	case REG_IO:
+		{
+			// Registers that live inside the cartridge never reach the C64.
+			u8 v;
+			if ( m_IO && m_IO->ioRead( a, v ) )
+				return v;
+
+			// Deliberately no flush here. Flushing before every I/O access
+			// meant a booting KERNAL -- which touches I/O constantly -- drove
+			// a continuous stream of unscheduled bursts across the visible
+			// display, corrupting the VIC-II's fetches. Mirroring is now
+			// scheduled against the raster in CSuperCPU::runFrame().
+			//
+			// The cost is that a program which stages a screen and immediately
+			// points the VIC at it may show stale data for one frame. The real
+			// SuperCPU mirrors asynchronously and has the same property.
+			m_IOReads++;
+			return m_C64 ? m_C64->read( a ) : 0xFF;
+		}
+
+	case REG_OPEN:
+	default:
+		// Open bus. Approximated as the high byte of the address, which is
+		// what the last VIC fetch usually leaves floating.
+		return (u8)( a >> 8 );
+	}
+}
+
+void CC64Memory::write8( scpu_addr_t addr, u8 value )
+{
+	const u16 a = (u16)( addr & 0xFFFF );
+
+	if ( a <= 1 )
+	{
+		if ( a == 0 ) m_Port00 = value; else m_Port01 = value;
+		updateBankMode();
+
+		// The C64 stores the port registers' shadow in DRAM too, and code does
+		// read $00/$01 back through the VIC's eyes in a few places.
+		m_RAM[ a ] = value;
+		if ( m_Mirror ) m_Mirror->onRamWrite( a, value );
+		return;
+	}
+
+	if ( c64WriteIsIO( a, m_BankMode ) )
+	{
+		if ( m_IO && m_IO->ioWrite( a, value ) )
+			return;
+
+		// No flush here either -- see the note in read8().
+		m_IOWrites++;
+		if ( m_C64 ) m_C64->write( a, value );
+		return;
+	}
+
+	// Everything else falls through to DRAM, including writes "into" ROM.
+	m_RAM[ a ] = value;
+	m_RamWrites++;
+
+	if ( m_Mirror )
+		m_Mirror->onRamWrite( a, value );
+}
+
+bool CC64Memory::irqAsserted()
+{
+	return m_C64 ? m_C64->irqAsserted() : false;
+}
+
+bool CC64Memory::nmiAsserted()
+{
+	return m_C64 ? m_C64->nmiAsserted() : false;
+}
+
+void CC64Memory::tick( u32 nCycles )
+{
+	(void)nCycles;
+}

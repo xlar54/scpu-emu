@@ -1,0 +1,108 @@
+/*
+   SCPU-EMU - CMD SuperCPU emulation for the C64/C128 using a RAD Expansion Unit
+   Copyright (c) 2026 SCPU-EMU contributors
+
+   CSuperCPU - the accelerator itself.
+
+   Owns and wires together the pieces that make up a SuperCPU:
+
+       CPU core  ->  CC64Memory (bank 0, shadowed)  ->  IC64Bus
+                          |                  |
+                          |                  +-> CWriteBuffer  (VIC mirroring)
+                          +-> CSuperCPURegisters   ($D07x, $D0Bx, $D2xx/$D3xx)
+
+   It is deliberately platform-agnostic: hand it any IC64Bus and it runs, which
+   is what lets the whole accelerator be exercised on a PC against CHostBus.
+
+   This program is free software: you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation, either version 3 of the License, or
+   (at your option) any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+#ifndef _supercpu_h
+#define _supercpu_h
+
+#include "../Common/types.h"
+#include "../C64/c64_bus.h"
+#include "../C64/c64_memory.h"
+#include "../CPU/cpu.h"
+#include "../CPU/M6502/m6502.h"
+#include "write_buffer.h"
+#include "registers.h"
+
+// Which core drives the machine. Milestone 1 uses the 6502; the 65816 takes
+// over once it lands (see Docs/roadmap.md).
+enum SCPUCoreType
+{
+	SCPU_CORE_6502 = 0,
+	SCPU_CORE_65816
+};
+
+class CSuperCPU
+{
+public:
+	CSuperCPU();
+
+	// Wire up a bus and bring the accelerator to its reset state. Returns
+	// false if the bus could not be acquired or no usable ROMs were obtained.
+	bool init( IC64Bus *bus, SCPUCoreType core = SCPU_CORE_6502 );
+
+	// Supply ROM images explicitly. Call before init() to override the images
+	// that would otherwise be snapshotted off the live machine.
+	void setBasicROM ( const u8 *data ) { m_Memory.setBasicROM( data ); }
+	void setKernalROM( const u8 *data ) { m_Memory.setKernalROM( data ); }
+	void setCharROM  ( const u8 *data ) { m_Memory.setCharROM( data ); }
+
+	void reset();
+
+	// Run the accelerator for approximately one C64 frame's worth of emulated
+	// time, then flush pending mirrored writes. Returns cycles executed.
+	u64 runFrame();
+
+	// Run until stopped. Returns if stop() is called, otherwise never.
+	void run();
+
+	// Ask the run loop to return at the next frame boundary.
+	void stop() { m_Running = false; }
+
+	// Called once per frame while running. Returning true stops the loop --
+	// used to make the RAD's button responsive without the bus layer having to
+	// know anything about the accelerator.
+	typedef bool (*FrameHook)( void *ctx );
+	void setFrameHook( FrameHook hook, void *ctx ) { m_FrameHook = hook; m_FrameHookCtx = ctx; }
+
+	CC64Memory         &memory()      { return m_Memory; }
+	CWriteBuffer       &writeBuffer() { return m_WriteBuffer; }
+	CSuperCPURegisters &registers()   { return m_Registers; }
+	ICpu               *cpu()         { return m_CPU; }
+
+	// Emulated 65816 cycles per second for each speed setting. The real
+	// hardware is 20MHz in turbo and drops to the host's own 1MHz (2MHz on a
+	// C128 in fast mode) when software asks for compatibility.
+	u32 currentClockHz() const;
+
+private:
+	CC64Memory         m_Memory;
+	CWriteBuffer       m_WriteBuffer;
+	CSuperCPURegisters m_Registers;
+	CM6502             m_Core6502;
+
+	ICpu    *m_CPU;
+	IC64Bus *m_Bus;
+	bool     m_Running;
+	FrameHook m_FrameHook;
+	void     *m_FrameHookCtx;
+};
+
+#define SCPU_TURBO_HZ   20000000u
+#define SCPU_NORMAL_HZ   1000000u
+
+#endif
