@@ -418,25 +418,27 @@ u32 CW65C816::step()
 		else            { m_Y = pull16(); setZN16( m_Y ); }
 		break;
 	case 0x28:																// PLP
-		// In emulation mode this cannot touch m or x; applyE() at the end of
-		// the instruction re-asserts them.
+		// In emulation mode this cannot touch m or x; applyE() re-asserts them.
 		m_P = pull8();
+		applyE();
 		break;
 	case 0xAB: m_DBR = pull8(); setZN8( m_DBR ); break;						// PLB
 
 	// "new" class: a full 16-bit stack pointer even in emulation mode, so these
 	// run off the bottom of page 1 rather than wrapping inside it.
-	case 0x0B: push16New( m_D ); break;										// PHD
-	case 0x2B: m_D = pull16New(); setZN16( m_D ); break;					// PLD
-	case 0xF4: push16New( fetch16() ); break;								// PEA -- pushes its operand literally, reads no memory
+	case 0x0B: push16New( m_D ); applyE(); break;										// PHD
+	case 0x2B: m_D = pull16New(); setZN16( m_D ); applyE(); break;					// PLD
+	case 0xF4: push16New( fetch16() ); applyE(); break;								// PEA -- pushes its operand literally, reads no memory
 	case 0xD4:																// PEI -- reads, and is exempt from the direct-page wrap
 		ea = eaDirect();
 		push16New( read16Bank0( (u16)ea ) );
+		applyE();
 		break;
 	case 0x62:																// PER
 		{
 			s16 disp = (s16)fetch16();
 			push16New( (u16)( m_PC + disp ) );
+			applyE();
 		}
 		break;
 
@@ -688,6 +690,7 @@ u32 CW65C816::step()
 			push16New( (u16)( m_PC - 1 ) );	// pushed BEFORE the pointer is read
 			m_PC = (u16)( read8( ( (u32)m_PBR << 16 ) | ptr )
 			     | ( (u16)read8( ( (u32)m_PBR << 16 ) | (u16)( ptr + 1 ) ) << 8 ) );
+			applyE();
 		}
 		break;
 	case 0x22:															// JSL long -- "new" stack, 3 bytes
@@ -697,6 +700,7 @@ u32 CW65C816::step()
 			push16New( (u16)( m_PC - 1 ) );
 			m_PC  = (u16)( target & 0xFFFF );
 			m_PBR = (u8)( target >> 16 );
+			applyE();
 		}
 		break;
 
@@ -707,13 +711,15 @@ u32 CW65C816::step()
 		// unrecoverable, which is why they are kept next to each other here.
 		m_PC  = (u16)( pull16New() + 1 );
 		m_PBR = pull8New();
+		applyE();
 		break;
 	case 0x40:															// RTI -- "old" stack
 		m_P = pull8();
 		m_PC = pull16();
 		if ( !m_E ) m_PBR = pull8();
 		// RTI restores m and x from the stacked P -- and can therefore zero XH
-		// and YH, which applyE() below does -- but it never restores E.
+		// and YH -- but it never restores E.
+		applyE();
 		break;
 
 	// --- branches ----------------------------------------------------------
@@ -750,8 +756,8 @@ u32 CW65C816::step()
 	// REP and SEP can modify ANY status bit -- SEP #$04 is a legal, unidiomatic
 	// SEI. In emulation mode they cannot touch m or x; applyE() enforces that at
 	// the end of the instruction, and every other named bit still changes.
-	case 0xC2: m_P = (u8)( m_P & ~fetch8() ); break;					// REP #imm
-	case 0xE2: m_P = (u8)( m_P |  fetch8() ); break;					// SEP #imm
+	case 0xC2: m_P = (u8)( m_P & ~fetch8() ); applyE(); break;			// REP #imm
+	case 0xE2: m_P = (u8)( m_P |  fetch8() ); applyE(); break;			// SEP #imm
 
 	case 0xFB:															// XCE
 		{
@@ -763,6 +769,7 @@ u32 CW65C816::step()
 			const bool oldE = m_E;
 			m_E = ( m_P & W65_C ) != 0;
 			setFlag( W65_C, oldE );
+			applyE();
 		}
 		break;
 
@@ -833,11 +840,6 @@ u32 CW65C816::step()
 	}
 
 	#undef W65_BRANCH
-
-	// Re-assert the emulation-mode invariants after anything that could have
-	// written P, S, X or Y. Doing it here rather than at each site is what makes
-	// it impossible to forget.
-	applyE();
 
 	const u32 used = w65c816Cycles( opcode, m8Entry, x8Entry, eEntry,
 	                                dpUnaligned, m_PageCross, m_BranchTaken );

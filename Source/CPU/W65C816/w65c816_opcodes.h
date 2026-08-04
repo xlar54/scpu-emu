@@ -91,13 +91,95 @@ struct SW65Opcode
 
 extern const SW65Opcode w65c816Opcodes[ 256 ];
 
+// Operand bytes per addressing mode, before the M/X width adjustment.
+static const u8 w65c816ModeLength[] =
+{
+	1,	// W65M_IMP
+	1,	// W65M_ACC
+	2,	// W65M_IMM8
+	2,	// W65M_IMMM   -- 3 when the accumulator is 16-bit
+	2,	// W65M_IMMX   -- 3 when the index registers are 16-bit
+	2,	// W65M_ZP
+	2,	// W65M_ZPX
+	2,	// W65M_ZPY
+	2,	// W65M_IZX
+	2,	// W65M_IZY
+	2,	// W65M_IZP
+	2,	// W65M_IZL
+	2,	// W65M_IZLY
+	3,	// W65M_ABS
+	3,	// W65M_ABX
+	3,	// W65M_ABY
+	4,	// W65M_ABL
+	4,	// W65M_ABLX
+	3,	// W65M_IND
+	3,	// W65M_IAX
+	3,	// W65M_INDL
+	2,	// W65M_SR
+	2,	// W65M_SRY
+	2,	// W65M_REL
+	3,	// W65M_RELL
+	3	// W65M_BM
+};
+
 // Instruction length in bytes. m8/x8 are the EFFECTIVE widths, i.e. what
 // CW65C816::memory8() and index8() return -- emulation mode forces both true.
-u8 w65c816Length( u8 opcode, bool m8, bool x8 );
+inline u8 w65c816Length( u8 opcode, bool m8, bool x8 )
+{
+	const u8 mode = w65c816Opcodes[ opcode ].mode;
+	u8 len = w65c816ModeLength[ mode ];
+
+	// The only variable-length modes: an immediate operand is as wide as the
+	// register it feeds. This is why REP/SEP change the length of instructions
+	// that have already been assembled.
+	if ( mode == W65M_IMMM && !m8 ) len++;
+	if ( mode == W65M_IMMX && !x8 ) len++;
+
+	return len;
+}
 
 // Cycle count with every adjustment applied. pageCross is meaningful only for
 // indexed and relative modes; branchTaken only for W65M_REL.
-u8 w65c816Cycles( u8 opcode, bool m8, bool x8, bool emulation,
-                  bool dpUnaligned, bool pageCross, bool branchTaken );
+//
+// INLINE ON PURPOSE. This runs once per emulated instruction, so as an
+// out-of-line call in another translation unit it cost a measurable slice of
+// the whole interpreter -- the compiler could not see that the flag tests
+// collapse to almost nothing for most opcodes.
+inline u8 w65c816Cycles( u8 opcode, bool m8, bool x8, bool emulation,
+                         bool dpUnaligned, bool pageCross, bool branchTaken )
+{
+	const SW65Opcode &op = w65c816Opcodes[ opcode ];
+	u8 c = op.baseCycles;
+	const u8 f = op.cycleFlags;
+
+	// Almost every opcode has no adjustments at all, so this pays for itself.
+	if ( f == 0 )
+		return c;
+
+	if ( ( f & W65C_M1 ) && !m8 ) c += 1;
+	if ( ( f & W65C_M2 ) && !m8 ) c += 2;
+	if ( ( f & W65C_X1 ) && !x8 ) c += 1;
+	if ( ( f & W65C_W  ) && dpUnaligned ) c++;
+	if ( ( f & W65C_E0 ) && !emulation ) c++;
+
+	// Indexed reads pay the penalty on a page cross with 8-bit index registers,
+	// and unconditionally with 16-bit ones -- the address adder always needs the
+	// extra cycle when the index can carry.
+	if ( f & W65C_P )
+	{
+		if ( !x8 || pageCross ) c++;
+	}
+
+	if ( ( f & W65C_BR ) && branchTaken )
+	{
+		c++;
+		// The page-cross penalty on a taken branch is emulation-mode only.
+		if ( emulation && pageCross ) c++;
+	}
+
+	if ( ( f & W65C_PE ) && emulation && pageCross ) c++;
+
+	return c;
+}
 
 #endif

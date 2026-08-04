@@ -49,7 +49,9 @@
 #define SCPU_ROM_BASE       0xF80000
 #define SCPU_ROM_MAXSIZE    0x80000		// 512K address space for the ROM image
 
-class CSuperCPUMemoryMap : public ICpuBus
+// final: see the note on CC64Memory. The 65816 reaches memory through this
+// class, so it is on the hot path twice over.
+class CSuperCPUMemoryMap final : public ICpuBus
 {
 public:
 	CSuperCPUMemoryMap();

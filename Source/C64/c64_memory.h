@@ -68,7 +68,11 @@ public:
 #define C64_KERNAL_SIZE   0x2000
 #define C64_CHARROM_SIZE  0x1000
 
-class CC64Memory : public ICpuBus
+// 'final' is load-bearing, not decoration: it lets the compiler devirtualise
+// and inline read8/write8 at the call site in CSuperCPUMemoryMap. Those are
+// the hottest calls in the emulator -- several per emulated instruction -- and
+// an indirect call there costs real megahertz on a Cortex-A53.
+class CC64Memory final : public ICpuBus
 {
 public:
 	CC64Memory();

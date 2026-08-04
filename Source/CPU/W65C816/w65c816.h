@@ -112,11 +112,28 @@ public:
 	inline bool index8()  const { return m_E || ( m_P & W65_X ) != 0; }
 
 	// While E=1 the hardware CONTINUOUSLY forces SH=$01, m=1, x=1 and the high
-	// bytes of X and Y to $00 -- writes to them simply do not take. That is an
-	// invariant, not a one-off conversion, so this is re-asserted at the end of
-	// every instruction rather than only where the mode changes. Forgetting it
-	// after a PLP, RTI, TXS, PLX, SEP or REP leaves an impossible state that
-	// only shows up much later.
+	// bytes of X and Y to $00 -- writes to them simply do not take.
+	//
+	// This used to run after EVERY instruction, which was the safe way to write
+	// it and cost 21% of the whole interpreter -- four read-modify-writes per
+	// instruction to re-assert something almost nothing disturbs.
+	//
+	// It is now called only from the instructions that can actually break an
+	// invariant, which is a much smaller set than it first appears:
+	//
+	//   X and Y   already cannot exceed $FF while index8() is true. Every site
+	//             that writes them -- LDX/LDY, TAX/TAY, TSX, TXY/TYX, PLX/PLY,
+	//             INX/DEX, MVN/MVP -- masks to 8 bits itself. Nothing to fix.
+	//   S         push8/pull8 keep the "old" stack inside page 1 on their own,
+	//             and TXS/TCS special-case emulation mode. Only the "new" stack
+	//             class (PEA, PEI, PER, PHD, PLD, JSL, RTL, JSR (a,X)) leaves S
+	//             outside page 1, by design, and needs putting back.
+	//   P         only PLP, RTI, REP, SEP and XCE can clear m or x, or change E.
+	//
+	// So those thirteen opcodes call it, plus serviceInterrupt(). If one is ever
+	// missed, the differential test catches it immediately: it asserts after
+	// every single instruction that E still holds, S is inside page 1, and
+	// neither index register exceeds $FF.
 	inline void applyE()
 	{
 		if ( m_E )

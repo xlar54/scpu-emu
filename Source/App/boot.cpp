@@ -224,13 +224,19 @@ static void scpuDumpEmulatedScreen( CLogger *logger, CSuperCPU &scpu )
 	// machine silently runs slower than it claims and everything time-based
 	// drifts. This is the number that says whether that is happening.
 	{
-		u64 c0 = scpu.cpu()->cycles();
-		u64 h0 = radBus.hostCycles();
-		for ( u32 i = 0; i < 60; i++ ) scpu.runFrame();
-		u64 dc = scpu.cpu()->cycles() - c0;
-		u64 dh = radBus.hostCycles() - h0;
+		const u64 c0 = scpu.cpu()->cycles();
+		const u64 h0 = radBus.hostCycles();
+		const u64 io0 = scpu.memory().m_IOReads + scpu.memory().m_IOWrites;
+		const u64 mir0 = scpu.writeBuffer().m_BytesFlushed;
 
-		u32 achievedKHz = dh ? (u32)( ( dc * ( SCPU_ARM_CLOCK_HZ / 1000 ) ) / dh ) : 0;
+		for ( u32 i = 0; i < 60; i++ ) scpu.runFrame();
+
+		const u64 dc  = scpu.cpu()->cycles() - c0;
+		const u64 dh  = radBus.hostCycles() - h0;
+		const u64 dio = ( scpu.memory().m_IOReads + scpu.memory().m_IOWrites ) - io0;
+		const u64 dmir = scpu.writeBuffer().m_BytesFlushed - mir0;
+
+		const u32 achievedKHz = dh ? (u32)( ( dc * ( SCPU_ARM_CLOCK_HZ / 1000 ) ) / dh ) : 0;
 
 		logger->Write( "SCPU", LogNotice,
 		               "speed: asked for %u kHz, achieving %u kHz (%s)",
@@ -238,6 +244,27 @@ static void scpuDumpEmulatedScreen( CLogger *logger, CSuperCPU &scpu )
 		               (unsigned)achievedKHz,
 		               ( achievedKHz * 100 >= ( scpu.currentClockHz() / 1000 ) * 90 )
 		                   ? "keeping up" : "FALLING BEHIND -- timing will drift" );
+
+		// Where the time actually went. Without this the speed figure says only
+		// THAT we are behind, never WHY, and the two candidate explanations --
+		// a slow interpreter versus too much traffic on the expansion port --
+		// call for completely different fixes.
+		//
+		// A bus access costs roughly one microsecond, i.e. about 1400 ARM
+		// cycles at 1.4GHz, so it takes very few of them to dominate. Compare
+		// "arm/emucycle" against "bus%" to tell the two apart: a high
+		// arm/emucycle with a low bus% means the interpreter is the limit.
+		const u64 busAccesses = dio + dmir;
+		const u64 busArmCycles = busAccesses * ( SCPU_ARM_CLOCK_HZ / 1000000 );
+		logger->Write( "SCPU", LogNotice,
+		               "  %llu emu cycles in %llu arm cycles = %llu arm/emucycle",
+		               (unsigned long long)dc, (unsigned long long)dh,
+		               (unsigned long long)( dc ? dh / dc : 0 ) );
+		logger->Write( "SCPU", LogNotice,
+		               "  bus: %llu io + %llu mirrored = %llu accesses, ~%llu%% of the time",
+		               (unsigned long long)dio, (unsigned long long)dmir,
+		               (unsigned long long)busAccesses,
+		               (unsigned long long)( dh ? ( busArmCycles * 100 ) / dh : 0 ) );
 	}
 
 	logger->Write( "SCPU", LogNotice,
