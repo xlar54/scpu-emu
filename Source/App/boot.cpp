@@ -183,6 +183,27 @@ static void scpuDumpEmulatedScreen( CLogger *logger, CSuperCPU &scpu )
 	               (unsigned)scpu.cpu()->cycles(),
 	               ram[ 0x38 ], ram[ 0x37 ] );
 
+	// Achieved speed. The selected speed is only a request: if the interpreter
+	// plus its pacing overhead cannot retire instructions fast enough, the
+	// machine silently runs slower than it claims and everything time-based
+	// drifts. This is the number that says whether that is happening.
+	{
+		u64 c0 = scpu.cpu()->cycles();
+		u64 h0 = radBus.hostCycles();
+		for ( u32 i = 0; i < 60; i++ ) scpu.runFrame();
+		u64 dc = scpu.cpu()->cycles() - c0;
+		u64 dh = radBus.hostCycles() - h0;
+
+		u32 achievedKHz = dh ? (u32)( ( dc * ( SCPU_ARM_CLOCK_HZ / 1000 ) ) / dh ) : 0;
+
+		logger->Write( "SCPU", LogNotice,
+		               "speed: asked for %u kHz, achieving %u kHz (%s)",
+		               (unsigned)( scpu.currentClockHz() / 1000 ),
+		               (unsigned)achievedKHz,
+		               ( achievedKHz * 100 >= ( scpu.currentClockHz() / 1000 ) * 90 )
+		                   ? "keeping up" : "FALLING BEHIND -- timing will drift" );
+	}
+
 	logger->Write( "SCPU", LogNotice,
 	               "bus: ioReads=%u ioWrites=%u ramWrites=%u mirrored=%u",
 	               (unsigned)scpu.memory().m_IOReads,
@@ -220,7 +241,7 @@ void scpuBootRun( CLogger *logger )
 
 	radBus.setLogger( logger );
 
-	if ( !superCPU.init( &radBus, SCPU_CORE_6502 ) )
+	if ( !superCPU.init( &radBus, SCPU_CORE_6502, SCPU_SIMM_16MB ) )
 	{
 		// init() releases /DMA on every failure path, so the C64 is running its
 		// own CPU again and is usable -- it simply has no accelerator.
@@ -236,6 +257,11 @@ void scpuBootRun( CLogger *logger )
 	actLED.Blink( 3 );		// milestone: bus acquired
 
 	const C64Signals &sig = radBus.signals();
+	logger->Write( "SCPU", LogNotice, "SuperRAM: %u MB%s",
+	               (unsigned)superCPU.fastRAM().sizeMB(),
+	               superCPU.fastRAM().present()
+	                   ? " (unreachable until the 65816 core lands)" : " -- none fitted" );
+
 	logger->Write( "SCPU", LogNotice, "attached to %s, %s",
 	               sig.machine == MACHINE_C128 ? "C128" : "C64",
 	               sig.video == VIDEO_PAL ? "PAL" : "NTSC" );

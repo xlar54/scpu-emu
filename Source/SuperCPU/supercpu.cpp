@@ -25,7 +25,7 @@ CSuperCPU::CSuperCPU()
 {
 }
 
-bool CSuperCPU::init( IC64Bus *bus, SCPUCoreType core )
+bool CSuperCPU::init( IC64Bus *bus, SCPUCoreType core, u32 simmMB )
 {
 	m_Bus = bus;
 
@@ -37,6 +37,13 @@ bool CSuperCPU::init( IC64Bus *bus, SCPUCoreType core )
 	m_Memory.setIOInterceptor( &m_Registers );
 
 	m_WriteBuffer.attach( m_Bus, m_Memory.m_RAM );
+
+	// SuperRAM, and the 24-bit space it lives in. Bank 0 of that space is the
+	// C64 itself; everything above is the accelerator's own memory and never
+	// touches the expansion port, which is why it runs at full speed.
+	m_FastRAM.init( simmMB );
+	m_MemoryMap.attachBank0( &m_Memory );
+	m_MemoryMap.attachFastRAM( &m_FastRAM );
 	m_Registers.attach( &m_WriteBuffer );
 	// $D0B0 on an SCPU64 reports only the hardware revision; the 64-vs-128
 	// distinction belongs to the SuperCPU 128's own register set, which we do
@@ -151,11 +158,17 @@ u64 CSuperCPU::runFrame()
 		const u32 perLine = c64CyclesPerLine( sig.video );
 		const u32 lines   = c64RasterLines( sig.video );
 
-		// Bounded wait. Each poll costs two bus cycles, so we cap it rather
-		// than spin for a whole frame if something is wrong with the raster.
+		// Look once, briefly. Each poll costs two bus cycles, and the previous
+		// version was willing to spend 400 of them -- up to 800us per frame with
+		// the CPU stopped dead, which showed up as visible stuttering.
+		//
+		// If the beam is not somewhere useful within a short look, give up and
+		// try next frame. Nothing is lost: the buffer holds its contents, the
+		// safe window is over a third of every frame, and the CPU keeps running
+		// in the meantime, which matters more than flushing promptly.
 		u16 line = 0;
 		bool safe = false;
-		for ( u32 poll = 0; poll < 400; poll++ )
+		for ( u32 poll = 0; poll < 24; poll++ )
 		{
 			line = m_Bus->rasterLine();
 			if ( line == 0xFFFF ) break;			// backend cannot tell
@@ -165,14 +178,14 @@ u64 CSuperCPU::runFrame()
 		if ( safe )
 		{
 			// Lines left before the display window resumes. Below the window we
-			// have the bottom border plus vertical blank plus the top border;
-			// above it, just the remaining top border.
+			// have the bottom border, the vertical blank and the top border;
+			// above it, only the remaining top border.
 			u32 linesLeft = ( line > c64DisplayLastLine( sig.video ) )
 			              ? ( lines - line ) + c64DisplayFirstLine( sig.video )
 			              : c64DisplayFirstLine( sig.video ) - line;
 
-			// One byte per C64 cycle, less a margin so we finish before the
-			// display resumes rather than running into it.
+			// One byte per C64 cycle, less a margin so the transfer finishes
+			// before the display resumes rather than running into it.
 			u32 budgetBytes = ( linesLeft * perLine * 3 ) / 4;
 
 			m_WriteBuffer.flushUpTo( budgetBytes );

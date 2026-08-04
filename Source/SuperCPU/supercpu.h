@@ -37,6 +37,8 @@
 #include "../CPU/M6502/m6502.h"
 #include "write_buffer.h"
 #include "registers.h"
+#include "fast_ram.h"
+#include "memory_map.h"
 
 // Which core drives the machine. Milestone 1 uses the 6502; the 65816 takes
 // over once it lands (see Docs/roadmap.md).
@@ -53,7 +55,11 @@ public:
 
 	// Wire up a bus and bring the accelerator to its reset state. Returns
 	// false if the bus could not be acquired or no usable ROMs were obtained.
-	bool init( IC64Bus *bus, SCPUCoreType core = SCPU_CORE_6502 );
+	// simmMB: SuperRAM to fit, in megabytes. 0/1/4/8/16, as the real card
+	// accepts. Only reachable once the 65816 core lands -- a 6502 has no way to
+	// name an address above $FFFF.
+	bool init( IC64Bus *bus, SCPUCoreType core = SCPU_CORE_6502,
+	           u32 simmMB = SCPU_SIMM_16MB );
 
 	// Supply ROM images explicitly. Call before init() to override the images
 	// that would otherwise be snapshotted off the live machine.
@@ -80,6 +86,8 @@ public:
 	void setFrameHook( FrameHook hook, void *ctx ) { m_FrameHook = hook; m_FrameHookCtx = ctx; }
 
 	CC64Memory         &memory()      { return m_Memory; }
+	CFastRAM           &fastRAM()     { return m_FastRAM; }
+	CSuperCPUMemoryMap &memoryMap()   { return m_MemoryMap; }
 	CWriteBuffer       &writeBuffer() { return m_WriteBuffer; }
 	CSuperCPURegisters &registers()   { return m_Registers; }
 	ICpu               *cpu()         { return m_CPU; }
@@ -94,6 +102,8 @@ private:
 	CWriteBuffer       m_WriteBuffer;
 	CSuperCPURegisters m_Registers;
 	CM6502             m_Core6502;
+	CFastRAM           m_FastRAM;
+	CSuperCPUMemoryMap m_MemoryMap;
 
 	ICpu    *m_CPU;
 	IC64Bus *m_Bus;

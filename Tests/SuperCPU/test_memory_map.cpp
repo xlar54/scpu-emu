@@ -1,0 +1,147 @@
+/*
+   SCPU-EMU - 24-bit address space and SuperRAM tests.
+
+   Layout verified against VICE's SCPU64 emulation; see Source/SuperCPU/memory_map.h.
+*/
+#include "../test_framework.h"
+#include "../../Source/SuperCPU/memory_map.h"
+#include "../../Source/Bus/Host/host_bus.h"
+
+struct MapFixture
+{
+	CHostBus            bus;
+	CC64Memory          bank0;
+	CFastRAM            simm;
+	CSuperCPUMemoryMap  map;
+
+	MapFixture( u32 simmMB = SCPU_SIMM_16MB )
+	{
+		bank0.attachBus( &bus );
+		simm.init( simmMB );
+		map.attachBank0( &bank0 );
+		map.attachFastRAM( &simm );
+		bank0.reset();
+		map.reset();
+	}
+};
+
+TEST( map_bank0_is_the_c64 )
+{
+	MapFixture f;
+
+	// Bank 0 goes through CC64Memory, so it sees C64 banking. $0400 is RAM.
+	f.map.write8( 0x000400, 0x41 );
+	CHECK_EQ( f.map.read8( 0x000400 ), 0x41 );
+	CHECK_EQ( f.bank0.m_RAM[ 0x0400 ], 0x41 );
+	CHECK( f.map.m_Bank0Accesses > 0 );
+	CHECK_EQ( f.map.m_FastAccesses, 0 );
+}
+
+TEST( map_bank1_is_private_sram )
+{
+	MapFixture f;
+
+	f.map.write8( 0x010000, 0x5A );
+	f.map.write8( 0x01FFFF, 0xA5 );
+
+	CHECK_EQ( f.map.read8( 0x010000 ), 0x5A );
+	CHECK_EQ( f.map.read8( 0x01FFFF ), 0xA5 );
+
+	// Bank 1 is the accelerator's own memory: nothing reaches the C64.
+	CHECK_EQ( f.bus.m_Cycles, 0 );
+	CHECK_EQ( f.map.m_Bank0Accesses, 0 );
+}
+
+TEST( map_superram_is_addressable_across_16mb )
+{
+	MapFixture f( SCPU_SIMM_16MB );
+	CHECK_EQ( f.simm.sizeMB(), 16 );
+
+	// A byte in a high bank, well beyond anything a 6502 could name.
+	f.map.write8( 0x123456, 0x77 );
+	CHECK_EQ( f.map.read8( 0x123456 ), 0x77 );
+
+	// Distinct banks are distinct memory.
+	f.map.write8( 0x020000, 0x11 );
+	f.map.write8( 0x030000, 0x22 );
+	CHECK_EQ( f.map.read8( 0x020000 ), 0x11 );
+	CHECK_EQ( f.map.read8( 0x030000 ), 0x22 );
+
+	// None of it touches the expansion port, which is the point: SuperRAM runs
+	// at full speed because it never leaves the Pi.
+	CHECK_EQ( f.bus.m_Cycles, 0 );
+}
+
+TEST( map_superram_aliases_beyond_the_fitted_size )
+{
+	// A real SIMM decodes a fixed number of address lines, so an address past
+	// the fitted size wraps onto lower memory. Software sizing the card relies
+	// on exactly that.
+	MapFixture f( SCPU_SIMM_1MB );
+	CHECK_EQ( f.simm.sizeMB(), 1 );
+
+	f.map.write8( 0x020000, 0x99 );
+
+	// Past 1MB the map stops decoding SuperRAM and returns open bus, which on a
+	// 65816 is the bank byte.
+	CHECK_EQ( f.map.read8( 0x800000 ), 0x80 );
+}
+
+TEST( map_unmapped_reads_return_the_bank_byte )
+{
+	MapFixture f( SCPU_SIMM_NONE );
+	CHECK( !f.simm.present() );
+
+	// With no SIMM fitted everything above bank 1 is open bus.
+	CHECK_EQ( f.map.read8( 0x020000 ), 0x02 );
+	CHECK_EQ( f.map.read8( 0xAB1234 ), 0xAB );
+}
+
+TEST( map_rom_region_reads_the_image_when_supplied )
+{
+	MapFixture f;
+
+	static u8 rom[ 0x1000 ];
+	for ( u32 i = 0; i < sizeof( rom ); i++ ) rom[ i ] = (u8)( i ^ 0x5A );
+	f.map.setROM( rom, sizeof( rom ) );
+	CHECK( f.map.hasROM() );
+
+	CHECK_EQ( f.map.read8( SCPU_ROM_BASE ), rom[ 0 ] );
+	CHECK_EQ( f.map.read8( SCPU_ROM_BASE + 0x123 ), rom[ 0x123 ] );
+
+	// Writes to ROM are discarded, not passed anywhere.
+	f.map.write8( SCPU_ROM_BASE, 0xFF );
+	CHECK_EQ( f.map.read8( SCPU_ROM_BASE ), rom[ 0 ] );
+}
+
+TEST( map_rom_region_is_open_bus_without_an_image )
+{
+	MapFixture f;
+	CHECK( !f.map.hasROM() );
+
+	// SCPU-EMU boots the machine's own KERNAL out of bank 0, so the
+	// accelerator's ROM being absent is a supported configuration.
+	CHECK_EQ( f.map.read8( 0xF80000 ), 0xF8 );
+}
+
+TEST( map_simm_window_reaches_the_card )
+{
+	MapFixture f;
+
+	f.map.write8( SCPU_SIMM_WINDOW, 0xC3 );
+	CHECK_EQ( f.map.read8( SCPU_SIMM_WINDOW ), 0xC3 );
+
+	// The window is a view onto the start of the SIMM, so the same byte is
+	// visible through the linear mapping at bank $02... which is offset 0.
+	CHECK_EQ( f.simm.read( 0 ), 0xC3 );
+}
+
+TEST( map_simm_sizes_round_down_to_what_hardware_accepts )
+{
+	CFastRAM r;
+	r.init( 3 );  CHECK_EQ( r.sizeMB(), 1 );	// 3 -> 1
+	r.init( 7 );  CHECK_EQ( r.sizeMB(), 4 );	// 7 -> 4
+	r.init( 12 ); CHECK_EQ( r.sizeMB(), 8 );	// 12 -> 8
+	r.init( 64 ); CHECK_EQ( r.sizeMB(), 16 );	// clamped to the maximum
+	r.init( 0 );  CHECK( !r.present() );
+}

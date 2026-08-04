@@ -284,24 +284,30 @@ void CC64Memory::tick( u32 nCycles )
 
 	// How much real time those emulated cycles were supposed to take.
 	const u64 owed = ( m_PacingDebtCycles * rate ) >> 16;
-	const u64 spent = m_C64->hostCycles() - m_PacingAnchor;
 
-	if ( spent >= owed )
+	// One reading in the common case. hostCycles() is a virtual call wrapping a
+	// system-register read, and this runs after every instruction -- the
+	// previous version called it four times, which at 20MHz was a serious
+	// fraction of the whole per-instruction budget.
+	u64 now = m_C64->hostCycles();
+
+	if ( ( now - m_PacingAnchor ) >= owed )
 	{
-		// Already behind, or exactly on time. Settle up and carry on rather
-		// than accumulating a debt we can never repay -- a burst of I/O can
-		// easily overrun its own budget, and trying to claw that back later
-		// would just make the next stretch run too slowly.
-		m_PacingAnchor = m_C64->hostCycles();
+		// Behind, or exactly on time. Settle up and carry on rather than
+		// accumulating a debt that can never be repaid: a burst of I/O easily
+		// overruns its own budget, and clawing that back later would just make
+		// the following stretch run too slowly.
+		m_PacingAnchor = now;
 		m_PacingDebtCycles = 0;
 		return;
 	}
 
 	// Ahead of schedule: wait out the difference. This is what makes a cycle
-	// count mean a duration, which is the whole basis of IEC bit timing.
-	while ( ( m_C64->hostCycles() - m_PacingAnchor ) < owed )
-		;
+	// count mean a duration.
+	do {
+		now = m_C64->hostCycles();
+	} while ( ( now - m_PacingAnchor ) < owed );
 
-	m_PacingAnchor = m_C64->hostCycles();
+	m_PacingAnchor = now;
 	m_PacingDebtCycles = 0;
 }

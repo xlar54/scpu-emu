@@ -27,6 +27,8 @@ OBJS = \
 	SuperCPU/supercpu.o \
 	SuperCPU/registers.o \
 	SuperCPU/write_buffer.o \
+	SuperCPU/fast_ram.o \
+	SuperCPU/memory_map.o \
 	Bus/RAD/rad_bus.o \
 	Bus/RAD/cpu_hijack.o \
 	Bus/RAD/bus_timing.o \

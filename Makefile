@@ -32,6 +32,8 @@ HOST_SRCS = \
 	Source/SuperCPU/write_buffer.cpp \
 	Source/SuperCPU/registers.cpp \
 	Source/SuperCPU/supercpu.cpp \
+	Source/SuperCPU/fast_ram.cpp \
+	Source/SuperCPU/memory_map.cpp \
 	Source/Bus/Host/host_bus.cpp
 
 TEST_SRCS = \
@@ -40,7 +42,8 @@ TEST_SRCS = \
 	Tests/C64/test_banking.cpp \
 	Tests/SuperCPU/test_write_buffer.cpp \
 	Tests/Integration/test_kernal_boot.cpp \
-	Tests/Integration/test_real_kernal.cpp
+	Tests/Integration/test_real_kernal.cpp \
+	Tests/SuperCPU/test_memory_map.cpp
 
 HOST_OBJS = $(HOST_SRCS:%.cpp=$(BUILDDIR)/%.o)
 TEST_OBJS = $(TEST_SRCS:%.cpp=$(BUILDDIR)/%.o)
