@@ -70,9 +70,23 @@ static CLogger *s_Logger;
 //                                 see the line go low. Treat it as a reset of
 //                                 the emulated machine, which is what it would
 //                                 do on a real SuperCPU.
+// Sampled every ~50 frames, so the freeze dump can report the CIA state as it
+// was BEFORE the reset button was pressed. The button is wired to the C64's
+// physical /RESET line, so by the time the dump reads the CIAs they have
+// already been reset -- DDR reads $00 regardless of what it was, which
+// contaminated several rounds of serial forensics before this existed.
+static u8  s_PreResetDD00 = 0, s_PreResetDD02 = 0;
+static u32 s_PreResetSampleFrame = 0;
+
 static bool scpuCheckButton( void *ctx )
 {
 	CSuperCPU *scpu = (CSuperCPU *)ctx;
+
+	if ( scpu && ( ++s_PreResetSampleFrame % 50 ) == 0 )
+	{
+		s_PreResetDD00 = scpu->memory().read8( 0xDD00 );
+		s_PreResetDD02 = scpu->memory().read8( 0xDD02 );
+	}
 
 	if ( radBusButtonPressed() )
 		return true;					// stop the run loop; caller reboots
@@ -159,8 +173,12 @@ static bool scpuCheckButton( void *ctx )
 				const u8 dd00 = scpu->memory().read8( 0xDD00 );
 				const u8 dd02 = scpu->memory().read8( 0xDD02 );
 				s_Logger->Write( "SCPU", LogNotice,
-				               "  live: $DD00=$%02X (DATAin=%u CLKin=%u) $DD02=$%02X",
+				               "  live: $DD00=$%02X (DATAin=%u CLKin=%u) $DD02=$%02X"
+				               "  [POST-RESET: CIAs already cleared by the button]",
 				               dd00, ( dd00 >> 7 ) & 1, ( dd00 >> 6 ) & 1, dd02 );
+				s_Logger->Write( "SCPU", LogNotice,
+				               "  pre-reset (~1s before): $DD00=$%02X $DD02=$%02X",
+				               s_PreResetDD00, s_PreResetDD02 );
 			}
 
 			// 64 accesses, oldest first, 16 per line. Lower-case = went to the
