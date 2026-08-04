@@ -197,8 +197,18 @@ u8 CC64Memory::read8( scpu_addr_t addr )
 			m_IOLog[ m_IOLogPos++ & 63 ] = (u32)a | ( (u32)v << 16 );
 			if ( ( a & 0xFE00 ) == 0xDC00 )
 			{
-				m_CIALogCyc[ m_CIALogPos & 63 ] = (u32)m_EmuCycles;
-				m_CIALog[ m_CIALogPos++ & 63 ] = (u32)a | ( (u32)v << 16 );
+				// Edge compression: a polling loop reads the same value tens of
+				// thousands of times, and logging every repeat wipes the ring's
+				// history in the gap between a freeze and the button press.
+				// Log a read only when it DIFFERS from the last logged read.
+				const u32 composite = (u32)a | ( (u32)v << 16 );
+				if ( composite != m_CIALastRead )
+				{
+					m_CIALastRead = composite;
+					m_CIALogCyc[ m_CIALogPos & 63 ] =
+						m_C64 ? (u32)m_C64->hostCycles() : (u32)m_EmuCycles;
+					m_CIALog[ m_CIALogPos++ & 63 ] = composite;
+				}
 			}
 			if ( a == 0xDD00 )
 			{
@@ -244,62 +254,28 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 			return;
 		}
 
-		// Flushing before just these restores program order where it is
-		// visible -- but only when the bits that CHANGE WHAT THE VIC LOOKS AT
-		// actually change. That refinement is not an optimisation, it is a
-		// hard requirement, learned on hardware:
+		// NO synchronous mirror flushing on I/O writes -- none, ever. Three
+		// generations of "flush before display-state changes" each failed on
+		// hardware, and the sequence is worth recording:
 		//
-		//   $DD00 is also the SERIAL PORT. ATN, CLK and DATA share the register
-		//   with the VIC bank bits, and an IEC transfer toggles them thousands
-		//   of times. Flushing the whole dirty buffer on every CLK edge
-		//   inserted milliseconds of stall between protocol transitions; the
-		//   drive timed out mid-byte and the KERNAL sat forever in its
-		//   no-timeout receive wait -- a frozen machine with the freeze PC in
-		//   the serial routines, which is exactly what the reset diagnostic
-		//   reported.
+		//   1. Flush before every display write: broke IEC, because $DD00 is
+		//      also the serial port and the flush stalls stretched byte
+		//      handshakes past the 200us threshold that MEANS end-of-data.
+		//   2. Flush when the buffer held <=128 bytes: rolled the display
+		//      whenever the CMD splash's raster interrupt -- which toggles
+		//      $D011 mode bits mid-display BY DESIGN -- met a modestly dirty
+		//      buffer.
+		//   3. Flush when <=8 bytes: STILL rolled, one boot in two. The flush
+		//      emits a BURST, and bursts are never display-safe at arbitrary
+		//      raster positions -- that is the entire reason the border
+		//      scheduler exists. Whether a boot rolled came down to power-on
+		//      phase: a coin flip.
 		//
-		//   $D011 is also the raster-compare high bit and Y-scroll, written by
-		//   every raster interrupt handler; only ECM/BMM/DEN change the fetch
-		//   source. $D016's X-scroll is likewise written constantly; only MCM
-		//   matters here. $D018 changes the fetch source by definition.
-		//
-		// First write with no baseline flushes, conservatively.
-		if ( m_Mirror )
-		{
-			bool displayChanged = false;
-
-			if ( a == 0xDD00 )
-			{
-				displayChanged = !m_HaveCIA2PortA
-				              || ( ( m_LastCIA2PortA ^ value ) & 0x03 ) != 0;
-			}
-			else if ( a == 0xD011 || a == 0xD016 || a == 0xD018 )
-			{
-				const u32 idx  = ( a == 0xD011 ) ? 0 : ( a == 0xD016 ) ? 1 : 2;
-				const u8  mask = ( a == 0xD011 ) ? 0x70			// ECM | BMM | DEN
-				               : ( a == 0xD016 ) ? 0x10			// MCM
-				               : 0xFF;							// $D018: all of it
-				displayChanged = !( m_HaveVICControl & ( 1u << idx ) )
-				              || ( ( m_LastVICControl[ idx ] ^ value ) & mask ) != 0;
-				m_LastVICControl[ idx ] = value;
-				m_HaveVICControl |= (u8)( 1u << idx );
-			}
-
-			// Only a TRIVIAL buffer may be flushed synchronously here. This
-			// write can arrive at any raster position -- the CMD splash runs a
-			// raster-interrupt animation that toggles $D011 mode bits every
-			// frame, mid-display BY DESIGN -- so the burst must be invisible
-			// anywhere on the screen, not merely small. Eight bytes is ~8us,
-			// the same as a routine cluster of I/O accesses. Anything larger
-			// defers to the border-scheduled flusher, which runs eight times a
-			// frame, so the staleness is bounded by about a millisecond -- the
-			// transient a real SuperCPU's asynchronous mirroring produces on a
-			// mode switch. The earlier 128-byte bound was ~2 raster lines of
-			// bus traffic at the beam, and rolled the display whenever the
-			// buffer happened to be modestly dirty at the interrupt's moment.
-			if ( displayChanged && m_Mirror->pendingBytes() <= 8 )
-				m_Mirror->flush();
-		}
+		// Ordering between staged screen data and the register write that
+		// points the VIC at it is handled ENTIRELY by the border-scheduled
+		// flusher, eight times a frame: worst-case staleness ~1ms, the same
+		// transient a real SuperCPU's asynchronous mirroring shows on a mode
+		// switch.
 
 		// $DD00 is CIA2 port A, which carries ATN, CLK and DATA for the serial
 		// bus as well as the VIC bank select. Only IEC-line changes arm the
@@ -314,9 +290,30 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 			m_LastCIA2PortA = value;
 			m_HaveCIA2PortA = true;
 
-			// CMD's KERNAL explicitly uses $D07A/$D07B. The automatic hold is a
-			// fallback for code touching IEC while still nominally in fast mode;
-			// it must not leave a slow tail after explicit control restores turbo.
+			// TWO separate concepts, learned the hard way:
+			//
+			// IEC ACTIVITY -- "a serial transaction is in progress". Refreshed
+			// on ANY line transition, REGARDLESS of what speed is selected.
+			// This is what suppresses mirror flushing and raster polling in
+			// runFrame: the slow protocol assigns meaning to pauses (a talker
+			// holding ready past 200us is signalling EOI), so nothing may
+			// stall the CPU mid-transaction. Keying that suppression off the
+			// SPEED hold was the bug: when CMD's KERNAL drives the speed
+			// explicitly via $D07A, the hold never arms, and the flushes kept
+			// injecting protocol-visible pauses into the handshake.
+			if ( iecChanged )
+			{
+				const bool wasQuiet = ( m_IECActivityCycles == 0 );
+				m_IECActivityCycles = 50000;	// ~50ms at 1MHz past the last edge
+				if ( wasQuiet && m_TimingHook )
+					m_TimingHook( m_TimingHookCtx );
+			}
+
+			// IEC SPEED HOLD -- "force 1MHz pacing as a compatibility
+			// fallback". Only for code that touches the serial lines while
+			// still nominally in fast mode; when software selects 1MHz
+			// explicitly via $D07A there is nothing to force, and the hold
+			// must not leave a slow tail after $D07B restores turbo.
 			const bool explicitlySlow = m_SelectedEmulatedHz != 0
 			                         && m_SelectedEmulatedHz <= 1000000u;
 			if ( m_IECThrottleEnabled && iecChanged && !explicitlySlow )
@@ -353,7 +350,9 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 		m_IOLog[ m_IOLogPos++ & 63 ] = (u32)a | ( (u32)value << 16 ) | ( 1u << 24 );
 		if ( ( a & 0xFE00 ) == 0xDC00 )
 		{
-			m_CIALogCyc[ m_CIALogPos & 63 ] = (u32)m_EmuCycles;
+			m_CIALastRead = 0xFFFFFFFF;		// a write resets read compression
+			m_CIALogCyc[ m_CIALogPos & 63 ] =
+				m_C64 ? (u32)m_C64->hostCycles() : (u32)m_EmuCycles;
 			m_CIALog[ m_CIALogPos++ & 63 ] = (u32)a | ( (u32)value << 16 ) | ( 1u << 24 );
 		}
 		if ( m_C64 ) m_C64->write( a, value );

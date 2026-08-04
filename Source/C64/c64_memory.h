@@ -311,6 +311,12 @@ public:
 	// the accelerator is nominally set to.
 	void setIECThrottle( bool enabled ) { m_IECThrottleEnabled = enabled; }
 	bool iecThrottleActive() const { return m_IECHoldCycles > 0; }
+
+	// True while a serial TRANSACTION is in progress, independent of what
+	// speed is selected. This is the flag that suppresses mirror flushing and
+	// raster polling: the slow protocol assigns meaning to pauses, so the CPU
+	// must not be stalled mid-transaction whatever the pacing mode.
+	bool iecBusActive() const { return m_IECHoldCycles != 0 || m_IECActivityCycles != 0; }
 	typedef void (*TimingHook)( void *ctx );
 	void setTimingHook( TimingHook hook, void *ctx ) { m_TimingHook = hook; m_TimingHookCtx = ctx; }
 	u64  m_IECThrottleEvents;
@@ -346,6 +352,7 @@ private:
 
 	bool m_IECThrottleEnabled;
 	u32  m_IECHoldCycles;		// emulated cycles left at forced 1MHz
+	u32  m_IECActivityCycles = 0;	// emulated cycles since last serial edge (countdown)
 	u8   m_LastCIA2PortA;
 	bool m_HaveCIA2PortA;
 	u8   m_LastVICControl[ 3 ];		// last written $D011 / $D016 / $D018
@@ -363,7 +370,9 @@ public:
 	// setup, interrupt mask writes, ATN/CLK/DATA toggles -- is the part a
 	// serial post-mortem actually needs, and it must survive the flood.
 	u32 m_CIALog[ 64 ];
-	u32 m_CIALogCyc[ 64 ];		// emulated-cycle stamp per entry: at 1MHz, 1 = 1us
+	u32 m_CIALogCyc[ 64 ];		// ARM host-cycle stamp per entry: real time, sees
+								// stalls that emulated cycles cannot
+	u32 m_CIALastRead = 0xFFFFFFFF;	// edge compression: identical repeat reads not logged
 	u8  m_CIALogPos;
 
 	// Free-running emulated cycle counter, for timestamping. Incremented in

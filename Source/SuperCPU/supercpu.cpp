@@ -308,7 +308,7 @@ u64 CSuperCPU::runFrame()
 		// CLK for an acknowledgment phase the host never entered, which is
 		// precisely the $DD00=$87 deadlock captured on hardware. Mirroring can
 		// always wait 100ms; the serial bus cannot.
-		if ( !m_Memory.iecThrottleActive()
+		if ( !m_Memory.iecBusActive()
 		     && !m_WriteBuffer.empty() && ticksUsed < frameTicks )
 		{
 			const u16 line = m_Bus->rasterLine();
@@ -335,7 +335,7 @@ u64 CSuperCPU::runFrame()
 	//
 	// So: wait for the beam to leave the display window, then send only as much
 	// as fits in the time remaining before it comes back.
-	if ( !m_WriteBuffer.empty() && !m_Memory.iecThrottleActive() )
+	if ( !m_WriteBuffer.empty() && !m_Memory.iecBusActive() )
 	{
 		const u32 perLine = c64CyclesPerLine( sig.video );
 		const u32 lines   = c64RasterLines( sig.video );

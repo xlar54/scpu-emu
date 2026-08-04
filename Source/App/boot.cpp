@@ -166,23 +166,23 @@ static bool scpuCheckButton( void *ctx )
 				s_Logger->Write( "SCPU", LogNotice, "  cia%u: %s", row, line );
 			}
 
-			// The same entries as INTERVALS, emulated microseconds at 1MHz --
-			// the pulse widths and gaps the DRIVE actually experienced. This
-			// is the protocol timing itself: an ACK shorter than ~20us or a
-			// ready-gap beyond ~200us names the desync directly. Only writes
-			// are shown; w@+NNN means "this write came NNN us after the
-			// previous CIA access".
+			// The same entries as INTERVALS, in REAL microseconds (ARM cycles
+			// / 1400) -- the pulse widths and gaps the DRIVE actually
+			// experienced, including every stall the emulated-cycle view
+			// cannot see. An ACK shorter than ~20us or a ready-gap beyond
+			// ~200us names the desync directly. The ring is edge-compressed,
+			// so these entries are transitions, not poll spam.
 			n = 0;
 			u32 shown = 0;
 			for ( u32 i = 1; i < 64 && shown < 16; i++ )
 			{
-				const u32 idx  = ( scpu->memory().m_CIALogPos + i ) & 63;
-				const u32 prev = ( scpu->memory().m_CIALogPos + i - 1 ) & 63;
+				const u32 idx  = ( scpu->memory().m_CIALogPos + 64 - i ) & 63;
+				const u32 prev = ( scpu->memory().m_CIALogPos + 64 - i - 1 ) & 63;
 				const u32 e = scpu->memory().m_CIALog[ idx ];
-				if ( !( e >> 24 ) ) continue;		// writes only
-				u32 dt = scpu->memory().m_CIALogCyc[ idx ] - scpu->memory().m_CIALogCyc[ prev ];
+				u32 dt = ( scpu->memory().m_CIALogCyc[ idx ] - scpu->memory().m_CIALogCyc[ prev ] )
+				       / ( SCPU_ARM_CLOCK_HZ / 1000000u );
 				if ( dt > 99999 ) dt = 99999;
-				line[ n++ ] = 'w';
+				line[ n++ ] = ( e >> 24 ) ? 'w' : 'r';
 				n += scpuHexByte( line + n, (u8)( ( e >> 8 ) & 0xFF ) ) - 1;
 				n += scpuHexByte( line + n, (u8)( e & 0xFF ) ) - 1;
 				line[ n++ ] = '=';

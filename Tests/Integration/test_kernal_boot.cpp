@@ -138,18 +138,14 @@ TEST( integration_ordinary_io_does_not_flush_the_mirror_buffer )
 	CHECK_EQ( f.bus.m_Memory[ 0x0400 ], 0x41 );
 }
 
-TEST( integration_display_state_registers_flush_first )
+TEST( integration_display_state_writes_never_flush_synchronously )
 {
-	// The four registers that change what the VIC-II LOOKS AT are the exception,
-	// and they have to be, because the reordering is visible.
-	//
-	// Staging a screen and then pointing the chip at it is the standard way to
-	// switch display: draw into memory, then write $D011/$D018. If the register
-	// write overtakes the drawing, the VIC-II starts displaying the new location
-	// before our bytes have arrived, so the machine shows whatever was there
-	// before and the intended picture appears a frame or more later. On the CMD
-	// SuperCPU's own boot animation that reads as the screen staying in text
-	// mode throughout, then flipping to graphics once it is over.
+	// The inverse of an earlier contract, and the third revision of this rule;
+	// the history is in c64_memory.cpp. A synchronous flush emits a burst, and
+	// bursts are never display-safe at arbitrary raster positions -- the CMD
+	// splash's raster interrupt toggles $D011 mode bits mid-display by design,
+	// and every "small enough to be safe" threshold turned out to be a per-boot
+	// coin flip on real hardware. Ordering is the border scheduler's job.
 	static const u16 displayRegs[] = { 0xD011, 0xD016, 0xD018, 0xDD00 };
 
 	for ( u32 i = 0; i < 4; i++ )
@@ -167,19 +163,23 @@ TEST( integration_display_state_registers_flush_first )
 
 		for ( int i2 = 0; i2 < 4; i2++ ) f.cpu.step();
 
-		// The staged byte must already be on the machine, and must have got
-		// there BEFORE the register write.
-		CHECK_EQ( f.wb.pending(), 0 );
-		CHECK_EQ( f.bus.m_Memory[ 0x0400 ], 0x41 );
+		// The staged byte stays queued: only the register write itself went to
+		// the machine. The border-scheduled flusher delivers the data within a
+		// frame, which is the same transient a real SuperCPU shows.
+		CHECK_EQ( f.wb.pending(), 1 );
 
-		bool sawScreenWrite = false, orderedCorrectly = false;
+		bool sawRegWrite = false, sawScreenWrite = false;
 		for ( u32 j = 0; j < f.bus.m_LogCount; j++ )
 		{
+			if ( f.bus.m_Log[ j ].addr == reg && f.bus.m_Log[ j ].op == HOSTOP_WRITE ) sawRegWrite = true;
 			if ( f.bus.m_Log[ j ].addr == 0x0400 ) sawScreenWrite = true;
-			if ( f.bus.m_Log[ j ].addr == reg )    orderedCorrectly = sawScreenWrite;
 		}
-		CHECK( sawScreenWrite );
-		CHECK( orderedCorrectly );
+		CHECK( sawRegWrite );
+		CHECK( !sawScreenWrite );
+
+		// And the border flush delivers it afterwards.
+		f.wb.flush();
+		CHECK_EQ( f.bus.m_Memory[ 0x0400 ], 0x41 );
 	}
 }
 
@@ -796,8 +796,11 @@ TEST( integration_serial_toggles_on_dd00_do_not_flush )
 	for ( int i = 0; i < 9; i++ ) f.cpu.step();
 	CHECK_EQ( f.wb.pending(), 1 );
 
-	// The VIC-bank change is the one that flushes.
+	// The VIC-bank change no longer flushes synchronously either -- nothing
+	// does; see integration_display_state_writes_never_flush_synchronously.
 	f.cpu.step(); f.cpu.step();
-	CHECK_EQ( f.wb.pending(), 0 );
+	CHECK_EQ( f.wb.pending(), 1 );
+
+	f.wb.flush();
 	CHECK_EQ( f.bus.m_Memory[ 0x0400 ], 0x41 );
 }
