@@ -259,36 +259,6 @@ void scpuBootRun( CLogger *logger )
 		scpuWaitForButtonThenReboot();
 	}
 
-	logger->Write( "SCPU", LogNotice,
-	               "flashing the border for ~8s: red, yellow, green, lt.green, "
-	               "lt.blue, cyan, white, black -- three times" );
-	radBus.signalAlive();
-
-	// --- idle observation window ------------------------------------------
-	// Decisive experiment. We hold /DMA but drive nothing at all for 15 seconds.
-	// Two very different faults currently look identical on the C64, and they
-	// need opposite fixes:
-	//
-	//   picture STABLE during this window  -> holding /DMA is harmless, and it
-	//                                         is our bus traffic (mirroring)
-	//                                         that destabilises the VIC-II
-	//   picture ALREADY ROLLING            -> the fault is in holding /DMA
-	//                                         continuously, or in the state the
-	//                                         bus signals are left in when idle
-	{
-		logger->Write( "SCPU", LogNotice, "=== IDLE TEST: 15s, holding /DMA, driving nothing ===" );
-		logger->Write( "SCPU", LogNotice, "    WATCH THE C64 NOW." );
-		logger->Write( "SCPU", LogNotice, "    stable picture  -> our bus traffic is the problem" );
-		logger->Write( "SCPU", LogNotice, "    rolling picture -> holding /DMA itself is the problem" );
-
-		radBus.write( 0xD020, 0 );		// black border, so a stable frame is obvious
-		radBus.write( 0xD021, 6 );		// standard blue background
-
-		radBus.idleHoldInterruptible( 15 );
-
-		logger->Write( "SCPU", LogNotice, "=== IDLE TEST over ===" );
-	}
-
 	actLED.Blink( 4 );		// milestone: handing over to the CPU core
 	logger->Write( "SCPU", LogNotice, "starting the CPU core" );
 	logger->Write( "SCPU", LogNotice,

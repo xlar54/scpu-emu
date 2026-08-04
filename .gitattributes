@@ -1,0 +1,30 @@
+# Normalise text in the repository, and keep line endings sane on checkout.
+* text=auto
+
+# Shell scripts must be LF. With CRLF they fail on Linux and macOS with an
+# opaque "bad interpreter" error.
+*.sh text eol=lf
+
+# Sources and docs: LF everywhere. The firmware is cross-compiled from a Unix
+# toolchain, so LF is what the build actually sees.
+*.c    text eol=lf
+*.cpp  text eol=lf
+*.h    text eol=lf
+*.S    text eol=lf
+*.mk   text eol=lf
+*.md   text eol=lf
+Makefile text eol=lf
+
+# The SD card config is read by our own parser, which handles either, and by
+# the Raspberry Pi firmware, which expects DOS-style. Keep CRLF.
+*.cfg text eol=crlf
+*.txt text eol=crlf
+
+# Never touch binaries.
+*.rom  binary
+*.bin  binary
+*.elf  binary
+*.dat  binary
+*.img  binary
+*.png  binary
+*.jpg  binary
