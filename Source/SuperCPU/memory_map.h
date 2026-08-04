@@ -71,8 +71,36 @@ public:
 	void reset();
 
 	// --- ICpuBus ----------------------------------------------------------
-	u8   read8( scpu_addr_t addr ) override;
-	void write8( scpu_addr_t addr, u8 value ) override;
+	// Bank 0 is inlined here and forwarded straight to CC64Memory's own inline
+	// fast path, so an ordinary RAM access becomes a few instructions with no
+	// call at all. Everything above bank 0 -- private SRAM, SuperRAM, the SIMM
+	// window, the ROM -- goes out of line; it is rare, and the decode chain is
+	// too long to be worth inlining.
+	u8 read8( scpu_addr_t addr ) override
+	{
+		addr &= SCPU_ADDR_MASK;
+		if ( addr < 0x010000 )
+		{
+			m_Bank0Accesses++;
+			return m_Bank0 ? m_Bank0->readFast( (u16)addr ) : 0xFF;
+		}
+		return readAbove( addr );
+	}
+
+	void write8( scpu_addr_t addr, u8 value ) override
+	{
+		addr &= SCPU_ADDR_MASK;
+		if ( addr < 0x010000 )
+		{
+			m_Bank0Accesses++;
+			if ( m_Bank0 ) m_Bank0->writeFast( (u16)addr, value );
+			return;
+		}
+		writeAbove( addr, value );
+	}
+
+	u8   readAbove( scpu_addr_t addr );
+	void writeAbove( scpu_addr_t addr, u8 value );
 	bool irqAsserted() override;
 	bool nmiAsserted() override;
 	void tick( u32 nCycles ) override;

@@ -43,18 +43,10 @@ void CSuperCPUMemoryMap::reset()
 
 // ---------------------------------------------------------------------------
 
-u8 CSuperCPUMemoryMap::read8( scpu_addr_t addr )
+// Everything ABOVE bank 0. Bank 0 itself is inlined in the header -- see the
+// note there.
+u8 CSuperCPUMemoryMap::readAbove( scpu_addr_t addr )
 {
-	addr &= SCPU_ADDR_MASK;
-
-	// Bank 0 first: it is overwhelmingly the common case, and the only one that
-	// can reach the C64.
-	if ( addr < 0x010000 )
-	{
-		m_Bank0Accesses++;
-		return m_Bank0 ? m_Bank0->read8( addr ) : 0xFF;
-	}
-
 	m_FastAccesses++;
 
 	if ( addr < 0x020000 )
@@ -84,17 +76,9 @@ u8 CSuperCPUMemoryMap::read8( scpu_addr_t addr )
 	return (u8)( addr >> 16 );
 }
 
-void CSuperCPUMemoryMap::write8( scpu_addr_t addr, u8 value )
+// Everything ABOVE bank 0; bank 0 is inlined in the header.
+void CSuperCPUMemoryMap::writeAbove( scpu_addr_t addr, u8 value )
 {
-	addr &= SCPU_ADDR_MASK;
-
-	if ( addr < 0x010000 )
-	{
-		m_Bank0Accesses++;
-		if ( m_Bank0 ) m_Bank0->write8( addr, value );
-		return;
-	}
-
 	m_FastAccesses++;
 
 	if ( addr < 0x020000 )

@@ -163,6 +163,37 @@ public:
 	bool hasKernalROM() const { return m_HasKernal; }
 	bool hasCharROM()   const { return m_HasChar; }
 
+	// --- hot path ---------------------------------------------------------
+	// Plain RAM in bank 0, inline, no call. This is the overwhelming majority
+	// of every emulated access -- opcode fetches, operands, zero page, the
+	// stack -- and on an in-order Cortex-A53 the call and the indirect branch
+	// that used to wrap it cost more than the work itself.
+	//
+	// Everything with any complexity is left OUT of line: the $00/$01 port,
+	// bootmap, the BASIC/KERNAL shadows, I/O and open bus. Those paths already
+	// do enough work that a call is noise, and keeping them out of the header
+	// keeps this small enough to actually inline.
+	inline u8 readFast( u16 a )
+	{
+		if ( a > 1 && !m_BootmapActive && c64MapRead( a, m_BankMode ) == REG_RAM )
+			return m_RAM[ a ];
+		return read8( a );
+	}
+
+	inline void writeFast( u16 a, u8 v )
+	{
+		// Note the mirror sink still has to be told: the VIC-II only sees what
+		// reaches the C64's own DRAM.
+		if ( a > 1 && c64MapRead( a, m_BankMode ) != REG_IO )
+		{
+			m_RAM[ a ] = v;
+			m_RamWrites++;
+			if ( m_Mirror ) m_Mirror->onRamWrite( a, v );
+			return;
+		}
+		write8( a, v );
+	}
+
 	// --- ICpuBus ----------------------------------------------------------
 	u8   read8( scpu_addr_t addr ) override;
 	void write8( scpu_addr_t addr, u8 value ) override;
