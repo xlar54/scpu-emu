@@ -139,6 +139,23 @@ void CSuperCPU::reset()
 	if ( !bootmapUsable )
 		m_Memory.m_BootmapActive = false;
 
+	// The BASIC and KERNAL windows are served from bank-1 SRAM, not from the
+	// snapshotted ROMs -- see CC64Memory::setROMShadow(). Seed that SRAM with
+	// the snapshots so a machine that never runs the accelerator's boot code
+	// behaves exactly as it did before this existed: same ROMs, same banner.
+	//
+	// If the SuperCPU's own boot ROM does run, it overwrites these with its
+	// patched copies, which is the entire point. Re-seeding on every reset is
+	// deliberate: bootmap comes back on at reset too, so the boot code gets to
+	// install its patches again, and anything left over from a previous run
+	// cannot persist into a fresh boot.
+	for ( u32 i = 0; i < C64_BASIC_SIZE; i++ )
+		m_MemoryMap.m_Bank1[ 0xA000 + i ] = m_Memory.m_Basic[ i ];
+	for ( u32 i = 0; i < C64_KERNAL_SIZE; i++ )
+		m_MemoryMap.m_Bank1[ 0xE000 + i ] = m_Memory.m_Kernal[ i ];
+
+	m_Memory.setROMShadow( m_MemoryMap.m_Bank1 );
+
 	m_Registers.reset();
 
 	// Put the mirroring policy back to its power-on state too, or a reset would

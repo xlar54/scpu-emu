@@ -101,6 +101,27 @@ public:
 	void setBootmapROM( const u8 *rom ) { m_BootmapROM = rom; }
 	bool hasBootmapROM() const          { return m_BootmapROM != 0; }
 
+	// --- ROM shadow -------------------------------------------------------
+	// On a SuperCPU there is NO C64 BASIC or KERNAL ROM in the map. Those
+	// windows are served from the accelerator's own SRAM -- VICE's
+	// scpu64meminit.c gives $A000-$BFFF as R1 (mem_sram[0x1A000]) and
+	// $E000-$FFFF as KT (mem_sram[0x1E000]), i.e. bank 1 at the same offsets.
+	//
+	// That is not a detail: it is how the accelerator works. The SuperCPU's
+	// EPROM carries its own copy of BASIC (byte-identical to Commodore's) and a
+	// PATCHED KERNAL -- JiffyDOS serial routines, and the banner that reads
+	// "SUPERCPU DOS 1.40 (C)1996 CMD" instead of "**** COMMODORE 64 BASIC V2
+	// ****". The boot code copies both into bank 1 and then maps itself out, so
+	// everything afterwards runs the patched copy, out of fast SRAM.
+	//
+	// Serving these windows from a read-only snapshot instead silently discards
+	// those patches, which is exactly what produced a stock C64 banner on a
+	// machine that had just run CMD's boot code.
+	//
+	// 'bank1' is the 64K of accelerator SRAM, not copied. Null falls back to the
+	// snapshotted ROMs, which is what a machine with no accelerator ROM wants.
+	void setROMShadow( u8 *bank1 ) { m_ROMShadow = bank1; }
+
 	// The live flag. CSuperCPURegisters points at this directly so a $D0B6
 	// write takes effect on the very next fetch, which is what the boot code
 	// depends on.
@@ -180,12 +201,14 @@ public:
 	u64  m_IECThrottleEvents;
 
 	u64 m_PacingDebtCycles;		// emulated cycles run but not yet paid for in real time
+	u32 m_PacingCheckCycles;	// emulated cycles between consulting the host clock
 
 private:
 	IC64Bus        *m_C64;
 	IMirrorSink    *m_Mirror;
 	IIOInterceptor *m_IO;
 	const u8       *m_BootmapROM;
+	u8             *m_ROMShadow;
 	bool            m_HasBasic, m_HasKernal, m_HasChar;
 
 	// Pacing state. m_HostPerEmuQ16 is host cycles per emulated cycle in 16.16

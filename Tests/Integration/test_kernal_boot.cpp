@@ -106,20 +106,19 @@ TEST( integration_io_read_goes_to_the_machine )
 	CHECK_EQ( f.mem.m_IOReads, 1 );
 }
 
-TEST( integration_io_access_does_not_flush_the_mirror_buffer )
+TEST( integration_ordinary_io_does_not_flush_the_mirror_buffer )
 {
-	// Contract change, deliberate. Flushing before every I/O access meant a
-	// booting KERNAL -- which touches I/O constantly -- drove a continuous
-	// stream of unscheduled bursts across the visible display, corrupting the
-	// VIC-II's fetches. Mirroring is now scheduled against the raster in
+	// Flushing before EVERY I/O access meant a booting KERNAL -- which touches
+	// I/O constantly -- drove a continuous stream of unscheduled bursts across
+	// the visible display, corrupting the VIC-II's fetches. So ordinary I/O
+	// does not flush; mirroring is scheduled against the raster in
 	// CSuperCPU::runFrame() instead.
 	//
-	// The accepted cost: a program that stages a screen and immediately points
-	// the VIC at it can show stale data for one frame. The real SuperCPU
-	// mirrors asynchronously and has the same property.
+	// $D020 is the border colour: it changes what the VIC-II draws, but not
+	// which memory it reads, so nothing has to arrive first.
 	SystemFixture f;
 	const u8 code[] = { 0xA9, 0x41, 0x8D, 0x00, 0x04,	// LDA #$41 / STA $0400
-	                    0xA9, 0x3B, 0x8D, 0x11, 0xD0 };	// LDA #$3B / STA $D011
+	                    0xA9, 0x0E, 0x8D, 0x20, 0xD0 };	// LDA #$0E / STA $D020
 	f.installKernal( 0xE000, code, sizeof( code ), 0xE000 );
 	f.start();
 	f.wb.setOptMode( SCPU_OPT_NONE );
@@ -130,12 +129,57 @@ TEST( integration_io_access_does_not_flush_the_mirror_buffer )
 	// The screen byte is still queued; only the register write went out.
 	CHECK_EQ( f.wb.pending(), 1 );
 	CHECK_EQ( f.bus.m_LogCount, 1 );
-	CHECK_EQ( f.bus.m_Log[ 0 ].addr, 0xD011 );
+	CHECK_EQ( f.bus.m_Log[ 0 ].addr, 0xD020 );
 	CHECK_EQ( f.bus.m_Log[ 0 ].op, HOSTOP_WRITE );
 
 	// It reaches the machine when the mirror is flushed, not before.
 	f.wb.flush();
 	CHECK_EQ( f.bus.m_Memory[ 0x0400 ], 0x41 );
+}
+
+TEST( integration_display_state_registers_flush_first )
+{
+	// The four registers that change what the VIC-II LOOKS AT are the exception,
+	// and they have to be, because the reordering is visible.
+	//
+	// Staging a screen and then pointing the chip at it is the standard way to
+	// switch display: draw into memory, then write $D011/$D018. If the register
+	// write overtakes the drawing, the VIC-II starts displaying the new location
+	// before our bytes have arrived, so the machine shows whatever was there
+	// before and the intended picture appears a frame or more later. On the CMD
+	// SuperCPU's own boot animation that reads as the screen staying in text
+	// mode throughout, then flipping to graphics once it is over.
+	static const u16 displayRegs[] = { 0xD011, 0xD016, 0xD018, 0xDD00 };
+
+	for ( u32 i = 0; i < 4; i++ )
+	{
+		const u16 reg = displayRegs[ i ];
+
+		SystemFixture f;
+		const u8 code[] = { 0xA9, 0x41, 0x8D, 0x00, 0x04,				// STA $0400
+		                    0xA9, 0x3B, 0x8D, (u8)( reg & 0xFF ),
+		                                      (u8)( reg >> 8 ) };		// STA reg
+		f.installKernal( 0xE000, code, sizeof( code ), 0xE000 );
+		f.start();
+		f.wb.setOptMode( SCPU_OPT_NONE );
+		f.bus.m_LogEnabled = true;
+
+		for ( int i2 = 0; i2 < 4; i2++ ) f.cpu.step();
+
+		// The staged byte must already be on the machine, and must have got
+		// there BEFORE the register write.
+		CHECK_EQ( f.wb.pending(), 0 );
+		CHECK_EQ( f.bus.m_Memory[ 0x0400 ], 0x41 );
+
+		bool sawScreenWrite = false, orderedCorrectly = false;
+		for ( u32 j = 0; j < f.bus.m_LogCount; j++ )
+		{
+			if ( f.bus.m_Log[ j ].addr == 0x0400 ) sawScreenWrite = true;
+			if ( f.bus.m_Log[ j ].addr == reg )    orderedCorrectly = sawScreenWrite;
+		}
+		CHECK( sawScreenWrite );
+		CHECK( orderedCorrectly );
+	}
 }
 
 TEST( integration_banking_switch_changes_what_executes )

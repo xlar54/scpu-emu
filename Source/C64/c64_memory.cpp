@@ -28,8 +28,8 @@ CC64Memory::CC64Memory()
 	  m_Port00( 0x2F ), m_Port01( 0x37 ), m_BankMode( 0 ),
 	  m_IOReads( 0 ), m_IOWrites( 0 ), m_RamWrites( 0 ),
 	  m_IECThrottleEvents( 0 ),
-	  m_PacingDebtCycles( 0 ),
-	  m_C64( 0 ), m_Mirror( 0 ), m_IO( 0 ), m_BootmapROM( 0 ),
+	  m_PacingDebtCycles( 0 ), m_PacingCheckCycles( 1 ),
+	  m_C64( 0 ), m_Mirror( 0 ), m_IO( 0 ), m_BootmapROM( 0 ), m_ROMShadow( 0 ),
 	  m_HasBasic( false ), m_HasKernal( false ), m_HasChar( false ),
 	  m_HostPerEmuQ16( 0 ), m_HostPerEmuQ16Slow( 0 ), m_PacingAnchor( 0 ),
 	  m_IECThrottleEnabled( true ), m_IECHoldCycles( 0 )
@@ -154,10 +154,12 @@ u8 CC64Memory::read8( scpu_addr_t addr )
 		return m_RAM[ a ];
 
 	case REG_BASIC:
-		return m_Basic[ a - 0xA000 ];
+		// Bank-1 SRAM at the same offset, not the C64's ROM -- see
+		// setROMShadow(). The boot ROM's patched copy lives here.
+		return m_ROMShadow ? m_ROMShadow[ a ] : m_Basic[ a - 0xA000 ];
 
 	case REG_KERNAL:
-		return m_Kernal[ a - 0xE000 ];
+		return m_ROMShadow ? m_ROMShadow[ a ] : m_Kernal[ a - 0xE000 ];
 
 	case REG_CHARROM:
 		return m_CharROM[ a - 0xD000 ];
@@ -227,7 +229,31 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 			m_IECHoldCycles = 100000;
 		}
 
-		// No flush here either -- see the note in read8().
+		// Mirroring is normally asynchronous -- see the note in read8() -- which
+		// means a buffered RAM write and an I/O write can reach the C64 out of
+		// program order. That is fine almost everywhere, because the VIC-II
+		// cannot tell when a byte of screen memory arrived.
+		//
+		// It is NOT fine for the four registers that change what the VIC-II
+		// LOOKS AT. Enabling bitmap mode, or repointing the screen or character
+		// base, makes the chip start displaying memory that our pending writes
+		// have not reached yet -- so the machine shows the previous contents of
+		// the new location, and the intended picture appears only later, when
+		// the buffer happens to drain. A program that draws a screen and then
+		// switches to it sees the two steps in the wrong order.
+		//
+		//   $D011  control 1  -- bitmap mode, display enable, Y scroll
+		//   $D016  control 2  -- multicolour, X scroll
+		//   $D018  memory pointers -- screen base, character/bitmap base
+		//   $DD00  CIA2 port A -- VIC bank select
+		//
+		// Flushing before just these restores program order where it is
+		// visible. They are rare -- a handful per mode change -- unlike the
+		// constant $D012/$DC01 traffic that made flushing before EVERY I/O
+		// write corrupt the display.
+		if ( m_Mirror && ( a == 0xD011 || a == 0xD016 || a == 0xD018 || a == 0xDD00 ) )
+			m_Mirror->flush();
+
 		m_IOWrites++;
 		if ( m_C64 ) m_C64->write( a, value );
 		return;
@@ -266,6 +292,12 @@ void CC64Memory::setPacing( u64 hostCyclesPerSecond, u32 emulatedHz )
 	// The rate to fall back to while the serial bus is busy.
 	m_HostPerEmuQ16Slow = ( hostCyclesPerSecond << 16 ) / 1000000ULL;
 
+	// How often it is worth consulting the host clock: about once per
+	// microsecond of emulated time. At 20MHz that is every 20 emulated cycles;
+	// at 1MHz it is every cycle, which is what it always used to be.
+	m_PacingCheckCycles = emulatedHz / 1000000u;
+	if ( m_PacingCheckCycles < 1 ) m_PacingCheckCycles = 1;
+
 	resyncPacing();
 }
 
@@ -290,6 +322,23 @@ void CC64Memory::tick( u32 nCycles )
 		return;
 
 	m_PacingDebtCycles += nCycles;
+
+	// Consulting the host clock means reading a system register -- PMCCNTR_EL0
+	// on the Pi -- and on an in-order Cortex-A53 that is nowhere near free.
+	// This runs after EVERY instruction, so at 20MHz it was the single biggest
+	// thing the pacer cost.
+	//
+	// Look only once enough emulated time has passed to be worth looking:
+	// roughly one microsecond. At 20MHz that is every 20 emulated cycles rather
+	// than every three or so. While the serial bus is active it stays at every
+	// cycle, because the KERNAL's IEC bit timing genuinely needs that
+	// resolution -- and at 1MHz we are nowhere near the limit anyway, so the
+	// reads cost nothing we cannot afford.
+	//
+	// Accuracy is unaffected either way: the debt accumulates regardless and is
+	// settled in full whenever the clock is finally read.
+	if ( !iecActive && m_PacingDebtCycles < (u64)m_PacingCheckCycles )
+		return;
 
 	// While the serial bus is active, run at 1MHz whatever speed is selected --
 	// the KERNAL's bit timing depends on it. See setIECThrottle().
