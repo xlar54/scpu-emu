@@ -246,6 +246,8 @@ public:
 	inline void tickFast( u32 nCycles )
 	{
 		m_EmuCycles += nCycles;
+		if ( nCycles > m_MaxTickChunk )
+			m_MaxTickChunk = nCycles;
 		if ( m_IntCredit < 0x100000 )
 			m_IntCredit += nCycles;
 
@@ -378,6 +380,14 @@ private:
 	bool m_IECThrottleEnabled;
 	u32  m_IECHoldCycles;		// emulated cycles left at forced 1MHz
 	u32  m_IECActivityCycles = 0;	// emulated cycles since last serial edge (countdown)
+public:
+	// Largest single tickFast() chunk seen. The 65816 run() loop batches bus
+	// ticks for speed but must drop to per-instruction ticks while the serial
+	// bus is active -- batched ticks compress the real-time spacing of bus
+	// edges, which intermittently violates drive setup windows. This exists
+	// so a test can PROVE the granularity contract instead of trusting it.
+	u32  m_MaxTickChunk = 0;
+private:
 	u8   m_LastCIA2PortA;
 	bool m_HaveCIA2PortA;
 	u8   m_LastVICControl[ 3 ];		// last written $D011 / $D016 / $D018

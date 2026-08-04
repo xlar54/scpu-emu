@@ -197,6 +197,7 @@ private:
 	inline bool busIRQ();
 	inline bool busNMI();
 	inline void busInterrupts( bool &irq, bool &nmi );
+	inline bool busFineTicks();
 	inline void busTick( u32 n );
 	u64      m_Cycles;
 	bool     m_RunBreak;

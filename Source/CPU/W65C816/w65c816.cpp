@@ -863,6 +863,14 @@ u64 CW65C816::run( u64 nCycles )
 	// the clock every 20 cycles at 20MHz, the IEC windows are 50000-cycle
 	// countdowns, and the interrupt cache refreshes on a ~20-cycle credit.
 	// step() itself still ticks per call, for tests and single-stepping.
+	//
+	// EXCEPT while the serial bus is mid-transaction: batching lets a handful
+	// of instructions run back to back at ARM speed before the pacer catches
+	// up, which compresses the real-time spacing of consecutive bus-line
+	// edges from microseconds to nanoseconds -- drives intermittently miss
+	// edges sampled that close together. busFineTicks() drops the loop to
+	// per-instruction ticks for the duration; it also catches the arming
+	// write itself, because the check runs after every instruction.
 	const u64 start = m_Cycles;
 	m_RunBreak = false;
 	u32 pending = 0;
@@ -873,7 +881,7 @@ u64 CW65C816::run( u64 nCycles )
 		pending += stepNoTick();
 		if ( m_Stopped )
 			break;
-		if ( ++sinceTick >= 8 )
+		if ( ++sinceTick >= 8 || busFineTicks() )
 		{
 			busTick( pending );
 			pending = 0;

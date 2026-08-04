@@ -110,6 +110,11 @@ public:
 		if ( m_Bank0 ) m_Bank0->sampleIRQNMIFast( irq, nmi );
 		else irq = nmi = false;
 	}
+
+	// True while the serial bus is mid-transaction: the core's run() loop must
+	// tick per instruction then, not in batches, so bus-line edges keep their
+	// paced real-time spacing on the wire.
+	bool fineTicksRequired() const { return m_Bank0 && m_Bank0->iecBusActive(); }
 	bool nmiAsserted() override { return m_Bank0 ? m_Bank0->nmiFast() : false; }
 	void tick( u32 nCycles ) override { if ( m_Bank0 ) m_Bank0->tickFast( nCycles ); }
 

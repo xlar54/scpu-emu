@@ -290,3 +290,43 @@ TEST( kernal_65816_native_mode_survives_a_return_to_emulation )
 	CHECK( ( m.cpu.m_P & W65_M ) != 0 );
 	CHECK( ( m.cpu.m_P & W65_X ) != 0 );
 }
+
+TEST( integration_run_ticks_per_instruction_while_iec_active )
+{
+	// The intermittent drive-freeze regression, pinned. run() batches bus
+	// ticks for speed, which lets consecutive serial-line edges leave the
+	// Pi nanoseconds apart instead of paced microseconds apart -- drives
+	// sometimes miss edges that close together. While the serial bus is
+	// active the loop must tick after EVERY instruction; when it is quiet
+	// the batching must come back, or the speed win silently dies.
+	Machine816 m;
+	if ( !m.haveROMs ) { std::printf( "(skipped: no ROMs) " ); return; }
+	m.cpu.attachFastBus( &m.map );
+
+	// A NOP sled looping in RAM, IRQs masked so the KERNAL never runs.
+	for ( u32 i = 0; i < 16; i++ ) m.mem.m_RAM[ 0x1000 + i ] = 0xEA;
+	m.mem.m_RAM[ 0x1010 ] = 0x4C;	// JMP $1000
+	m.mem.m_RAM[ 0x1011 ] = 0x00;
+	m.mem.m_RAM[ 0x1012 ] = 0x10;
+	m.cpu.m_PBR = 0x00;
+	m.cpu.m_PC  = 0x1000;
+	m.cpu.m_P  |= W65_I;
+
+	// Quiet bus: chunks must span several instructions (8 NOPs = 16 cycles).
+	m.mem.m_MaxTickChunk = 0;
+	m.cpu.run( 400 );
+	CHECK( m.mem.m_MaxTickChunk > 8 );
+
+	// A serial-line edge arms the activity window (and the speed hold).
+	m.mem.read8( 0xDD00 );
+	const u8 v = m.bus.m_Memory[ 0xDD00 ];
+	m.mem.write8( 0xDD00, (u8)( v ^ 0x08 ) );
+	CHECK( m.mem.iecBusActive() );
+
+	// Active bus: no chunk may exceed one instruction -- NOP is 2 cycles,
+	// JMP is 3, so anything above 3 means a batch slipped through.
+	m.mem.m_MaxTickChunk = 0;
+	m.cpu.run( 400 );
+	CHECK( m.mem.iecBusActive() );
+	CHECK( m.mem.m_MaxTickChunk <= 3 );
+}

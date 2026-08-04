@@ -131,6 +131,11 @@ inline void CW65C816::busInterrupts( bool &irq, bool &nmi )
 	else { irq = m_Bus->irqAsserted(); nmi = m_Bus->nmiAsserted(); }
 }
 
+inline bool CW65C816::busFineTicks()
+{
+	return m_FastBus ? m_FastBus->fineTicksRequired() : false;
+}
+
 inline void CW65C816::busTick( u32 n )
 {
 	if ( m_FastBus ) m_FastBus->tick( n ); else m_Bus->tick( n );
