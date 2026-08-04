@@ -298,7 +298,18 @@ u64 CSuperCPU::runFrame()
 
 		// Opportunistic flush: one raster read, and only drain what fits in
 		// the border time remaining. Never during the visible display.
-		if ( !m_WriteBuffer.empty() && ticksUsed < frameTicks )
+		//
+		// And NEVER while the serial bus is active. A flush stalls the
+		// emulated CPU for up to several hundred microseconds, and the slow
+		// serial protocol assigns MEANING to pauses: a talker holding its
+		// ready state longer than 200us is signalling EOI. A flush landing
+		// between a host's ready and its first bit made the drive see EOI on
+		// ordinary bytes, desyncing the transfer -- the drive then sat holding
+		// CLK for an acknowledgment phase the host never entered, which is
+		// precisely the $DD00=$87 deadlock captured on hardware. Mirroring can
+		// always wait 100ms; the serial bus cannot.
+		if ( !m_Memory.iecThrottleActive()
+		     && !m_WriteBuffer.empty() && ticksUsed < frameTicks )
 		{
 			const u16 line = m_Bus->rasterLine();
 			if ( line != 0xFFFF
@@ -324,7 +335,7 @@ u64 CSuperCPU::runFrame()
 	//
 	// So: wait for the beam to leave the display window, then send only as much
 	// as fits in the time remaining before it comes back.
-	if ( !m_WriteBuffer.empty() )
+	if ( !m_WriteBuffer.empty() && !m_Memory.iecThrottleActive() )
 	{
 		const u32 perLine = c64CyclesPerLine( sig.video );
 		const u32 lines   = c64RasterLines( sig.video );
