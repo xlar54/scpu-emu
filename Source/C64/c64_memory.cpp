@@ -282,16 +282,19 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 				m_HaveVICControl |= (u8)( 1u << idx );
 			}
 
-			// Only a SMALL buffer may be flushed synchronously here. This
+			// Only a TRIVIAL buffer may be flushed synchronously here. This
 			// write can arrive at any raster position -- the CMD splash runs a
 			// raster-interrupt animation that toggles $D011 mode bits every
-			// frame -- and blasting a large buffer across the visible display
-			// corrupts the VIC's fetches: the screen rolls. A small burst is
-			// invisible; a large one defers to the border-scheduled flusher,
-			// which runs eight times a frame, so the staleness is bounded by
-			// about a millisecond -- the same transient a real SuperCPU's
-			// asynchronous mirroring produces on a mode switch.
-			if ( displayChanged && m_Mirror->pendingBytes() <= 128 )
+			// frame, mid-display BY DESIGN -- so the burst must be invisible
+			// anywhere on the screen, not merely small. Eight bytes is ~8us,
+			// the same as a routine cluster of I/O accesses. Anything larger
+			// defers to the border-scheduled flusher, which runs eight times a
+			// frame, so the staleness is bounded by about a millisecond -- the
+			// transient a real SuperCPU's asynchronous mirroring produces on a
+			// mode switch. The earlier 128-byte bound was ~2 raster lines of
+			// bus traffic at the beam, and rolled the display whenever the
+			// buffer happened to be modestly dirty at the interrupt's moment.
+			if ( displayChanged && m_Mirror->pendingBytes() <= 8 )
 				m_Mirror->flush();
 		}
 
