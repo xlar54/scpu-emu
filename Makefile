@@ -108,10 +108,12 @@ sdcard:
 	@cp -f ROMs/basic.rom   $(SDDIR)/SCPU/ 2>/dev/null || true
 	@cp -f ROMs/chargen.rom $(SDDIR)/SCPU/ 2>/dev/null || true
 	@# The SuperCPU's own ROM: SuperCPU DOS and its JiffyDOS support. Optional --
-	@# the accelerator boots the machine's own KERNAL without it. 2.04 is the
-	@# later of the two CMD builds; drop scpu-dos-1.4.bin in as scpu.rom instead
-	@# to run that one.
-	@cp -f ROMs/scpu-dos-2.04.bin $(SDDIR)/SCPU/scpu.rom 2>/dev/null \
+	@# the accelerator boots the machine's own KERNAL without it.
+	@#
+	@# 1.4 is the SuperCPU 64 image. 2.04 is for the SuperCPU 128 -- it carries a
+	@# C128 KERNAL and BASIC inside it, and on a 64 its boot code gets as far as
+	@# "SUPERCPU INITIALIZATION ERROR: 06". Do not stage 2.04 for a C64.
+	@cp -f ROMs/scpu-dos-1.4.bin $(SDDIR)/SCPU/scpu.rom 2>/dev/null \
 		|| echo "  (no SuperCPU ROM staged -- optional, see ROMs/README.md)"
 	@cp -f Source/kernel8.img $(SDDIR)/ 2>/dev/null \
 		|| echo "  MISSING kernel8.img       -- run 'make firmware' first (needs a Circle tree, see Docs/build.md)"

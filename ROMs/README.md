@@ -26,21 +26,27 @@ boot a genuine KERNAL through the CPU core. Those tests report as *skipped*
 rather than failing when the files are absent, so a fresh clone still goes
 green.
 
-The SuperCPU DOS images are 128KB. `make sdcard` stages **2.04** as
-`SCPU/scpu.rom`, and the firmware maps it at `$F80000` where accelerator-aware
-software can read it. It is entirely optional: SCPU-EMU boots the machine's own
+The SuperCPU DOS images are 128KB. `make sdcard` stages **1.4** as
+`SCPU/scpu.rom`, and the firmware maps it at `$F80000`. It is entirely optional: SCPU-EMU boots the machine's own
 KERNAL out of bank 0, so without it `$F80000` simply reads open bus and
 everything still works.
 
-The two images are not equivalent:
+**The two images are for different machines.** This is the thing to get right:
 
-| | populated | vector table at the top |
+| | machine | contents |
 |---|---|---|
-| `scpu-dos-2.04.bin` | all 128KB | yes — `RESET=$FF3D`, `NMI=$FF05`, `IRQ=$FF17` |
-| `scpu-dos-1.4.bin` | first 64KB only, rest `$FF` | no — the top half is blank |
+| `scpu-dos-1.4.bin` | **SuperCPU 64** | first 64KB populated, rest `$FF`. No C128 content. |
+| `scpu-dos-2.04.bin` | **SuperCPU 128** | all 128KB, and carries a C128 KERNAL and BASIC — the strings `(C)1986 COMMODORE ELECTRONICS, LTD.` and `(C)1977 MICROSOFT CORP.` are in there. |
 
-2.04 is the default for that reason. To run 1.4 instead, copy it over
-`SCPU/scpu.rom` on the card.
+Staging 2.04 on a C64 gets you as far as the SuperCPU's own boot screen and then
+`SUPERCPU INITIALIZATION ERROR: 06`, because its boot code is checking for a
+machine that is not there.
+
+1.4's boot chain, for reference: reset reads `$FFFC` under bootmap and gets
+`$FC90`, which is `JML $F800FC`, which is `JML $F80100`, which is the real
+start — `SEI`, set up the stack, then enable the hardware registers at `$D07E`.
+So both the bootmap window and the `$F80000` mapping have to be right for it to
+get anywhere.
 
 **What this does not do:** it makes the ROM *readable*, not *executed*. A real
 SuperCPU has a "bootmap" mode in which it maps its own ROM over bank 0 at reset
