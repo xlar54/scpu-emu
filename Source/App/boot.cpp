@@ -441,6 +441,10 @@ static void scpuDumpEmulatedScreen( CLogger *logger, CSuperCPU &scpu )
 		               "  pacer waited %llu arm cycles; excluding waits: %llu arm/emucycle",
 		               (unsigned long long)dwait,
 		               (unsigned long long)( dc && dh > dwait ? ( dh - dwait ) / dc : 0 ) );
+		if ( superCPU.benchArmPerEmuCycle() )
+			logger->Write( "SCPU", LogNotice,
+			               "  interpreter pure: %u arm/emucycle (70 = 20MHz)",
+			               (unsigned)superCPU.benchArmPerEmuCycle() );
 		logger->Write( "SCPU", LogNotice,
 		               "  bus: %llu io + %llu mirrored = %llu accesses, ~%llu%% of the time",
 		               (unsigned long long)dio, (unsigned long long)dmir,
