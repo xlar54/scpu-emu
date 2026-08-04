@@ -49,6 +49,8 @@
 
 #include "../cpu.h"
 
+class CSuperCPUMemoryMap;
+
 // Status register. In emulation mode bits 4 and 5 behave as the 6502's B and
 // unused bits; in native mode they select index and accumulator width.
 #define W65_C 0x01	// carry
@@ -83,7 +85,17 @@ public:
 	CW65C816();
 
 	// --- ICpu -------------------------------------------------------------
-	void attachBus( ICpuBus *bus ) override { m_Bus = bus; }
+	void attachBus( ICpuBus *bus ) override { m_Bus = bus; m_FastBus = 0; }
+
+	// Attach the concrete memory map instead of the abstract bus. The static
+	// type is what lets the compiler devirtualise and INLINE every memory
+	// access, interrupt sample and tick into the interpreter -- through
+	// ICpuBus* each of those is an indirect call, several per instruction,
+	// and on an in-order A53 that indirection was one of the two dominant
+	// costs in the whole emulator. Tests keep using attachBus() with their own
+	// bus classes; the firmware uses this. Defined in w65c816_addressing.h,
+	// where the map's full type is visible.
+	void attachFastBus( CSuperCPUMemoryMap *map );
 	void reset() override;
 	u32  step() override;
 	u64  run( u64 nCycles ) override;
@@ -170,7 +182,16 @@ public:
 	u64 m_NativeInstructions;
 
 private:
-	ICpuBus *m_Bus;
+	ICpuBus            *m_Bus;
+	CSuperCPUMemoryMap *m_FastBus;
+
+	// Every bus touch in the core goes through these. One perfectly-predicted
+	// branch selects the inline fast path; the ICpuBus path stays for tests.
+	inline u8   busRead8( u32 addr );
+	inline void busWrite8( u32 addr, u8 v );
+	inline bool busIRQ();
+	inline bool busNMI();
+	inline void busTick( u32 n );
 	u64      m_Cycles;
 	bool     m_NMIPrevLevel;
 	bool     m_NMIPending;

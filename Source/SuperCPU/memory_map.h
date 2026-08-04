@@ -101,9 +101,12 @@ public:
 
 	u8   readAbove( scpu_addr_t addr );
 	void writeAbove( scpu_addr_t addr, u8 value );
-	bool irqAsserted() override;
-	bool nmiAsserted() override;
-	void tick( u32 nCycles ) override;
+
+	// Interrupts and pacing forward inline to bank 0's own fast paths. These
+	// run once per emulated instruction; two virtual hops each was real money.
+	bool irqAsserted() override { return m_Bank0 ? m_Bank0->irqFast() : false; }
+	bool nmiAsserted() override { return m_Bank0 ? m_Bank0->nmiFast() : false; }
+	void tick( u32 nCycles ) override { if ( m_Bank0 ) m_Bank0->tickFast( nCycles ); }
 
 	// Bank 1: the accelerator's private SRAM.
 	u8 m_Bank1[ SCPU_BANK1_SIZE ];

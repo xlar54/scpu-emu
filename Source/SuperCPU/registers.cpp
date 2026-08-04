@@ -62,7 +62,10 @@ void CSuperCPURegisters::reset()
 void CSuperCPURegisters::noteSpeedChange( bool wasFast )
 {
 	if ( fastMode() != wasFast )
+	{
 		m_SpeedChanged = true;
+		if ( m_SpeedHook ) m_SpeedHook( m_SpeedHookCtx );
+	}
 }
 
 bool CSuperCPURegisters::consumeSpeedChanged()

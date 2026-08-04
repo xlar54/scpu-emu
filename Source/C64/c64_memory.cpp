@@ -270,12 +270,12 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 
 bool CC64Memory::irqAsserted()
 {
-	return m_C64 ? m_C64->irqAsserted() : false;
+	return irqFast();
 }
 
 bool CC64Memory::nmiAsserted()
 {
-	return m_C64 ? m_C64->nmiAsserted() : false;
+	return nmiFast();
 }
 
 void CC64Memory::setPacing( u64 hostCyclesPerSecond, u32 emulatedHz )
@@ -311,36 +311,13 @@ void CC64Memory::resyncPacing()
 
 void CC64Memory::tick( u32 nCycles )
 {
-	// The serial-bus hold-off counts down whether or not pacing is armed, so
-	// that its lifetime is a property of the emulated machine rather than of
-	// how the host happens to be configured. The host tests run unpaced.
-	const bool iecActive = ( m_IECHoldCycles != 0 );
-	if ( iecActive )
-		m_IECHoldCycles = ( m_IECHoldCycles > nCycles )
-		                ? ( m_IECHoldCycles - nCycles ) : 0;
+	// Virtual entry, kept for callers that only have an ICpuBus. The real work
+	// is the inline tickFast() in the header plus this settle path.
+	tickFast( nCycles );
+}
 
-	if ( m_HostPerEmuQ16 == 0 || !m_C64 )
-		return;
-
-	m_PacingDebtCycles += nCycles;
-
-	// Consulting the host clock means reading a system register -- PMCCNTR_EL0
-	// on the Pi -- and on an in-order Cortex-A53 that is nowhere near free.
-	// This runs after EVERY instruction, so at 20MHz it was the single biggest
-	// thing the pacer cost.
-	//
-	// Look only once enough emulated time has passed to be worth looking:
-	// roughly one microsecond. At 20MHz that is every 20 emulated cycles rather
-	// than every three or so. While the serial bus is active it stays at every
-	// cycle, because the KERNAL's IEC bit timing genuinely needs that
-	// resolution -- and at 1MHz we are nowhere near the limit anyway, so the
-	// reads cost nothing we cannot afford.
-	//
-	// Accuracy is unaffected either way: the debt accumulates regardless and is
-	// settled in full whenever the clock is finally read.
-	if ( !iecActive && m_PacingDebtCycles < (u64)m_PacingCheckCycles )
-		return;
-
+void CC64Memory::tickSettle( bool iecActive )
+{
 	// While the serial bus is active, run at 1MHz whatever speed is selected --
 	// the KERNAL's bit timing depends on it. See setIECThrottle().
 	const u64 rate = iecActive ? m_HostPerEmuQ16Slow : m_HostPerEmuQ16;

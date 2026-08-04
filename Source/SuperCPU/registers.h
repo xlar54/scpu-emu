@@ -175,6 +175,14 @@ public:
 	// Set when anything changed the speed, so the pacer can be re-armed.
 	bool consumeSpeedChanged();
 
+	// Immediate notification on top of the polled flag. CMD's KERNAL writes
+	// $D07A to drop to 1MHz immediately before driving the serial bus; a pacer
+	// that catches up at the next frame boundary leaves the whole first IEC
+	// handshake running at turbo pacing, which the drive cannot follow. The
+	// callback fires on the register write itself.
+	typedef void (*SpeedHook)( void *ctx );
+	void setSpeedHook( SpeedHook hook, void *ctx ) { m_SpeedHook = hook; m_SpeedHookCtx = ctx; }
+
 	u64 m_RegWrites;
 
 private:
@@ -191,6 +199,8 @@ private:
 	bool m_HWRegsEnabled;
 	bool  m_Bootmap;
 	bool *m_BootmapFlag;
+	SpeedHook m_SpeedHook = 0;
+	void     *m_SpeedHookCtx = 0;
 
 	void applyBootmap() { if ( m_BootmapFlag ) *m_BootmapFlag = m_Bootmap; }
 

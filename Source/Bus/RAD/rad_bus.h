@@ -54,6 +54,7 @@ public:
 
 	bool irqAsserted() override;
 	bool nmiAsserted() override;
+	void sampleInterrupts( bool &irq, bool &nmi ) override;
 	u16  rasterLine() override;
 
 	u64  hostCycles() override;

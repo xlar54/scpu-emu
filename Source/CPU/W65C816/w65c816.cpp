@@ -34,7 +34,7 @@ CW65C816::CW65C816()
 	  m_P( W65_M | W65_X | W65_I ), m_E( true ),
 	  m_Stopped( false ), m_Waiting( false ),
 	  m_NativeInstructions( 0 ),
-	  m_Bus( 0 ), m_Cycles( 0 ),
+	  m_Bus( 0 ), m_FastBus( 0 ), m_Cycles( 0 ),
 	  m_NMIPrevLevel( false ), m_NMIPending( false ),
 	  m_PageCross( false ), m_BranchTaken( false ), m_EABank0( false )
 {
@@ -236,16 +236,16 @@ u32 CW65C816::step()
 	if ( m_Stopped )
 	{
 		m_Cycles += 1;
-		m_Bus->tick( 1 );
+		busTick( 1 );
 		return 1;
 	}
 
 	// NMI is edge triggered, IRQ level triggered.
-	const bool nmiLevel = m_Bus->nmiAsserted();
+	const bool nmiLevel = busNMI();
 	if ( nmiLevel && !m_NMIPrevLevel ) m_NMIPending = true;
 	m_NMIPrevLevel = nmiLevel;
 
-	const bool irq = m_Bus->irqAsserted();
+	const bool irq = busIRQ();
 
 	if ( m_NMIPending )
 	{
@@ -254,7 +254,7 @@ u32 CW65C816::step()
 		const u32 c = m_E ? 7 : 8;
 		serviceInterrupt( W65_VEC_NATIVE_NMI, W65_VEC_EMU_NMI, false );
 		m_Cycles += c;
-		m_Bus->tick( c );
+		busTick( c );
 		return c;
 	}
 
@@ -267,7 +267,7 @@ u32 CW65C816::step()
 		if ( !irq )
 		{
 			m_Cycles += 1;
-			m_Bus->tick( 1 );
+			busTick( 1 );
 			return 1;
 		}
 		m_Waiting = false;
@@ -278,7 +278,7 @@ u32 CW65C816::step()
 		const u32 c = m_E ? 7 : 8;
 		serviceInterrupt( W65_VEC_NATIVE_IRQ, W65_VEC_EMU_IRQ, false );
 		m_Cycles += c;
-		m_Bus->tick( c );
+		busTick( c );
 		return c;
 	}
 
@@ -844,7 +844,7 @@ u32 CW65C816::step()
 	const u32 used = w65c816Cycles( opcode, m8Entry, x8Entry, eEntry,
 	                                dpUnaligned, m_PageCross, m_BranchTaken );
 	m_Cycles += used;
-	m_Bus->tick( used );
+	busTick( used );
 	return used;
 }
 

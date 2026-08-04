@@ -80,6 +80,16 @@ public:
 	virtual bool irqAsserted() = 0;
 	virtual bool nmiAsserted() = 0;
 
+	// Both lines in one call. On the RAD backend the two are bits of the SAME
+	// GPIO level register, and an MMIO read of that register costs on the order
+	// of a hundred ARM cycles -- so one combined read instead of two separate
+	// virtual calls halves the cost even before any caching above this layer.
+	virtual void sampleInterrupts( bool &irq, bool &nmi )
+	{
+		irq = irqAsserted();
+		nmi = nmiAsserted();
+	}
+
 	// Current VIC-II raster line, or 0xFFFF if the backend cannot tell.
 	// Costs two bus cycles on real hardware ($D012 plus $D011 bit 7).
 	virtual u16 rasterLine() { return 0xFFFF; }

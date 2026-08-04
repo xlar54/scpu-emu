@@ -96,6 +96,39 @@
 #define _w65c816_addressing_h
 
 #include "w65c816.h"
+#include "../../SuperCPU/memory_map.h"
+
+// The fast-bus plumbing. See attachFastBus() in w65c816.h for why this exists.
+inline void CW65C816::attachFastBus( CSuperCPUMemoryMap *map )
+{
+	m_FastBus = map;
+	m_Bus     = map;
+}
+
+inline u8 CW65C816::busRead8( u32 addr )
+{
+	return m_FastBus ? m_FastBus->read8( addr ) : m_Bus->read8( addr );
+}
+
+inline void CW65C816::busWrite8( u32 addr, u8 v )
+{
+	if ( m_FastBus ) m_FastBus->write8( addr, v ); else m_Bus->write8( addr, v );
+}
+
+inline bool CW65C816::busIRQ()
+{
+	return m_FastBus ? m_FastBus->irqAsserted() : m_Bus->irqAsserted();
+}
+
+inline bool CW65C816::busNMI()
+{
+	return m_FastBus ? m_FastBus->nmiAsserted() : m_Bus->nmiAsserted();
+}
+
+inline void CW65C816::busTick( u32 n )
+{
+	if ( m_FastBus ) m_FastBus->tick( n ); else m_Bus->tick( n );
+}
 
 // UNRESOLVED (U1 in Docs/research/65816-reference.md). With E=1 and DL=$00,
 // does the pointer high byte of (dp), (dp,X) and (dp),Y wrap inside the direct
@@ -119,7 +152,7 @@
 
 inline u8 CW65C816::fetch8()
 {
-	u8 v = m_Bus->read8( ( (u32)m_PBR << 16 ) | m_PC );
+	u8 v = busRead8( ( (u32)m_PBR << 16 ) | m_PC );
 	m_PC = (u16)( m_PC + 1 );		// wraps within the bank; PBR unchanged
 	return v;
 }
@@ -140,12 +173,12 @@ inline u32 CW65C816::fetch24()
 
 inline u8 CW65C816::read8( u32 addr )
 {
-	return m_Bus->read8( addr & SCPU_ADDR_MASK );
+	return busRead8( addr & SCPU_ADDR_MASK );
 }
 
 inline void CW65C816::write8( u32 addr, u8 v )
 {
-	m_Bus->write8( addr & SCPU_ADDR_MASK, v );
+	busWrite8( addr & SCPU_ADDR_MASK, v );
 }
 
 // 16-bit data accesses carry into the next byte with 24-bit wrap, so a word at

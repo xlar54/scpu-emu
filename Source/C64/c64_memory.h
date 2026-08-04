@@ -194,6 +194,57 @@ public:
 		write8( a, v );
 	}
 
+	// --- interrupts, cached -----------------------------------------------
+	// /IRQ and /NMI come from the VIC-II and the CIAs, which live in the C64's
+	// 1MHz domain: the lines physically cannot change faster than about once a
+	// microsecond. Sampling them per emulated instruction at 20MHz was ~14
+	// samples per possible change -- and on the RAD each sample was an uncached
+	// GPIO MMIO read costing on the order of a hundred ARM cycles. Two of those
+	// per instruction was one of the largest single costs in the emulator, and
+	// it was invisible in the bus statistics, which only count I/O and
+	// mirroring traffic.
+	//
+	// So: one combined sample (see IC64Bus::sampleInterrupts), refreshed once
+	// enough emulated time has passed for the lines to have possibly changed.
+	// m_PacingCheckCycles is exactly "emulated cycles per microsecond", so it
+	// is reused here; at 1MHz that is every cycle, i.e. the old behaviour.
+	inline void refreshInterruptsIfDue()
+	{
+		if ( m_IntCredit >= m_PacingCheckCycles && m_C64 )
+		{
+			m_C64->sampleInterrupts( m_CachedIRQ, m_CachedNMI );
+			m_IntCredit = 0;
+		}
+	}
+	inline bool irqFast() { refreshInterruptsIfDue(); return m_CachedIRQ; }
+	inline bool nmiFast() { refreshInterruptsIfDue(); return m_CachedNMI; }
+
+	// --- pacing, inline fast path -----------------------------------------
+	// Runs after every instruction, so the common case -- "not enough emulated
+	// time has passed to be worth looking at the clock" -- must not cost a
+	// call. The clock work itself is in tickSettle(), out of line.
+	inline void tickFast( u32 nCycles )
+	{
+		if ( m_IntCredit < 0x100000 )
+			m_IntCredit += nCycles;
+
+		const bool iecActive = ( m_IECHoldCycles != 0 );
+		if ( iecActive )
+			m_IECHoldCycles = ( m_IECHoldCycles > nCycles )
+			                ? ( m_IECHoldCycles - nCycles ) : 0;
+
+		if ( m_HostPerEmuQ16 == 0 || !m_C64 )
+			return;
+
+		m_PacingDebtCycles += nCycles;
+
+		if ( !iecActive && m_PacingDebtCycles < (u64)m_PacingCheckCycles )
+			return;
+
+		tickSettle( iecActive );
+	}
+	void tickSettle( bool iecActive );
+
 	// --- ICpuBus ----------------------------------------------------------
 	u8   read8( scpu_addr_t addr ) override;
 	void write8( scpu_addr_t addr, u8 value ) override;
@@ -250,6 +301,13 @@ public:
 
 	u64 m_PacingDebtCycles;		// emulated cycles run but not yet paid for in real time
 	u32 m_PacingCheckCycles;	// emulated cycles between consulting the host clock
+public:
+	// Interrupt cache; public so the inline accessors above can live in the
+	// class body without friend gymnastics.
+	u32  m_IntCredit = 0xFFFFF;	// starts "due" so the first query samples
+	bool m_CachedIRQ = false;
+	bool m_CachedNMI = false;
+private:
 
 private:
 	IC64Bus        *m_C64;

@@ -74,7 +74,7 @@ bool CSuperCPU::init( IC64Bus *bus, SCPUCoreType core, u32 simmMB )
 	{
 	case SCPU_CORE_65816:
 		m_CPU = &m_Core65816;
-		m_CPU->attachBus( &m_MemoryMap );
+		m_Core65816.attachFastBus( &m_MemoryMap );
 		m_Registers.trackEmulationMode( &m_Core65816.m_E );
 		break;
 
@@ -112,6 +112,17 @@ bool CSuperCPU::init( IC64Bus *bus, SCPUCoreType core, u32 simmMB )
 	// duration, and everything that measures time by counting -- IEC transfers,
 	// CIA-timed loops, raster-chasing code -- behaves wrongly.
 	m_Memory.setPacing( m_Bus->hostCyclesPerSec(), currentClockHz() );
+
+	// Re-arm the pacer the moment a speed register is written, not at the next
+	// frame boundary. CMD's KERNAL drops to 1MHz via $D07A immediately before
+	// an IEC transaction; a frame-boundary catch-up leaves that transaction's
+	// first 20ms running at turbo pacing.
+	m_Registers.setSpeedHook( []( void *ctx )
+	{
+		CSuperCPU *self = (CSuperCPU *)ctx;
+		self->m_Memory.setPacing( self->m_Bus->hostCyclesPerSec(),
+		                          self->currentClockHz() );
+	}, this );
 
 	reset();
 	return true;

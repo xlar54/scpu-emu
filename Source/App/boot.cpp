@@ -48,6 +48,7 @@ extern "C" void radUnmountFileSystem();
 static bool radBusButtonPressed();
 static bool radBusHardwareResetPressed();
 static void scpuWaitForButtonThenReboot();
+static CLogger *s_Logger;
 
 // Frame hook: reboot the Pi when the RAD's button is pressed, so the card can
 // be swapped and retried without power-cycling anything.
@@ -69,6 +70,17 @@ static bool scpuCheckButton( void *ctx )
 
 	if ( radBusHardwareResetPressed() )
 	{
+		// Before resetting, say where the machine was. A frozen program is a
+		// loop that never exits, and the PC names the loop -- which turns "it
+		// froze" into a diagnosable report. The KERNAL's serial routines live
+		// in $ED00-$EEFF (stock) and the JiffyDOS patches around $F76E-$FC57,
+		// so the PC alone usually says whether IEC is the suspect.
+		if ( s_Logger && scpu && scpu->cpu() )
+			s_Logger->Write( "SCPU", LogNotice,
+			               "reset pressed: PC was $%06X after %u cycles",
+			               (unsigned)scpu->cpu()->pc(),
+			               (unsigned)scpu->cpu()->cycles() );
+
 		// Wait for release so one press is one reset, then restart the
 		// emulated machine from its reset vector. The Pi keeps running and the
 		// bus stays ours -- no need to renegotiate the handover.
@@ -320,6 +332,7 @@ void scpuBootRun( CLogger *logger )
 	radUnmountFileSystem();
 	actLED.Blink( 2 );		// milestone: ROMs handled, SD released
 
+	s_Logger = logger;
 	radBus.setLogger( logger );
 
 	// Which core: the 65816 is the real accelerator, the 6502 is milestone-1

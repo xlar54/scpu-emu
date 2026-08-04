@@ -100,18 +100,3 @@ void CSuperCPUMemoryMap::writeAbove( scpu_addr_t addr, u8 value )
 		m_SIMM->write( addr, value );
 }
 
-bool CSuperCPUMemoryMap::irqAsserted()
-{
-	return m_Bank0 ? m_Bank0->irqAsserted() : false;
-}
-
-bool CSuperCPUMemoryMap::nmiAsserted()
-{
-	return m_Bank0 ? m_Bank0->nmiAsserted() : false;
-}
-
-void CSuperCPUMemoryMap::tick( u32 nCycles )
-{
-	// Pacing lives in bank 0, which owns the host time source.
-	if ( m_Bank0 ) m_Bank0->tick( nCycles );
-}

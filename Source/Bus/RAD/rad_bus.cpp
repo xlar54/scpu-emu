@@ -460,6 +460,14 @@ bool CRADBus::nmiAsserted()
 	return CPU_NMI_LOW ? true : false;
 }
 
+void CRADBus::sampleInterrupts( bool &irq, bool &nmi )
+{
+	// One MMIO read serves both lines; see the note in c64_bus.h.
+	u32 g2 = read32( ARM_GPIO_GPLEV0 );
+	irq = CPU_IRQ_LOW ? true : false;
+	nmi = CPU_NMI_LOW ? true : false;
+}
+
 u64 CRADBus::hostCycles()
 {
 	u64 c;
