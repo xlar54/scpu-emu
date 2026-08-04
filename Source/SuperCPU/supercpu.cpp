@@ -75,6 +75,11 @@ bool CSuperCPU::init( IC64Bus *bus, SCPUCoreType core )
 
 	m_CPU->attachBus( &m_Memory );
 
+	// Hold the emulated CPU to real time. Without this a cycle count is not a
+	// duration, and everything that measures time by counting -- IEC transfers,
+	// CIA-timed loops, raster-chasing code -- behaves wrongly.
+	m_Memory.setPacing( m_Bus->hostCyclesPerSec(), currentClockHz() );
+
 	reset();
 	return true;
 }
@@ -91,6 +96,8 @@ void CSuperCPU::reset()
 	m_WriteBuffer.setExcludeZeroPageStack( true );
 	m_WriteBuffer.setOptMode( SCPU_OPT_DEFAULT );
 	m_WriteBuffer.resetStats();
+
+	m_Memory.resyncPacing();
 
 	if ( m_CPU )
 		m_CPU->reset();
@@ -116,7 +123,11 @@ u64 CSuperCPU::runFrame()
 	const u32 clockHz = currentClockHz();
 	const u64 budget  = c64CyclesPerFrame * ( clockHz / SCPU_NORMAL_HZ );
 
-	const u64 startHost = m_Bus->hostCycles();
+	// A write to $D07A/$D07B changes how long an emulated cycle is worth in
+	// real time, so the pacer has to be told. This is what finally makes the
+	// SuperCPU's speed selection mean something.
+	if ( m_Registers.consumeSpeedChanged() )
+		m_Memory.setPacing( m_Bus->hostCyclesPerSec(), clockHz );
 
 	u64 executed = m_CPU->run( budget );
 
@@ -167,24 +178,10 @@ u64 CSuperCPU::runFrame()
 		}
 	}
 
-	// --- pacing ------------------------------------------------------------
-	// Without this the core runs as fast as the ARM can retire instructions,
-	// which is far above 20MHz for code living in shadow RAM. Everything the
-	// C64 does in real time -- CIA timers, the raster, IEC transfers -- then
-	// happens at the wrong rate relative to the program, and a selected speed
-	// of 1MHz means nothing.
-	//
-	// So: having executed N emulated cycles, wait until N cycles' worth of real
-	// time has actually passed. If the frame overran its budget (plenty of bus
-	// traffic, say) there is nothing to wait for and we simply carry on.
-	const u32 hostHz = m_Bus->hostCyclesPerSec();
-	if ( hostHz && executed )
-	{
-		const u64 targetHost = ( executed * (u64)hostHz ) / (u64)clockHz;
-
-		while ( ( m_Bus->hostCycles() - startHost ) < targetHost )
-			;
-	}
+	// Pacing is no longer done here. It happens after every instruction in
+	// CC64Memory::tick(), because frame granularity (~20ms) is far too coarse
+	// for anything that measures time by counting cycles -- the KERNAL's IEC
+	// routines bit-bang the serial lines to microsecond tolerances.
 
 	return executed;
 }

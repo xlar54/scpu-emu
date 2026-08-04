@@ -126,11 +126,33 @@ public:
 
 	void updateBankMode();
 
+	// --- pacing -----------------------------------------------------------
+	// Hold the emulated CPU to real time, checked after every instruction.
+	//
+	// Pacing used to happen once per frame in CSuperCPU::runFrame(), which is
+	// about 20ms of granularity: the CPU sprinted through a frame's work and
+	// then idled. That is fine for anything that only cares about averages, and
+	// useless for anything that measures time by counting cycles. The KERNAL's
+	// IEC routines bit-bang the serial lines to microsecond tolerances, so
+	// under frame pacing disk access cannot work.
+	//
+	// Setting a rate of 0 disables pacing, which is what the host tests want.
+	void setPacing( u64 hostCyclesPerSecond, u32 emulatedHz );
+	void resyncPacing();
+
+	u64 m_PacingDebtCycles;		// emulated cycles run but not yet paid for in real time
+
 private:
 	IC64Bus        *m_C64;
 	IMirrorSink    *m_Mirror;
 	IIOInterceptor *m_IO;
 	bool            m_HasBasic, m_HasKernal, m_HasChar;
+
+	// Pacing state. m_HostPerEmuQ16 is host cycles per emulated cycle in 16.16
+	// fixed point, so the common case is a multiply and a shift rather than a
+	// division per instruction.
+	u64 m_HostPerEmuQ16;
+	u64 m_PacingAnchor;
 };
 
 #endif

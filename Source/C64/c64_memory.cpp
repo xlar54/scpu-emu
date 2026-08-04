@@ -22,7 +22,9 @@
 CC64Memory::CC64Memory()
 	: m_Port00( 0x2F ), m_Port01( 0x37 ), m_BankMode( 0 ),
 	  m_IOReads( 0 ), m_IOWrites( 0 ), m_RamWrites( 0 ),
+	  m_PacingDebtCycles( 0 ),
 	  m_C64( 0 ), m_Mirror( 0 ), m_IO( 0 ),
+	  m_HostPerEmuQ16( 0 ), m_PacingAnchor( 0 ),
 	  m_HasBasic( false ), m_HasKernal( false ), m_HasChar( false )
 {
 	c64BankingInit();
@@ -218,7 +220,55 @@ bool CC64Memory::nmiAsserted()
 	return m_C64 ? m_C64->nmiAsserted() : false;
 }
 
+void CC64Memory::setPacing( u64 hostCyclesPerSecond, u32 emulatedHz )
+{
+	if ( hostCyclesPerSecond == 0 || emulatedHz == 0 )
+	{
+		m_HostPerEmuQ16 = 0;			// pacing off
+		return;
+	}
+
+	// Host cycles per emulated cycle, 16.16 fixed point. At 1.4GHz host and
+	// 1MHz emulated that is 1400.0; at 20MHz it is 70.0.
+	m_HostPerEmuQ16 = ( hostCyclesPerSecond << 16 ) / (u64)emulatedHz;
+
+	resyncPacing();
+}
+
+void CC64Memory::resyncPacing()
+{
+	m_PacingDebtCycles = 0;
+	if ( m_C64 )
+		m_PacingAnchor = m_C64->hostCycles();
+}
+
 void CC64Memory::tick( u32 nCycles )
 {
-	(void)nCycles;
+	if ( m_HostPerEmuQ16 == 0 || !m_C64 )
+		return;
+
+	m_PacingDebtCycles += nCycles;
+
+	// How much real time those emulated cycles were supposed to take.
+	const u64 owed = ( m_PacingDebtCycles * m_HostPerEmuQ16 ) >> 16;
+	const u64 spent = m_C64->hostCycles() - m_PacingAnchor;
+
+	if ( spent >= owed )
+	{
+		// Already behind, or exactly on time. Settle up and carry on rather
+		// than accumulating a debt we can never repay -- a burst of I/O can
+		// easily overrun its own budget, and trying to claw that back later
+		// would just make the next stretch run too slowly.
+		m_PacingAnchor = m_C64->hostCycles();
+		m_PacingDebtCycles = 0;
+		return;
+	}
+
+	// Ahead of schedule: wait out the difference. This is what makes a cycle
+	// count mean a duration, which is the whole basis of IEC bit timing.
+	while ( ( m_C64->hostCycles() - m_PacingAnchor ) < owed )
+		;
+
+	m_PacingAnchor = m_C64->hostCycles();
+	m_PacingDebtCycles = 0;
 }
