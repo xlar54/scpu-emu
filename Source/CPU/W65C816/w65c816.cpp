@@ -232,21 +232,27 @@ void CW65C816::serviceInterrupt( u32 vectorNative, u32 vectorEmu, bool isBRKorCO
 
 u32 CW65C816::step()
 {
+	const u32 used = stepNoTick();
+	busTick( used );
+	return used;
+}
+
+u32 CW65C816::stepNoTick()
+{
 	// STP stops the clock, and only RESET restarts it -- not IRQ, not NMI. Burn
 	// a cycle and keep ticking the bus so the C64 around us carries on.
 	if ( m_Stopped )
 	{
 		m_Cycles += 1;
-		busTick( 1 );
 		return 1;
 	}
 
-	// NMI is edge triggered, IRQ level triggered.
-	const bool nmiLevel = busNMI();
+	// NMI is edge triggered, IRQ level triggered. One combined sample pays
+	// the cache-refresh check once for both lines.
+	bool irq = false, nmiLevel = false;
+	busInterrupts( irq, nmiLevel );
 	if ( nmiLevel && !m_NMIPrevLevel ) m_NMIPending = true;
 	m_NMIPrevLevel = nmiLevel;
-
-	const bool irq = busIRQ();
 
 	if ( m_NMIPending )
 	{
@@ -256,7 +262,6 @@ u32 CW65C816::step()
 		const u32 c = m_E ? 7 : 8;
 		serviceInterrupt( W65_VEC_NATIVE_NMI, W65_VEC_EMU_NMI, false );
 		m_Cycles += c;
-		busTick( c );
 		return c;
 	}
 
@@ -269,7 +274,6 @@ u32 CW65C816::step()
 		if ( !irq )
 		{
 			m_Cycles += 1;
-			busTick( 1 );
 			return 1;
 		}
 		m_Waiting = false;
@@ -281,7 +285,6 @@ u32 CW65C816::step()
 		const u32 c = m_E ? 7 : 8;
 		serviceInterrupt( W65_VEC_NATIVE_IRQ, W65_VEC_EMU_IRQ, false );
 		m_Cycles += c;
-		busTick( c );
 		return c;
 	}
 
@@ -847,19 +850,37 @@ u32 CW65C816::step()
 	const u32 used = w65c816Cycles( opcode, m8Entry, x8Entry, eEntry,
 	                                dpUnaligned, m_PageCross, m_BranchTaken );
 	m_Cycles += used;
-	busTick( used );
 	return used;
 }
 
 u64 CW65C816::run( u64 nCycles )
 {
+	// The hot loop ticks the bus in BATCHES of up to eight instructions. The
+	// tick path -- pacer debt, IEC countdowns, interrupt-cache credit -- runs
+	// millions of times a second, and per-instruction it was one of the larger
+	// single costs the PMU could see. Every consumer of tick granularity
+	// already tolerates far more than ~24 cycles of slack: the pacer looks at
+	// the clock every 20 cycles at 20MHz, the IEC windows are 50000-cycle
+	// countdowns, and the interrupt cache refreshes on a ~20-cycle credit.
+	// step() itself still ticks per call, for tests and single-stepping.
 	const u64 start = m_Cycles;
 	m_RunBreak = false;
+	u32 pending = 0;
+	u32 sinceTick = 0;
+
 	while ( m_Cycles - start < nCycles && !m_RunBreak )
 	{
-		step();
+		pending += stepNoTick();
 		if ( m_Stopped )
 			break;
+		if ( ++sinceTick >= 8 )
+		{
+			busTick( pending );
+			pending = 0;
+			sinceTick = 0;
+		}
 	}
+	if ( pending )
+		busTick( pending );
 	return m_Cycles - start;
 }

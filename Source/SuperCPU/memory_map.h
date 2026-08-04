@@ -105,6 +105,11 @@ public:
 	// Interrupts and pacing forward inline to bank 0's own fast paths. These
 	// run once per emulated instruction; two virtual hops each was real money.
 	bool irqAsserted() override { return m_Bank0 ? m_Bank0->irqFast() : false; }
+	void sampleIRQNMIFast( bool &irq, bool &nmi )
+	{
+		if ( m_Bank0 ) m_Bank0->sampleIRQNMIFast( irq, nmi );
+		else irq = nmi = false;
+	}
 	bool nmiAsserted() override { return m_Bank0 ? m_Bank0->nmiFast() : false; }
 	void tick( u32 nCycles ) override { if ( m_Bank0 ) m_Bank0->tickFast( nCycles ); }
 

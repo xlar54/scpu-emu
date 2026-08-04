@@ -125,6 +125,12 @@ inline bool CW65C816::busNMI()
 	return m_FastBus ? m_FastBus->nmiAsserted() : m_Bus->nmiAsserted();
 }
 
+inline void CW65C816::busInterrupts( bool &irq, bool &nmi )
+{
+	if ( m_FastBus ) m_FastBus->sampleIRQNMIFast( irq, nmi );
+	else { irq = m_Bus->irqAsserted(); nmi = m_Bus->nmiAsserted(); }
+}
+
 inline void CW65C816::busTick( u32 n )
 {
 	if ( m_FastBus ) m_FastBus->tick( n ); else m_Bus->tick( n );

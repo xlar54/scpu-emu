@@ -228,6 +228,17 @@ public:
 	inline bool irqFast() { refreshInterruptsIfDue(); return m_CachedIRQ; }
 	inline bool nmiFast() { refreshInterruptsIfDue(); return m_CachedNMI; }
 
+	// The core samples NMI and IRQ back to back on every instruction; this
+	// combined form pays the refresh check once instead of twice, at several
+	// million calls a second. The single accessors above stay fresh for
+	// everyone else.
+	inline void sampleIRQNMIFast( bool &irq, bool &nmi )
+	{
+		refreshInterruptsIfDue();
+		irq = m_CachedIRQ;
+		nmi = m_CachedNMI;
+	}
+
 	// --- pacing, inline fast path -----------------------------------------
 	// Runs after every instruction, so the common case -- "not enough emulated
 	// time has passed to be worth looking at the clock" -- must not cost a

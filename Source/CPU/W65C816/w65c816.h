@@ -98,6 +98,7 @@ public:
 	void attachFastBus( CSuperCPUMemoryMap *map );
 	void reset() override;
 	u32  step() override;
+	u32  stepNoTick();
 	u64  run( u64 nCycles ) override;
 	void requestRunBreak() override { m_RunBreak = true; }
 	u64  cycles() const override { return m_Cycles; }
@@ -195,6 +196,7 @@ private:
 	inline void busWrite8( u32 addr, u8 v );
 	inline bool busIRQ();
 	inline bool busNMI();
+	inline void busInterrupts( bool &irq, bool &nmi );
 	inline void busTick( u32 n );
 	u64      m_Cycles;
 	bool     m_RunBreak;
