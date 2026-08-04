@@ -301,16 +301,44 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 
 			if ( displayChanged )
 			{
+				// Drain BUDGETED, across as many borders as it takes, with the
+				// flip held throughout. The first version waited for the border
+				// and then issued one unbudgeted flush -- and a large buffer
+				// (the splash's first flip arrives with a whole bitmap pending)
+				// overran the border into the visible display. Whether that
+				// happened depended on how dirty the buffer was at the flip:
+				// another per-boot coin toss, now closed. If the drain has not
+				// finished after a handful of borders, the flip lands anyway --
+				// a one-frame ghost beats an unbounded stall.
 				const C64VideoStandard vid = m_C64->signals().video;
-				for ( u32 guard = 0; guard < 40000; guard++ )
+				const u32 perLine = c64CyclesPerLine( vid );
+				const u32 lines   = c64RasterLines( vid );
+
+				for ( u32 border = 0; border < 6 && m_Mirror->pendingBytes() > 8; border++ )
 				{
-					const u16 line = m_C64->rasterLine();
+					u16 line = 0xFFFF;
+					for ( u32 guard = 0; guard < 40000; guard++ )
+					{
+						line = m_C64->rasterLine();
+						if ( line == 0xFFFF )
+							break;					// no raster: host bus
+						if ( c64RasterIsSafeForBulkTransfer( vid, line ) )
+							break;
+					}
+
 					if ( line == 0xFFFF )
-						break;						// no raster: host bus, just flush
-					if ( c64RasterIsSafeForBulkTransfer( vid, line ) )
+					{
+						m_Mirror->flush();			// rasterless backend: just drain
 						break;
+					}
+
+					// Only what fits in the border time remaining, exactly as
+					// the frame scheduler computes it.
+					u32 linesLeft = ( line > c64DisplayLastLine( vid ) )
+					              ? ( lines - line ) + c64DisplayFirstLine( vid )
+					              : c64DisplayFirstLine( vid ) - line;
+					m_Mirror->flushUpTo( ( linesLeft * perLine * 3 ) / 4 );
 				}
-				m_Mirror->flush();
 			}
 		}
 

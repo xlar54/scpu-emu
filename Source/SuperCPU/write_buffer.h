@@ -101,7 +101,7 @@ public:
 	// Flush at most maxBytes and return how many writes are still outstanding.
 	// This is what the raster-scheduled path uses, so a transfer can be sized
 	// to the time actually left in the safe window.
-	u32 flushUpTo( u32 maxBytes );
+	u32 flushUpTo( u32 maxBytes ) override;
 
 	// Mark a range dirty wholesale, e.g. after a block move. Cheaper than
 	// funnelling every byte through onRamWrite().

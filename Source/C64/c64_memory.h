@@ -49,6 +49,11 @@ public:
 	virtual void onRamWrite( u16 addr, u8 value ) = 0;
 	virtual void flush() = 0;
 	virtual u32  pendingBytes() { return 0; }
+
+	// Drain at most maxBytes, oldest first; returns bytes still pending. The
+	// default drains everything -- only budgeted implementations can promise
+	// raster safety.
+	virtual u32 flushUpTo( u32 maxBytes ) { (void)maxBytes; flush(); return 0; }
 };
 
 // Lets an accelerator claim addresses inside the I/O window before they are
