@@ -320,3 +320,44 @@ TEST( kernal_window_follows_the_hardware_register_bank )
 	mem.write8( SCPU_REG_HWREGS_ENABLE, 0 );
 	CHECK_EQ( mem.read8( 0xA000 ), 0x77 );
 }
+
+TEST( kernal_window_follows_a_d0b2_bank_close )
+{
+	// CMD's serial receive ends with a cross-image trampoline: from the KS
+	// image, STZ $D0B2 (bit 7 clear = close the register bank), and the very
+	// next fetch must come from the KT image -- the two kernal variants differ
+	// at that address by design, and the KT side is the routine's epilogue.
+	// Missing the window move here left the machine looping in the KS image
+	// forever: the disk-access freeze, identical on two different drives.
+	// VICE scpu64mem.c:753 is the reference for the write semantics.
+	static u8 bank1[ 0x10000 ];
+	for ( u32 i = 0; i < 0x10000; i++ ) bank1[ i ] = 0;
+	for ( u32 i = 0; i < C64_KERNAL_SIZE; i++ )
+	{
+		bank1[ 0xE000 + i ] = 0xAA;		// KT
+		bank1[ 0x6000 + i ] = 0x55;		// KS
+	}
+
+	CC64Memory mem;
+	CSuperCPURegisters regs;
+	mem.setIOInterceptor( &regs );
+	mem.setROMShadow( bank1 );
+	regs.trackKernalShadow( &mem.m_KernalShadowBase );
+	regs.reset();
+
+	// Open the bank the way software does, then close it via $D0B2 bit 7.
+	mem.write8( SCPU_REG_HWREGS_ENABLE, 0 );
+	CHECK( regs.hardwareRegsEnabled() );
+	CHECK_EQ( mem.read8( 0xEE82 ), 0x55 );		// fetching from KS
+
+	mem.write8( SCPU_REG_STATUS, 0x00 );		// STZ $D0B2
+
+	CHECK( !regs.hardwareRegsEnabled() );
+	CHECK_EQ( mem.read8( 0xEE82 ), 0xAA );		// the VERY NEXT fetch is KT
+
+	// And bit 7 SET must leave the bank open and the window in place.
+	mem.write8( SCPU_REG_HWREGS_ENABLE, 0 );
+	mem.write8( SCPU_REG_STATUS, 0x80 );
+	CHECK( regs.hardwareRegsEnabled() );
+	CHECK_EQ( mem.read8( 0xEE82 ), 0x55 );
+}

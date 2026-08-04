@@ -250,7 +250,25 @@ bool CSuperCPURegisters::ioWrite( u16 addr, u8 value )
 		{
 			m_Sys1MHz = ( value & SCPU_STATUS_SYS_1MHZ ) != 0;
 			if ( !( value & SCPU_STATUS_HWREGS ) )
+			{
 				m_HWRegsEnabled = false;
+
+				// Closing the bank MOVES THE KERNAL WINDOW, and it must move
+				// before the next instruction fetch. CMD's serial code ends
+				// its receive routine with a cross-image trampoline:
+				//
+				//   KS $EE7F: STZ $D0B2      bit 7 clear -> bank closes
+				//   KS $EE82: (falls through)
+				//
+				// and on real hardware the fetch at $EE82 now comes from the
+				// KT image, where it is CLI / CLC / RTS -- the clean end of
+				// the byte receive. With the flag cleared but the window left
+				// in place, execution stays in the KS image, whose bytes at
+				// $EE8A are JMP $EE7F: an unconditional loop, a frozen
+				// machine, and an IEC bus stuck mid-transfer. That was the
+				// disk freeze, verified against VICE scpu64mem.c:753.
+				applyKernalShadow();
+			}
 		}
 		break;
 
