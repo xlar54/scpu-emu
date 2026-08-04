@@ -163,6 +163,11 @@ public:
 	// straight into the machine's KERNAL. Anything lazier -- updating at a
 	// frame boundary, say -- would keep executing ROM that is no longer there.
 	void trackBootmap( bool *flag ) { m_BootmapFlag = flag; applyBootmap(); }
+
+	// Point this at CC64Memory::m_KernalShadowBase. Opening or closing the
+	// register bank moves the KERNAL window between two different parts of
+	// bank 1 -- see the note on that member.
+	void trackKernalShadow( u32 *base ) { m_KernalShadowBase = base; applyKernalShadow(); }
 	bool dosExtensionEnabled() const { return m_DOSExt; }
 	u8   simmConfig() const          { return m_SIMMConfig; }
 	u8   optimRegister() const       { return m_Optim; }
@@ -188,6 +193,13 @@ private:
 	bool *m_BootmapFlag;
 
 	void applyBootmap() { if ( m_BootmapFlag ) *m_BootmapFlag = m_Bootmap; }
+
+	u32 *m_KernalShadowBase;
+	void applyKernalShadow()
+	{
+		// KS while the registers are open, KT while they are not.
+		if ( m_KernalShadowBase ) *m_KernalShadowBase = m_HWRegsEnabled ? 0x6000 : 0xE000;
+	}
 	bool m_DOSExt;
 	bool m_RAMLink;
 	bool m_EmulationMode;

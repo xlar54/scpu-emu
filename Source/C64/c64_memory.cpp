@@ -24,7 +24,7 @@
 // order regardless of what is written here, so a list in a different order
 // reads as a lie about what happens.
 CC64Memory::CC64Memory()
-	: m_BootmapActive( false ),
+	: m_KernalShadowBase( 0xE000 ), m_BootmapActive( false ),
 	  m_Port00( 0x2F ), m_Port01( 0x37 ), m_BankMode( 0 ),
 	  m_IOReads( 0 ), m_IOWrites( 0 ), m_RamWrites( 0 ),
 	  m_IECThrottleEvents( 0 ),
@@ -159,7 +159,8 @@ u8 CC64Memory::read8( scpu_addr_t addr )
 		return m_ROMShadow ? m_ROMShadow[ a ] : m_Basic[ a - 0xA000 ];
 
 	case REG_KERNAL:
-		return m_ROMShadow ? m_ROMShadow[ a ] : m_Kernal[ a - 0xE000 ];
+		return m_ROMShadow ? m_ROMShadow[ m_KernalShadowBase + ( a - 0xE000 ) ]
+		                   : m_Kernal[ a - 0xE000 ];
 
 	case REG_CHARROM:
 		return m_CharROM[ a - 0xD000 ];

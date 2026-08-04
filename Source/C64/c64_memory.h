@@ -122,6 +122,23 @@ public:
 	// snapshotted ROMs, which is what a machine with no accelerator ROM wants.
 	void setROMShadow( u8 *bank1 ) { m_ROMShadow = bank1; }
 
+	// WHICH part of bank 1 backs $E000-$FFFF depends on whether the hardware
+	// registers are open. VICE calls the two cases KT and KS:
+	//
+	//   hwregs off  KT  mem_sram[0x10000 + addr]  ->  bank 1 $E000-$FFFF
+	//   hwregs on   KS  mem_sram[0x8000  + addr]  ->  bank 1 $6000-$7FFF
+	//
+	// This is not a curiosity. While the registers are open -- which is the
+	// state the SuperCPU's boot code puts the machine in almost immediately --
+	// bank 1 $E000-$FFFF is NOT the KERNAL and is free for the boot code to use
+	// as scratch. Reading our KERNAL out of there anyway means watching it get
+	// overwritten, which shows up as a machine that runs the boot animation
+	// perfectly and then comes up to a blank screen.
+	//
+	// Held as a precomputed base so the read path is one add rather than a
+	// branch: $E000 for KT, $6000 for KS.
+	u32 m_KernalShadowBase;
+
 	// The live flag. CSuperCPURegisters points at this directly so a $D0B6
 	// write takes effect on the very next fetch, which is what the boot code
 	// depends on.

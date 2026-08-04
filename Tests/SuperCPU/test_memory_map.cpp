@@ -6,6 +6,7 @@
 #include "../test_framework.h"
 #include "../../Source/SuperCPU/memory_map.h"
 #include "../../Source/Bus/Host/host_bus.h"
+#include "../../Source/SuperCPU/registers.h"
 
 struct MapFixture
 {
@@ -261,4 +262,61 @@ TEST( bootmap_off_restores_the_normal_c64_map )
 	mem.m_BootmapActive = false;
 	CHECK_EQ( mem.read8( 0xE000 ), 0x5A );
 	CHECK_EQ( mem.read8( 0xFFFC ), 0x5A );
+}
+
+// ---------------------------------------------------------------------------
+// The KERNAL window moves when the register bank opens
+// ---------------------------------------------------------------------------
+
+TEST( kernal_window_follows_the_hardware_register_bank )
+{
+	// VICE's scpu64meminit.c, at ordinary C64 banking with bootmap off:
+	//
+	//   hwregs off  KT  mem_sram[0x10000 + addr]  ->  bank 1 $E000-$FFFF
+	//   hwregs on   KS  mem_sram[0x8000  + addr]  ->  bank 1 $6000-$7FFF
+	//
+	// This matters more than it looks. While the registers are open, bank 1
+	// $E000-$FFFF is NOT the KERNAL -- it is free SRAM, and the SuperCPU's boot
+	// code is entitled to use it as scratch. Serving the KERNAL from there
+	// anyway means watching it get overwritten, which presents as a machine
+	// that runs the whole boot animation correctly and then comes up blank.
+	static u8 bank1[ 0x10000 ];
+	for ( u32 i = 0; i < 0x10000; i++ ) bank1[ i ] = 0;
+
+	// Two distinguishable KERNALs, one in each window.
+	for ( u32 i = 0; i < C64_KERNAL_SIZE; i++ )
+	{
+		bank1[ 0xE000 + i ] = 0xAA;		// KT
+		bank1[ 0x6000 + i ] = 0x55;		// KS
+	}
+
+	CC64Memory mem;
+	CSuperCPURegisters regs;
+	mem.setIOInterceptor( &regs );
+	mem.setROMShadow( bank1 );
+	regs.trackKernalShadow( &mem.m_KernalShadowBase );
+	regs.reset();
+
+	// Registers closed: the KERNAL comes from bank 1 $E000.
+	CHECK( !regs.hardwareRegsEnabled() );
+	CHECK_EQ( mem.read8( 0xE000 ), 0xAA );
+	CHECK_EQ( mem.read8( 0xFFFF ), 0xAA );
+
+	// Opening the bank moves the window immediately -- the very next fetch has
+	// to see it, because that is how the boot code uses it.
+	mem.write8( SCPU_REG_HWREGS_ENABLE, 0 );
+	CHECK( regs.hardwareRegsEnabled() );
+	CHECK_EQ( mem.read8( 0xE000 ), 0x55 );
+	CHECK_EQ( mem.read8( 0xFFFF ), 0x55 );
+
+	// And closing it moves the window back.
+	mem.write8( SCPU_REG_HWREGS_DISABLE, 0 );
+	CHECK( !regs.hardwareRegsEnabled() );
+	CHECK_EQ( mem.read8( 0xE000 ), 0xAA );
+
+	// BASIC does not move: it is R1 in both cases.
+	for ( u32 i = 0; i < C64_BASIC_SIZE; i++ ) bank1[ 0xA000 + i ] = 0x77;
+	CHECK_EQ( mem.read8( 0xA000 ), 0x77 );
+	mem.write8( SCPU_REG_HWREGS_ENABLE, 0 );
+	CHECK_EQ( mem.read8( 0xA000 ), 0x77 );
 }

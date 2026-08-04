@@ -25,6 +25,7 @@ CSuperCPURegisters::CSuperCPURegisters()
 	  m_Sys1MHz( false ), m_Soft1MHz( false ),
 	  m_SwitchSlow( false ), m_SwitchJiffy( false ),
 	  m_HWRegsEnabled( false ), m_Bootmap( true ), m_BootmapFlag( 0 ),
+	  m_KernalShadowBase( 0 ),
 	  m_DOSExt( false ), m_RAMLink( false ),
 	  m_EmulationMode( true ), m_EmulationFlag( 0 ), m_SpeedChanged( true ),
 	  m_Optim( SCPU_OPTIM_NONE ), m_SIMMConfig( 0 )
@@ -55,6 +56,7 @@ void CSuperCPURegisters::reset()
 
 	applyOptimisation();
 	applyBootmap();
+	applyKernalShadow();
 }
 
 void CSuperCPURegisters::noteSpeedChange( bool wasFast )
@@ -211,9 +213,9 @@ bool CSuperCPURegisters::ioWrite( u16 addr, u8 value )
 	case SCPU_REG_SOFT_1MHZ_OFF: m_Soft1MHz = false; break;
 
 	// --- register bank -----------------------------------------------------
-	case SCPU_REG_HWREGS_ENABLE:  m_HWRegsEnabled = true;  break;
+	case SCPU_REG_HWREGS_ENABLE:  m_HWRegsEnabled = true;  applyKernalShadow(); break;
 	case SCPU_REG_HWREGS_ALT:
-	case SCPU_REG_HWREGS_DISABLE: m_HWRegsEnabled = false; break;
+	case SCPU_REG_HWREGS_DISABLE: m_HWRegsEnabled = false; applyKernalShadow(); break;
 
 	// --- optimization: needs the bank open ---------------------------------
 	case SCPU_REG_OPT_VICBANK2:

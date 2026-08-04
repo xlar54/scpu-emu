@@ -149,12 +149,20 @@ void CSuperCPU::reset()
 	// deliberate: bootmap comes back on at reset too, so the boot code gets to
 	// install its patches again, and anything left over from a previous run
 	// cannot persist into a fresh boot.
+	// Both KERNAL windows get seeded, because which one is live depends on
+	// whether the register bank happens to be open: $E000 for KT, $6000 for KS.
+	// Seeding only one leaves the machine reading uninitialised SRAM the moment
+	// software opens the registers.
 	for ( u32 i = 0; i < C64_BASIC_SIZE; i++ )
 		m_MemoryMap.m_Bank1[ 0xA000 + i ] = m_Memory.m_Basic[ i ];
 	for ( u32 i = 0; i < C64_KERNAL_SIZE; i++ )
-		m_MemoryMap.m_Bank1[ 0xE000 + i ] = m_Memory.m_Kernal[ i ];
+	{
+		m_MemoryMap.m_Bank1[ 0xE000 + i ] = m_Memory.m_Kernal[ i ];	// KT
+		m_MemoryMap.m_Bank1[ 0x6000 + i ] = m_Memory.m_Kernal[ i ];	// KS
+	}
 
 	m_Memory.setROMShadow( m_MemoryMap.m_Bank1 );
+	m_Registers.trackKernalShadow( &m_Memory.m_KernalShadowBase );
 
 	m_Registers.reset();
 
