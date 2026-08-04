@@ -38,7 +38,11 @@ bool CSuperCPU::init( IC64Bus *bus, SCPUCoreType core )
 
 	m_WriteBuffer.attach( m_Bus, m_Memory.m_RAM );
 	m_Registers.attach( &m_WriteBuffer );
-	m_Registers.setC128Mode( m_Bus->signals().machine == MACHINE_C128 );
+	// $D0B0 on an SCPU64 reports only the hardware revision; the 64-vs-128
+	// distinction belongs to the SuperCPU 128's own register set, which we do
+	// not emulate yet. The detected machine type is still used elsewhere for
+	// video timing.
+	m_Registers.setHardwareVersion( SCPU_V2 );
 
 	// Fill in whichever ROM images the caller did not supply by reading them off
 	// the live machine. This is the zero-configuration path: no files needed,

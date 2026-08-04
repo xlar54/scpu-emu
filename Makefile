@@ -31,6 +31,7 @@ HOST_SRCS = \
 	Source/C64/c64_memory.cpp \
 	Source/SuperCPU/write_buffer.cpp \
 	Source/SuperCPU/registers.cpp \
+	Source/SuperCPU/supercpu.cpp \
 	Source/Bus/Host/host_bus.cpp
 
 TEST_SRCS = \
