@@ -54,3 +54,44 @@ From `Source/Bus/RAD/lowlevel_dma.h`, inherited from RAD:
   revisions need it; newer ones work without.
 - Writes re-check BA mid-burst and resync if a badline starts partway through.
 - Timing constants were tuned at `-Ofast`. Changing optimisation flags moves them.
+
+## Latent issue: the burst path drives a transient wrong address
+
+Not currently causing harm, but real, and the first thing to suspect if VIC-II
+fetch corruption ever reappears — particularly once mirroring volume rises with
+the 65816 core.
+
+`busBeginBurstWrites()` leaves `LATCH_A0` and `LATCH_A8` **high, i.e.
+transparent** (`Source/Bus/RAD/lowlevel_dma.h`). `busWriteByteBurst_p1()` then
+enables the latch outputs onto the C64 address bus with
+`CLR_GPIO( ... | bLATCH_A_OE )` as its *first* action — at which point both
+halves are still transparent and the shared D0-D7 GPIOs carry only the **low**
+address byte. The address momentarily presented to the machine is therefore
+`(lo, lo)`: a burst write to `$04D0` briefly drives `$D0D0`, one to `$07D8`
+drives `$D8D8`. Only afterwards is `LATCH_A0` clocked, the high byte driven, and
+`LATCH_A8` clocked.
+
+Both single-access paths avoid this. `busWriteByte_p1()` and `busReadByte_p1()`
+enable the latch only at a timed point well into the cycle
+(`TIMING_ENABLE_RWOUT_ADDR_LATCH_WRITING - 40` and `TIMING_ENABLE_ADDRLATCH`
+respectively), by which time both halves hold the correct address.
+
+Why it is not biting us today:
+
+* the code is inherited verbatim from RAD-Doom, whose display is clean;
+* RAD-Doom blits into the *inactive* VIC bank, so any fetch it disturbs is not
+  being displayed;
+* our bursts are now scheduled into the border and vertical blank, where the
+  VIC-II is not fetching at all.
+
+The last point is doing the work for us, and it means the raster gate is
+load-bearing for a reason we did not originally intend. If bursts ever need to
+happen during active display, fix this first: move the `bLATCH_A_OE` clear out
+of the opening `CLR_GPIO` and down to the existing
+`WAIT_UP_TO_CYCLE( TIMING_ENABLE_RWOUT_ADDR_LATCH_WRITING - 40 )` point, so
+there is exactly one place the latch is enabled and it happens after both halves
+are clocked. The wait is already in the loop, so it costs nothing.
+
+Note the stock RAD firmware has no burst path at all -- `emuWriteByteMany` does
+not appear in `_radmain/`. It is a RAD-Doom addition, so "proven on hardware"
+rests on one program rather than on the REU firmware.
