@@ -47,6 +47,7 @@ extern "C" void radUnmountFileSystem();
 
 static bool radBusButtonPressed();
 static bool radBusHardwareResetPressed();
+static void radBusSampleInterrupts( bool &irq, bool &nmi );
 
 // Bare metal: no snprintf. Enough formatter for the freeze dumps.
 static int scpuHexByte( char *dst, u8 v )
@@ -101,7 +102,7 @@ static bool scpuCheckButton( void *ctx )
 			if ( CW65C816 *core = scpu->core65816() )
 			{
 				bool liveIRQ = false, liveNMI = false;
-				radBus.sampleInterrupts( liveIRQ, liveNMI );
+				radBusSampleInterrupts( liveIRQ, liveNMI );
 				s_Logger->Write( "SCPU", LogNotice,
 				               "  P=$%02X (I=%u) E=%u  irqsTaken=%u nmisTaken=%u  line: IRQ=%u NMI=%u",
 				               core->m_P, ( core->m_P & W65_I ) ? 1 : 0,
@@ -178,6 +179,7 @@ static u8 scpuROMBuffer[ SCPU_ROM_MAXSIZE ];
 
 static bool radBusButtonPressed() { return radBus.buttonPressed(); }
 static bool radBusHardwareResetPressed() { return radBus.hardwareResetPressed(); }
+static void radBusSampleInterrupts( bool &irq, bool &nmi ) { radBus.sampleInterrupts( irq, nmi ); }
 
 // Park here on any failure. Without this a failed start-up never reaches the
 // run loop, so nothing ever polls the button and the only way out is a power
