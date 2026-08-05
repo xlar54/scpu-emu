@@ -1230,3 +1230,55 @@ TEST( integration_polling_dd00_with_idle_lines_never_latches_iec_activity )
 	}
 	CHECK( !f.mem.iecBusActive() );
 }
+
+TEST( integration_frame_end_runs_the_cpu_toward_the_border_instead_of_missing_it )
+{
+	// Every other drain is opportunistic: sample the raster, transfer only if
+	// the beam happens to be outside the picture. The border is under a
+	// quarter of the frame, so a meaningful share of frames delivered NOTHING
+	// -- and a frame that delivers nothing shows the previous frame's objects,
+	// which is a flicker no budget size can fix.
+	//
+	// At frame end the machine now approaches the border deliberately: it runs
+	// the emulated CPU for exactly the time the beam needs to get there. The
+	// wait is useful work rather than a bus poll, and arrival is by
+	// construction rather than by luck.
+	struct FixedRasterBus : CHostBus
+	{
+		u16 line = 250;
+		u16 rasterLine() override { return line; }
+	};
+
+	auto runOne = []( u16 rasterAt ) -> u64
+	{
+		static FixedRasterBus bus;
+		bus.line = rasterAt;
+		static CSuperCPU scpu;
+		u8 basic[ C64_BASIC_SIZE ];
+		u8 kernal[ C64_KERNAL_SIZE ];
+		std::memset( basic, 0xEA, sizeof basic );
+		std::memset( kernal, 0xEA, sizeof kernal );
+		kernal[ 0 ] = 0x4C;              // JMP $E000
+		kernal[ 1 ] = 0x00;
+		kernal[ 2 ] = 0xE0;
+		kernal[ 0x1FFC ] = 0x00;
+		kernal[ 0x1FFD ] = 0xE0;
+		scpu.setBasicROM( basic );
+		scpu.setKernalROM( kernal );
+		CHECK( scpu.init( &bus, SCPU_CORE_6502, 0 ) );
+		scpu.writeBuffer().setOptMode( SCPU_OPT_NONE );
+		scpu.setMirrorDisplayBudget( 0 );
+
+		for ( u32 i = 0; i < 100; i++ )
+			scpu.memory().write8( (u16)( 0x2000 + i ), (u8)i );
+		return scpu.runFrame();
+	};
+
+	// Beam already in the bottom border: nothing to approach.
+	const u64 atBorder = runOne( 250 );
+
+	// Beam mid-picture: the frame runs on until the border is reached.
+	const u64 inDisplay = runOne( 100 );
+
+	CHECK( inDisplay > atBorder );
+}

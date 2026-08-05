@@ -92,13 +92,13 @@ extern int cfgJiffyDOS;
 #define SCPU_CFG_JIFFYDOS_DEFAULT 1
 
 // Mirrored bytes per drain call while the beam is in the visible display.
-// Border-only mirroring (0) bounds delivery at roughly 3KB per frame, which a
-// game redrawing moving objects outruns -- the VIC then fetches a mixture of
-// several frames for exactly the things that move. Writing inside the picture
-// is safe because the burst path yields the bus to the VIC on BA.
+// Off by default: bus-safe, but it can replay a game's sprite writes while the
+// VIC is fetching that sprite, tearing shapes that the game itself had timed
+// correctly. Raise it only for games that write more per frame than the border
+// can carry. See CSuperCPU::setMirrorDisplayBudget.
 extern int cfgMirrorDisplayBytes;
 
-#define SCPU_CFG_MIRROR_DISPLAY_DEFAULT 224
+#define SCPU_CFG_MIRROR_DISPLAY_DEFAULT 0
 
 extern int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME );
 

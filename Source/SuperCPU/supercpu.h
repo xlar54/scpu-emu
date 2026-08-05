@@ -51,8 +51,8 @@ enum SCPUCoreType
 };
 
 // Mirrored bytes allowed per drain call while the beam is inside the picture.
-// See CSuperCPU::setMirrorDisplayBudget.
-#define SCPU_MIRROR_DISPLAY_BYTES_DEFAULT 224
+// OFF by default: see CSuperCPU::setMirrorDisplayBudget for why.
+#define SCPU_MIRROR_DISPLAY_BYTES_DEFAULT 0
 
 class CSuperCPU
 {
@@ -80,18 +80,24 @@ public:
 	void setBootmapEnabled( bool on ) { m_BootmapEnabled = on; }
 	bool bootmapEnabled() const       { return m_BootmapEnabled; }
 
-	// Default display ration. Nine drain opportunities per frame (eight slice
-	// boundaries plus the frame end) put the ceiling near 2KB per frame, which
-	// covers a game redrawing its moving objects without letting a full-screen
-	// rewriter stall the emulated CPU for half a frame.
-	//
 	// How many mirrored bytes may be pushed per drain call while the beam is
-	// INSIDE the visible display. 0 restores strict border-only mirroring.
+	// INSIDE the visible display. 0 -- the default -- keeps delivery entirely
+	// in the border.
 	//
-	// Border bytes are nearly free; display bytes contend with the VIC and
-	// stall on BA, so they are rationed rather than unlimited. They are not
-	// unsafe: the burst path yields the bus whenever the VIC claims it, which
-	// is exactly how a real REU writes DRAM mid-picture.
+	// Such writes are not unsafe at the BUS level: the burst path yields to the
+	// VIC on BA, exactly as a real REU does. They are unsafe at the FRAME
+	// level, and that is subtler. A game writes its sprite shapes at a moment
+	// it has chosen, normally in the vertical blank, so the VIC never fetches a
+	// half-updated shape. Mirroring defers those writes and can replay them
+	// while the VIC is fetching that very sprite -- the top of the sprite comes
+	// from the old shape and the bottom from the new. The result flickers
+	// between the right picture and garbage, and it is WORSE for well-written
+	// games, because their careful timing is what gets discarded.
+	//
+	// So this stays off unless a game writes more per frame than the border can
+	// carry (roughly 3KB), where a torn object beats an object frozen several
+	// frames behind. Delivery is kept honest instead by arriving at the border
+	// deliberately once per frame -- see the end of runFrame().
 	void setMirrorDisplayBudget( u32 bytes ) { m_MirrorDisplayBudget = bytes; }
 	u32  mirrorDisplayBudget() const         { return m_MirrorDisplayBudget; }
 

@@ -434,19 +434,49 @@ u64 CSuperCPU::runFrame()
 	}
 
 	// --- raster-scheduled mirroring ----------------------------------------
-	// Mirrored writes must not be pushed across the visible display. While the
-	// VIC-II is fetching character, colour and bitmap data, bulk traffic on the
-	// bus corrupts those fetches and the picture will not hold -- which is
-	// exactly the failure this replaces. RAD-Doom, which moves ~10KB a frame
-	// without disturbing the display, does the same thing: it works out how
-	// many scanlines its transfer needs and waits so it lands in the border and
-	// vertical blank.
+	// Land in the border ON PURPOSE, once per frame.
 	//
-	// So: send only when the sampled beam is already outside the display window,
-	// and only as much as fits before it comes back.
+	// Every drain above is opportunistic: sample the raster, and transfer only
+	// if the beam happens to be outside the picture. The border is under a
+	// quarter of the frame, so with nine samples about one frame in eleven
+	// drains nothing at all -- and a frame that delivers nothing shows the
+	// previous frame's objects. That is a flicker with no cure in the size of
+	// the budget, because the problem is WHEN the budget is spent.
+	//
+	// Waiting for the border by polling was the old answer and it cost real
+	// time (the CPU stopped dead for up to 800us a frame, which showed as
+	// stutter). Instead, work out how far the beam is from the border and run
+	// the emulated CPU for exactly that long. The wait becomes useful work, the
+	// machine arrives at the border by construction, and the drain then has the
+	// whole border window to itself.
+	//
+	// The cycles spent here belong to the next frame, which is precisely the
+	// point: it re-phases the emulated frame against the real raster instead of
+	// letting the two drift.
 	if ( !m_WriteBuffer.empty() && !m_Memory.iecBusActive() )
-		flushMirrorsRasterAware( m_WriteBuffer, *m_Bus, sig,
-		                         m_MirrorDisplayBudget );
+	{
+		const u16 line = m_Bus->rasterLine();
+		const u32 lines = c64RasterLines( sig.video );
+
+		if ( line < lines && !c64RasterIsSafeForBulkTransfer( sig.video, line ) )
+		{
+			const u32 linesToGo = ( c64DisplayLastLine( sig.video ) + 1 ) - line;
+			const u64 approachTicks = (u64)linesToGo
+			                        * (u64)c64CyclesPerLine( sig.video )
+			                        * ( SCPU_TURBO_HZ / SCPU_NORMAL_HZ );
+
+			const u32 clockHz = m_Memory.iecThrottleActive()
+			                  ? SCPU_NORMAL_HZ : currentClockHz();
+			const u32 ticksPerCycle = SCPU_TURBO_HZ / clockHz;
+			const u64 ran = m_CPU->run( approachTicks / ticksPerCycle );
+			executed += ran;
+		}
+
+		// Re-check the serial bus: the approach run may have started one.
+		if ( !m_Memory.iecBusActive() )
+			flushMirrorsRasterAware( m_WriteBuffer, *m_Bus, sig,
+			                         m_MirrorDisplayBudget );
+	}
 
 	// Pacing is no longer done here. It happens after every instruction in
 	// CC64Memory::tick(), because frame granularity (~20ms) is far too coarse
