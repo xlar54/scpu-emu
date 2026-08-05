@@ -110,10 +110,10 @@ sdcard:
 	@# The SuperCPU's own ROM: SuperCPU DOS and its JiffyDOS support. Optional --
 	@# the accelerator boots the machine's own KERNAL without it.
 	@#
-	@# 1.4 is the SuperCPU 64 image. 2.04 is for the SuperCPU 128 -- it carries a
-	@# C128 KERNAL and BASIC inside it, and on a 64 its boot code gets as far as
-	@# "SUPERCPU INITIALIZATION ERROR: 06". Do not stage 2.04 for a C64.
-	@cp -f ROMs/scpu-dos-1.4.bin $(SDDIR)/SCPU/scpu.rom 2>/dev/null \
+	@# SuperCPU DOS 2.04, confirmed working on this machine. An early debugging
+	@# round blamed 2.04 for "INITIALIZATION ERROR: 06" and switched to 1.4; the
+	@# real culprits were since-fixed emulation bugs, and 2.04 is preferred.
+	@cp -f ROMs/scpu-dos-2.04.bin $(SDDIR)/SCPU/scpu.rom 2>/dev/null \
 		|| echo "  (no SuperCPU ROM staged -- optional, see ROMs/README.md)"
 	@cp -f Source/kernel8.img $(SDDIR)/ 2>/dev/null \
 		|| echo "  MISSING kernel8.img       -- run 'make firmware' first (needs a Circle tree, see Docs/build.md)"
