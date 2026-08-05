@@ -772,6 +772,14 @@ void scpuBootRun( CLogger *logger )
 	// always effective, however badly the emulated machine behaves with it on.
 	superCPU.setBootmapEnabled( cfgBootmap != 0 );
 
+	// Mirroring inside the visible picture. Border-only delivery (0) cannot
+	// keep up with a game that redraws moving objects every frame, which shows
+	// as coherent scenery with mixed-frame garbage on exactly the moving parts.
+	superCPU.setMirrorDisplayBudget( (u32)cfgMirrorDisplayBytes );
+	logger->Write( "SCPU", LogNotice, "mirror: %u bytes/drain inside the display%s",
+	               (unsigned)cfgMirrorDisplayBytes,
+	               cfgMirrorDisplayBytes ? "" : " (border-only)" );
+
 	// From superCPU.init() onward the Pi owns and accesses the C64 bus in
 	// sub-microsecond GPIO windows. Circle's timer/SD IRQs may pre-empt at any
 	// instruction, so leaving them enabled can stretch a nominally valid bus

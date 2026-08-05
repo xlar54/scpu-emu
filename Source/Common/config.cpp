@@ -83,6 +83,7 @@ int timingValues[ TIMING_NAMES ] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 int cfgCPUCore = SCPU_CFG_CORE_DEFAULT;
 int cfgBootmap = SCPU_CFG_BOOTMAP_DEFAULT;
 int cfgJiffyDOS = SCPU_CFG_JIFFYDOS_DEFAULT;
+int cfgMirrorDisplayBytes = SCPU_CFG_MIRROR_DISPLAY_DEFAULT;
 
 char cfg[ 65536 ];
 
@@ -98,6 +99,7 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	cfgCPUCore = SCPU_CFG_CORE_DEFAULT;
 	cfgBootmap = SCPU_CFG_BOOTMAP_DEFAULT;
 	cfgJiffyDOS = SCPU_CFG_JIFFYDOS_DEFAULT;
+	cfgMirrorDisplayBytes = SCPU_CFG_MIRROR_DISPLAY_DEFAULT;
 
 	// Leave a byte spare so cfg is always NUL-terminated for the line scanner.
 	if ( !readFile( logger, DRIVE, FILENAME, (u8*)cfg, &cfgBytes, sizeof( cfg ) - 1 ) )
@@ -108,6 +110,7 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	bool cpuCoreSeen = false;
 	bool bootmapSeen = false;
 	bool jiffyDOSSeen = false;
+	bool mirrorDisplaySeen = false;
 
 	while ( *cfgPos != 0 )
 	{
@@ -130,6 +133,7 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 						if ( i == 21 ) cpuCoreSeen = true;
 						if ( i == 22 ) bootmapSeen = true;
 						if ( i == 23 ) jiffyDOSSeen = true;
+						if ( i == 24 ) mirrorDisplaySeen = true;
 						while ( *ptr == '\t' || *ptr == ' ' ) ptr++;
 					#ifdef DEBUG_OUT
 						logger->Write( "RaspiMenu", LogNotice, "  %s >%d< (%s)", timingNames[ i ], timingValues[ i ], ptr );
@@ -178,6 +182,10 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	// values. It defaults on when the key is absent.
 	if ( jiffyDOSSeen )
 		cfgJiffyDOS = ( timingValues[ 23 ] != 0 ) ? 1 : 0;
+
+	// A byte count, not a flag: 0 means border-only mirroring.
+	if ( mirrorDisplaySeen && timingValues[ 24 ] >= 0 )
+		cfgMirrorDisplayBytes = timingValues[ 24 ];
 
 	return 1;
 }

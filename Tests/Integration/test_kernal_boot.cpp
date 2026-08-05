@@ -1106,6 +1106,7 @@ TEST( integration_mirror_drain_rechecks_raster_before_each_small_chunk )
 	scpu.setKernalROM( kernal );
 	CHECK( scpu.init( &bus, SCPU_CORE_6502, 0 ) );
 	scpu.writeBuffer().setOptMode( SCPU_OPT_NONE );
+	scpu.setMirrorDisplayBudget( 0 );		// strict border-only
 
 	for ( u32 i = 0; i < 200; i++ )
 		scpu.memory().write8( (u16)( 0x2000 + i ), (u8)i );
@@ -1118,4 +1119,114 @@ TEST( integration_mirror_drain_rechecks_raster_before_each_small_chunk )
 	CHECK( bus.samples > 1 );
 	CHECK_EQ( bus.m_BurstWrites, 64 );
 	CHECK_EQ( scpu.writeBuffer().pending(), 136 );
+}
+
+TEST( integration_mirror_drains_inside_the_display_within_its_ration )
+{
+	// Border-only mirroring bounds delivery at roughly 3KB per frame, and only
+	// on frames where a raster sample catches the border at all. A game that
+	// redraws its moving objects every frame outruns that, so the VIC fetches a
+	// mixture of several frames' bytes for exactly the parts that move while
+	// static scenery -- delivered long ago -- stays perfect.
+	//
+	// Writing inside the picture is safe: the burst path re-samples BA and
+	// hands the bus back whenever the VIC claims it, which is what a real REU
+	// does. So a display ration must drain, and must stop at the ration.
+	struct AlwaysDisplayBus : CHostBus
+	{
+		u16 rasterLine() override { return 100; }	// never in the border
+	} bus;
+
+	CSuperCPU scpu;
+	u8 basic[ C64_BASIC_SIZE ];
+	u8 kernal[ C64_KERNAL_SIZE ];
+	std::memset( basic, 0xEA, sizeof basic );
+	std::memset( kernal, 0xEA, sizeof kernal );
+	kernal[ 0 ] = 0x4C;              // JMP $E000
+	kernal[ 1 ] = 0x00;
+	kernal[ 2 ] = 0xE0;
+	kernal[ 0x1FFC ] = 0x00;
+	kernal[ 0x1FFD ] = 0xE0;
+	scpu.setBasicROM( basic );
+	scpu.setKernalROM( kernal );
+	CHECK( scpu.init( &bus, SCPU_CORE_6502, 0 ) );
+	scpu.writeBuffer().setOptMode( SCPU_OPT_NONE );
+	scpu.setMirrorDisplayBudget( 128 );
+
+	for ( u32 i = 0; i < 4000; i++ )
+		scpu.memory().write8( (u16)( 0x2000 + i ), (u8)i );
+	const u32 staged = scpu.writeBuffer().pending();
+	CHECK( staged >= 4000 );
+	bus.resetStats();
+
+	scpu.runFrame();
+
+	// Nine drain calls per frame at 128 bytes each: real progress inside the
+	// picture, and far short of the whole queue.
+	const u32 sent = staged - scpu.writeBuffer().pending();
+	CHECK( sent >= 128 );
+	CHECK( sent <= 9 * 128 );
+}
+
+TEST( integration_border_only_mode_sends_nothing_inside_the_display )
+{
+	// The escape hatch: MIRROR_DISPLAY_BYTES 0 restores the old rule exactly,
+	// so a card can back this out without a rebuild.
+	struct AlwaysDisplayBus : CHostBus
+	{
+		u16 rasterLine() override { return 100; }
+	} bus;
+
+	CSuperCPU scpu;
+	u8 basic[ C64_BASIC_SIZE ];
+	u8 kernal[ C64_KERNAL_SIZE ];
+	std::memset( basic, 0xEA, sizeof basic );
+	std::memset( kernal, 0xEA, sizeof kernal );
+	kernal[ 0 ] = 0x4C;
+	kernal[ 1 ] = 0x00;
+	kernal[ 2 ] = 0xE0;
+	kernal[ 0x1FFC ] = 0x00;
+	kernal[ 0x1FFD ] = 0xE0;
+	scpu.setBasicROM( basic );
+	scpu.setKernalROM( kernal );
+	CHECK( scpu.init( &bus, SCPU_CORE_6502, 0 ) );
+	scpu.writeBuffer().setOptMode( SCPU_OPT_NONE );
+	scpu.setMirrorDisplayBudget( 0 );
+
+	for ( u32 i = 0; i < 200; i++ )
+		scpu.memory().write8( (u16)( 0x2000 + i ), (u8)i );
+	bus.resetStats();
+
+	scpu.runFrame();
+	CHECK_EQ( bus.m_BurstWrites, 0 );
+	CHECK_EQ( scpu.writeBuffer().pending(), 200 );
+}
+
+TEST( integration_polling_dd00_with_idle_lines_never_latches_iec_activity )
+{
+	// The mirror-blackout latch-up, pinned. Re-arming the activity window on
+	// any $DD00 read once it happened to be open made it self-sustaining: that
+	// window is only ~2.5ms of real time at 20MHz, so ordinary code reading
+	// $DD00 a few times a frame held it open forever. iecBusActive() gates ALL
+	// mirroring, so the physical screen froze while the machine ran on.
+	SystemFixture f;
+	f.start();
+	f.bus.m_Memory[ 0xDD02 ] = 0x3F;		// PA6/PA7 inputs, as the KERNAL sets
+	f.mem.read8( 0xDD02 );
+
+	// A real transaction opens the window.
+	f.bus.m_Memory[ 0xDD00 ] = 0x7F;		// DATA in low: a drive is talking
+	f.mem.read8( 0xDD00 );
+	CHECK( f.mem.iecBusActive() );
+
+	// The drive releases. From here on the lines are idle high and the only
+	// traffic is a game polling the register -- which must not hold the
+	// window open. Poll far more often than the window is long.
+	f.bus.m_Memory[ 0xDD00 ] = 0xFF;
+	for ( u32 i = 0; i < 200000; i++ )
+	{
+		if ( ( i % 1000 ) == 0 ) f.mem.read8( 0xDD00 );
+		f.mem.tickFast( 1 );
+	}
+	CHECK( !f.mem.iecBusActive() );
 }

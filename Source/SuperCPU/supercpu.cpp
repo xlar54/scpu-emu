@@ -21,6 +21,7 @@
 
 CSuperCPU::CSuperCPU()
 	: m_CPU( 0 ), m_Bus( 0 ), m_Running( false ), m_BootmapEnabled( false ),
+	  m_MirrorDisplayBudget( SCPU_MIRROR_DISPLAY_BYTES_DEFAULT ),
 	  m_FrameHook( 0 ), m_FrameHookCtx( 0 )
 {
 }
@@ -283,41 +284,83 @@ u32 CSuperCPU::currentClockHz() const
 	return m_Registers.turboEnabled() ? SCPU_TURBO_HZ : SCPU_NORMAL_HZ;
 }
 
-// Drain mirrored RAM only in small, independently raster-guarded bursts. A
-// single border sample cannot safely authorize thousands of writes: sprite DMA,
-// badlines and ordinary beam progress can consume that window while the burst is
-// still running. Re-sampling before every chunk lets the physical VIC stop us as
-// soon as the display becomes active again.
-static void flushMirrorsWhileRasterSafe( CWriteBuffer &buffer, IC64Bus &bus,
-                                         const C64Signals &sig )
+// Drain mirrored RAM in small, independently raster-guarded bursts. A single
+// sample cannot safely authorize thousands of writes: sprite DMA, badlines and
+// ordinary beam progress can consume the window while the burst is still
+// running. Re-sampling before every chunk lets the physical VIC steer us.
+//
+// Border bytes are effectively free -- nothing else wants the bus -- so the
+// border budget is the whole remaining border. Display bytes are RATIONED but
+// not forbidden, and that distinction is the point of this function.
+//
+// Mirroring only in the border bounds delivery at roughly 3KB per frame, and
+// only on frames where a raster sample happens to catch the border at all. A
+// game that redraws moving objects every frame queues more than that, so the
+// queue ages: the VIC then fetches a MIXTURE of several frames' bytes for the
+// objects that changed, while static scenery -- written once, delivered long
+// ago -- stays perfect. That is precisely the observed artifact, moving pool
+// balls rendered as blocks of mixed-frame garbage on a clean table.
+//
+// Writing inside the picture is what a real REU does, and is safe for the same
+// reason: busWriteByteBurst_p1 re-samples BA at the configured in-cycle point
+// and hands the bus back whenever the VIC claims it, so a VIC fetch is never
+// disturbed -- only our own write is delayed. The historical "bursts are never
+// display-safe" rule dates from when that BA re-check was commented out, and
+// from PAL write timings whose data window overran the VIC's half-cycle on this
+// NTSC machine. Both are fixed, so the restriction can be relaxed.
+static void flushMirrorsRasterAware( CWriteBuffer &buffer, IC64Bus &bus,
+                                     const C64Signals &sig, u32 displayBudget )
 {
-	const u32 perLine = c64CyclesPerLine( sig.video );
-	const u32 lines   = c64RasterLines( sig.video );
+	const u32 perLine  = c64CyclesPerLine( sig.video );
+	const u32 lines    = c64RasterLines( sig.video );
 	const u32 maxChunk = 64;
+	u32 displayLeft = displayBudget;
 
 	while ( !buffer.empty() )
 	{
 		const u16 line = bus.rasterLine();
-		if ( !c64RasterIsSafeForBulkTransfer( sig.video, line ) )
-			break;
+		u32 budgetBytes;
+		bool inDisplay = false;
 
-		// Recompute the time left from this fresh sample. Below the display the
-		// window includes bottom border, vertical blank and top border; above it,
-		// only the remaining top border is available.
-		const u32 linesLeft = ( line > c64DisplayLastLine( sig.video ) )
-		                    ? ( lines - line ) + c64DisplayFirstLine( sig.video )
-		                    : c64DisplayFirstLine( sig.video ) - line;
-		const u32 budgetBytes = ( linesLeft * perLine * 3 ) / 4;
-		if ( budgetBytes == 0 )
+		if ( c64RasterIsSafeForBulkTransfer( sig.video, line ) )
+		{
+			// Below the display the window includes bottom border, vertical
+			// blank and top border; above it, only the remaining top border.
+			const u32 linesLeft = ( line > c64DisplayLastLine( sig.video ) )
+			                    ? ( lines - line ) + c64DisplayFirstLine( sig.video )
+			                    : c64DisplayFirstLine( sig.video ) - line;
+			budgetBytes = ( linesLeft * perLine * 3 ) / 4;
+		}
+		else if ( line < lines && displayLeft != 0 )
+		{
+			// A real line, inside the picture, with ration left.
+			inDisplay = true;
+			budgetBytes = displayLeft;
+		}
+		else
+		{
+			// Torn or unknown raster, or the display ration is spent. An
+			// unusable sample must never authorize a transfer.
 			break;
+		}
 
 		const u32 chunk = budgetBytes < maxChunk ? budgetBytes : maxChunk;
+		if ( chunk == 0 )
+			break;
+
 		const u32 before = buffer.pending();
 		buffer.flushUpTo( chunk );
+		const u32 after = buffer.pending();
 
-		// A detached or failing sink must not turn this safety loop into a spin.
-		if ( buffer.pending() >= before )
+		// A detached or failing sink must not turn this loop into a spin.
+		if ( after >= before )
 			break;
+
+		if ( inDisplay )
+		{
+			const u32 sent = before - after;
+			displayLeft = ( displayLeft > sent ) ? ( displayLeft - sent ) : 0;
+		}
 	}
 }
 
@@ -386,7 +429,8 @@ u64 CSuperCPU::runFrame()
 		// always wait 100ms; the serial bus cannot.
 		if ( !m_Memory.iecBusActive()
 		     && !m_WriteBuffer.empty() && ticksUsed < frameTicks )
-			flushMirrorsWhileRasterSafe( m_WriteBuffer, *m_Bus, sig );
+			flushMirrorsRasterAware( m_WriteBuffer, *m_Bus, sig,
+			                         m_MirrorDisplayBudget );
 	}
 
 	// --- raster-scheduled mirroring ----------------------------------------
@@ -401,7 +445,8 @@ u64 CSuperCPU::runFrame()
 	// So: send only when the sampled beam is already outside the display window,
 	// and only as much as fits before it comes back.
 	if ( !m_WriteBuffer.empty() && !m_Memory.iecBusActive() )
-		flushMirrorsWhileRasterSafe( m_WriteBuffer, *m_Bus, sig );
+		flushMirrorsRasterAware( m_WriteBuffer, *m_Bus, sig,
+		                         m_MirrorDisplayBudget );
 
 	// Pacing is no longer done here. It happens after every instruction in
 	// CC64Memory::tick(), because frame granularity (~20ms) is far too coarse

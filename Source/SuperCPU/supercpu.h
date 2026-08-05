@@ -50,6 +50,10 @@ enum SCPUCoreType
 	SCPU_CORE_65816
 };
 
+// Mirrored bytes allowed per drain call while the beam is inside the picture.
+// See CSuperCPU::setMirrorDisplayBudget.
+#define SCPU_MIRROR_DISPLAY_BYTES_DEFAULT 224
+
 class CSuperCPU
 {
 public:
@@ -75,6 +79,21 @@ public:
 	// without one this is ignored and the machine boots its own KERNAL.
 	void setBootmapEnabled( bool on ) { m_BootmapEnabled = on; }
 	bool bootmapEnabled() const       { return m_BootmapEnabled; }
+
+	// Default display ration. Nine drain opportunities per frame (eight slice
+	// boundaries plus the frame end) put the ceiling near 2KB per frame, which
+	// covers a game redrawing its moving objects without letting a full-screen
+	// rewriter stall the emulated CPU for half a frame.
+	//
+	// How many mirrored bytes may be pushed per drain call while the beam is
+	// INSIDE the visible display. 0 restores strict border-only mirroring.
+	//
+	// Border bytes are nearly free; display bytes contend with the VIC and
+	// stall on BA, so they are rationed rather than unlimited. They are not
+	// unsafe: the burst path yields the bus whenever the VIC claims it, which
+	// is exactly how a real REU writes DRAM mid-picture.
+	void setMirrorDisplayBudget( u32 bytes ) { m_MirrorDisplayBudget = bytes; }
+	u32  mirrorDisplayBudget() const         { return m_MirrorDisplayBudget; }
 
 	void reset();
 
@@ -139,6 +158,7 @@ private:
 	IC64Bus *m_Bus;
 	bool     m_Running;
 	bool     m_BootmapEnabled;
+	u32      m_MirrorDisplayBudget;
 	u32      m_BenchArmPerEmuCycle = 0;
 
 	void benchmark65816();

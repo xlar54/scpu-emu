@@ -29,7 +29,7 @@
 #define _config_h
 
 
-#define TIMING_NAMES 24
+#define TIMING_NAMES 25
 const char timingNames[TIMING_NAMES][32] = {
 	"WAIT_FOR_SIGNALS", 
 	"WAIT_CYCLE_READ", 
@@ -64,7 +64,10 @@ const char timingNames[TIMING_NAMES][32] = {
 	// Also not a timing: 1 maps the SuperCPU's own ROM over bank 0 at reset.
 	"BOOTMAP",
 	// Virtual replacement for the cartridge's physical JiffyDOS switch.
-	"JIFFYDOS"
+	"JIFFYDOS",
+	// Also not a timing: mirrored bytes allowed per drain while the VIC-II is
+	// drawing the picture. 0 restores strict border-only mirroring.
+	"MIRROR_DISPLAY_BYTES"
 };
 
 // Which CPU core boot.cpp should install. Set from CPU_CORE in the config file;
@@ -87,6 +90,15 @@ extern int cfgBootmap;
 extern int cfgJiffyDOS;
 
 #define SCPU_CFG_JIFFYDOS_DEFAULT 1
+
+// Mirrored bytes per drain call while the beam is in the visible display.
+// Border-only mirroring (0) bounds delivery at roughly 3KB per frame, which a
+// game redrawing moving objects outruns -- the VIC then fetches a mixture of
+// several frames for exactly the things that move. Writing inside the picture
+// is safe because the burst path yields the bus to the VIC on BA.
+extern int cfgMirrorDisplayBytes;
+
+#define SCPU_CFG_MIRROR_DISPLAY_DEFAULT 224
 
 extern int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME );
 

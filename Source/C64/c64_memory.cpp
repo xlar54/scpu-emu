@@ -277,14 +277,22 @@ u8 CC64Memory::read8( scpu_addr_t addr )
 				// low. A PRA read reports pin levels, not the CIA's hidden output
 				// latch, so never use it as a PA3-PA5 latch baseline.
 				const bool inputAsserted = ( v & inputMask ) != inputMask;
-				const bool continuingPoll = inputMask != 0
-				                          && m_HaveCIA2PortARead
-				                          && ( m_IECActivityCycles != 0
-				                               || m_IECHoldCycles != 0 );
 				m_LastCIA2PortARead = v;
 				m_HaveCIA2PortARead = true;
 
-				if ( inputChanged || inputAsserted || continuingPoll )
+				// A changed input, or one a drive is actively holding low, is
+				// evidence of a live conversation. The mere ACT of polling is
+				// not, and treating it as such was a mirror-blackout latch-up:
+				// re-arming the 50000-cycle window on any read once the window
+				// happened to be open made it self-sustaining. That window is
+				// only ~2.5ms of real time at 20MHz, so ordinary code reading
+				// $DD00 a few times a frame -- VIC bank manipulation, raster
+				// splits -- held it open forever. iecBusActive() gates ALL
+				// mirroring, so the physical screen froze at whatever had last
+				// been delivered while the emulated machine ran on perfectly:
+				// static scenery intact, everything that moved stuck as a
+				// half-delivered smear.
+				if ( inputChanged || inputAsserted )
 					noteIECActivity();
 			}
 			else if ( a == 0xDD02 )
