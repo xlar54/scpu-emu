@@ -24,9 +24,10 @@
        everything else. A BASIC program only needs $0400-$07FF kept coherent;
        mirroring its zero page and stack traffic would be pure waste.
 
-   Ordering rule: the buffer is flushed before any I/O access. Without that a
-   program could set up a screen and then hit $D011 to switch to it while the
-   screen data is still sitting in the buffer.
+   Ordering rule: ordinary I/O never drains the buffer synchronously. The frame
+   scheduler alone delivers queued RAM during sampled border windows. A display
+   pointer can therefore expose stale data for a frame, but its exact raster
+   write is preserved and no visible-region burst is generated.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -98,6 +99,12 @@ public:
 	// polite: a large flush here will disturb the display.
 	void flush() override;
 
+	// Forget everything queued without touching the C64 bus. Reset uses this:
+	// bytes staged by the program that was just reset are obsolete, and blasting
+	// them into the machine at an arbitrary raster position only corrupts the
+	// new display state.
+	void discard();
+
 	// Flush at most maxBytes and return how many writes are still outstanding.
 	// This is what the raster-scheduled path uses, so a transfer can be sized
 	// to the time actually left in the safe window.
@@ -142,6 +149,11 @@ private:
 
 	// Dirty set: bitmap for O(1) membership, list for O(n) iteration.
 	u64 m_Dirty[ 0x10000 / 64 ];
+	// Value accepted under the policy in force at the time of the write. Keeping
+	// it here lets an optimisation-mode change take effect immediately without
+	// synchronously flushing the old queue. A later write excluded by the new
+	// policy must not change the value of an already queued old-policy write.
+	u8  m_PendingValue[ SCPU_WRITEBUF_CAPACITY ];
 	// A RING, consumed oldest-first. It used to be a stack flushed from the
 	// tail, which is one line simpler -- and starves. A program that
 	// continuously re-dirties memory (a scrolling PRINT loop rewrites the
@@ -159,6 +171,10 @@ private:
 
 	inline bool isDirty( u16 a ) const { return ( m_Dirty[ a >> 6 ] >> ( a & 63 ) ) & 1; }
 	inline void setDirty( u16 a )      { m_Dirty[ a >> 6 ] |= ( 1ULL << ( a & 63 ) ); }
+	// A rewritten sprite pointer is a commit record for the sprite data it
+	// selects. Move its existing ring entry behind everything currently queued
+	// without creating a duplicate dirty entry.
+	void moveDirtyToTail( u16 addr );
 	void clearDirty();
 };
 

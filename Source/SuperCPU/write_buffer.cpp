@@ -21,7 +21,8 @@
 
 CWriteBuffer::CWriteBuffer()
 	: m_WritesAccepted( 0 ), m_WritesSkipped( 0 ), m_WritesCoalesced( 0 ),
-	  m_BytesFlushed( 0 ), m_Flushes( 0 ), m_IOWindowSuppressed( 0 ),
+	  m_BytesFlushed( 0 ), m_Flushes( 0 ),
+	  m_IOWindowSuppressed( 0 ),
 	  m_Bus( 0 ), m_RAM( 0 ),
 	  m_Mode( SCPU_OPT_DEFAULT ), m_ExcludeZPStack( true ),
 	  m_RangeLo( 0x0000 ), m_RangeHi( 0xFFFF ),
@@ -43,6 +44,34 @@ void CWriteBuffer::clearDirty()
 		m_Dirty[ i ] = 0;
 }
 
+static inline bool isPotentialVICSpritePointer( u16 addr )
+{
+	// Every possible VIC screen is aligned to 1KB. Its last eight bytes are
+	// the sprite-pointer table, regardless of which 16KB VIC bank contains it.
+	return ( addr & 0x03FF ) >= 0x03F8;
+}
+
+void CWriteBuffer::moveDirtyToTail( u16 addr )
+{
+	if ( m_Count < 2 )
+		return;
+
+	const u32 mask = SCPU_WRITEBUF_CAPACITY - 1;
+	u32 position = 0;
+	while ( position < m_Count && m_List[ ( m_Head + position ) & mask ] != addr )
+		position++;
+
+	// isDirty() guarantees an entry should exist. Be defensive if the bitmap
+	// and ring are ever damaged, and avoid work when it is already last.
+	if ( position >= m_Count || position + 1 == m_Count )
+		return;
+
+	for ( u32 i = position; i + 1 < m_Count; i++ )
+		m_List[ ( m_Head + i ) & mask ] = m_List[ ( m_Head + i + 1 ) & mask ];
+
+	m_List[ ( m_Head + m_Count - 1 ) & mask ] = addr;
+}
+
 void CWriteBuffer::resetStats()
 {
 	m_WritesAccepted = m_WritesSkipped = m_WritesCoalesced = 0;
@@ -52,10 +81,6 @@ void CWriteBuffer::resetStats()
 
 void CWriteBuffer::setOptMode( SCPUOptMode mode )
 {
-	// Anything already buffered was queued under the old policy; get it out
-	// before the rules change.
-	flush();
-
 	m_Mode = mode;
 
 	switch ( mode )
@@ -108,8 +133,6 @@ bool CWriteBuffer::shouldMirror( u16 addr ) const
 
 void CWriteBuffer::onRamWrite( u16 addr, u8 value )
 {
-	(void)value;	// the current byte is read out of shadow RAM at flush time
-
 	if ( !shouldMirror( addr ) )
 	{
 		m_WritesSkipped++;
@@ -117,12 +140,18 @@ void CWriteBuffer::onRamWrite( u16 addr, u8 value )
 	}
 
 	m_WritesAccepted++;
+	m_PendingValue[ addr ] = value;
 
 	if ( isDirty( addr ) )
 	{
-		// Already queued. The flush reads the live value out of shadow RAM, so
-		// there is nothing to update here -- this is where the coalescing win
-		// comes from.
+		// Already queued. m_PendingValue was updated above, so the latest write
+		// accepted under the current policy replaces the old one without adding
+		// another address to the ring. A sprite-pointer byte is different from
+		// ordinary data: its newest value selects the data written before it, so
+		// move that existing entry behind everything currently queued. Otherwise
+		// coalescing can expose a new pointer before its sprite bytes arrive.
+		if ( isPotentialVICSpritePointer( addr ) )
+			moveDirtyToTail( addr );
 		m_WritesCoalesced++;
 		return;
 	}
@@ -141,7 +170,10 @@ void CWriteBuffer::onRamWrite( u16 addr, u8 value )
 void CWriteBuffer::invalidateRange( u16 addr, u32 length )
 {
 	for ( u32 i = 0; i < length; i++ )
-		onRamWrite( (u16)( addr + i ), 0 );
+	{
+		const u16 a = (u16)( addr + i );
+		onRamWrite( a, m_RAM ? m_RAM[ a ] : 0 );
+	}
 }
 
 u32 CWriteBuffer::flushUpTo( u32 maxBytes )
@@ -149,12 +181,12 @@ u32 CWriteBuffer::flushUpTo( u32 maxBytes )
 	if ( m_Count == 0 || maxBytes == 0 )
 		return m_Count;
 
-	if ( !m_Bus || !m_RAM )
+	if ( !m_Bus )
 	{
-		// No bus attached (host tests): drop the queue rather than grow forever.
+		// No bus attached: drop the queue rather than grow forever.
 		clearDirty();
 		m_Count = 0;
-	m_Head = 0;
+		m_Head = 0;
 		return 0;
 	}
 
@@ -174,7 +206,7 @@ u32 CWriteBuffer::flushUpTo( u32 maxBytes )
 		{
 			u16 a = m_List[ ( m_Head + i ) & ( SCPU_WRITEBUF_CAPACITY - 1 ) ];
 			m_Burst[ i ].addr  = a;
-			m_Burst[ i ].value = m_RAM[ a ];
+			m_Burst[ i ].value = m_PendingValue[ a ];
 		}
 
 		m_Bus->writeBurst( m_Burst, n );
@@ -198,9 +230,16 @@ u32 CWriteBuffer::flushUpTo( u32 maxBytes )
 
 void CWriteBuffer::flush()
 {
-	// Unbounded: used at points where correctness beats politeness, such as a
-	// mode change that would otherwise strand writes queued under the old
-	// policy. Prefer flushUpTo() from the raster-scheduled path.
+	// Unbounded: reserve this for callers which explicitly know that bus traffic
+	// is safe. Policy changes retain their already-accepted values in the queue;
+	// reset discards obsolete entries. Normal display work uses flushUpTo().
 	while ( flushUpTo( SCPU_WRITEBUF_CHUNK * 8 ) > 0 )
 		;
+}
+
+void CWriteBuffer::discard()
+{
+	clearDirty();
+	m_Head = 0;
+	m_Count = 0;
 }

@@ -65,7 +65,7 @@
 #define SCPU_REG_STATUS         0xD0B2	// b7 hwregs enabled, b6 system 1MHz
 #define SCPU_REG_OPTIM_V2       0xD0B3	// v2 only: optimization, read/write
 #define SCPU_REG_OPTIM          0xD0B4	// optimization mode, read/write
-#define SCPU_REG_SWITCHES       0xD0B5	// b7 JiffyDOS switch, b6 speed switch
+#define SCPU_REG_SWITCHES       0xD0B5	// read switches; direct write b7 virtual Jiffy switch
 #define SCPU_REG_PROCMODE       0xD0B6	// read: b7 emulation mode. write: bootmap off
 #define SCPU_REG_BOOTMAP_ON     0xD0B7	// write: bootmap on
 #define SCPU_REG_SPEEDFLAGS     0xD0B8	// b7 software 1MHz, b6 1MHz from any source
@@ -116,11 +116,16 @@ class CSuperCPURegisters : public IIOInterceptor
 public:
 	CSuperCPURegisters();
 
-	void attach( CWriteBuffer *writeBuffer ) { m_WriteBuffer = writeBuffer; }
+	void attach( CWriteBuffer *writeBuffer )
+	{
+		m_WriteBuffer = writeBuffer;
+		applyOptimisation();
+	}
 
 	void setHardwareVersion( SCPUHardwareVersion v ) { m_Version = v; }
 
-	// Physical switch positions on the cartridge.
+	// Switch positions: speed comes from the cartridge/configuration; JiffyDOS
+	// is virtual in this build and can also be changed through $D0B5 bit 7.
 	void setSpeedSwitchAllowsTurbo( bool allow );	// false = switch selects 1MHz
 	void setJiffyDOSSwitch( bool on ) { m_SwitchJiffy = on; }
 
@@ -194,7 +199,7 @@ private:
 	bool m_Sys1MHz;			// $D072 / $D073 / $D0B2
 	bool m_Soft1MHz;		// $D07A / $D07B / $D0B8
 	bool m_SwitchSlow;		// physical speed switch in the 1MHz position
-	bool m_SwitchJiffy;		// physical JiffyDOS switch
+	bool m_SwitchJiffy;		// virtual JiffyDOS switch; persists across reset
 
 	bool m_HWRegsEnabled;
 	bool  m_Bootmap;

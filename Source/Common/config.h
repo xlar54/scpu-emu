@@ -29,7 +29,7 @@
 #define _config_h
 
 
-#define TIMING_NAMES 23
+#define TIMING_NAMES 24
 const char timingNames[TIMING_NAMES][32] = {
 	"WAIT_FOR_SIGNALS", 
 	"WAIT_CYCLE_READ", 
@@ -62,7 +62,9 @@ const char timingNames[TIMING_NAMES][32] = {
 	// rebuild and no toolchain.
 	"CPU_CORE",
 	// Also not a timing: 1 maps the SuperCPU's own ROM over bank 0 at reset.
-	"BOOTMAP"
+	"BOOTMAP",
+	// Virtual replacement for the cartridge's physical JiffyDOS switch.
+	"JIFFYDOS"
 };
 
 // Which CPU core boot.cpp should install. Set from CPU_CORE in the config file;
@@ -78,6 +80,13 @@ extern int cfgCPUCore;
 extern int cfgBootmap;
 
 #define SCPU_CFG_BOOTMAP_DEFAULT 1
+
+// Initial position of the virtual JiffyDOS switch. The config file is read
+// before the SuperCPU ROM runs, so CMD's boot code sees this value when it
+// chooses which KERNAL to install.
+extern int cfgJiffyDOS;
+
+#define SCPU_CFG_JIFFYDOS_DEFAULT 1
 
 extern int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME );
 

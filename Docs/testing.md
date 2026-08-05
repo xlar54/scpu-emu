@@ -12,8 +12,8 @@ and compares everything they do.
 |---|---|
 | `Tests/CPU/test_m6502.cpp` | NMOS decimal ADC/SBC, the indirect-JMP page-wrap bug, page-cross cycle penalties, BRK vs IRQ stack layout, edge-triggered NMI, undocumented-opcode lengths |
 | `Tests/C64/test_banking.cpp` | the PLA table for every interesting `$01` value, Ultimax, DDR-dependent port readback |
-| `Tests/SuperCPU/test_write_buffer.cpp` | coalescing, each optimization mode, flush-on-mode-change, auto-flush |
-| `Tests/Integration/test_kernal_boot.cpp` | the seams: ROM execution costing zero bus cycles, I/O reaching the machine, flush-before-I/O ordering, register interception, partial ROM snapshotting |
+| `Tests/SuperCPU/test_write_buffer.cpp` | coalescing, each optimization mode, sprite-pointer commit ordering, pending-value preservation across policy changes, bounded flushes, reset discard |
+| `Tests/Integration/test_kernal_boot.cpp` | the seams: ROM execution costing zero bus cycles, immediate VIC/CIA I/O, raster-scheduled mirroring with repeated guards, IEC activity and pacing, register interception, partial ROM snapshotting |
 | `Tests/CPU/test_w65c816.cpp` | everything that makes a 65816 not a 6502: XCE and the mode invariants, each address-wrapping rule, the emulation-mode old/new stack split, `MVN`/`MVP`, 16-bit decimal, the read-modify-write behaviours, `WAI`/`STP` |
 | `Tests/CPU/test_w65c816_diff.cpp` | runs `CW65C816` and `CM6502` over the same programs and compares registers, flags, cycle counts and every byte of bus traffic — see below |
 | `Tests/SuperCPU/test_memory_map.cpp` | the 24-bit space: bank 0 delegation, private SRAM, SIMM sizing and aliasing, open bus |
@@ -33,8 +33,9 @@ f.wb.flush();
 CHECK_EQ( f.bus.m_Cycles, 1 );   // 1000 writes, one bus cycle
 ```
 
-`CHostBus` logs every access, so ordering can be asserted directly — which is how
-the flush-before-I/O rule is pinned down.
+`CHostBus` logs every access, so ordering can be asserted directly. The tests pin
+down that I/O remains immediate while staged RAM stays queued for a safe raster
+opportunity, rather than forcing a burst across the visible display.
 
 ## The differential test
 

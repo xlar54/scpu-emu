@@ -20,6 +20,10 @@ FAT-formatted. Layout:
 /SCPU/chargen.rom      optional, 4096 bytes
 ```
 
+`SCPU/scpu.cfg` also selects the virtual JiffyDOS switch. `JIFFYDOS 1` enables
+it (the default), while `JIFFYDOS 0` disables it. The setting is applied before
+the SuperCPU boot ROM runs.
+
 No ROM files are required. Without them SCPU-EMU snapshots BASIC and KERNAL off
 the running machine. See [../ROMs/README.md](../ROMs/README.md).
 

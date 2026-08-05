@@ -19,6 +19,13 @@
 */
 #include "c64_memory.h"
 
+// CIA2 PA3-PA5 feed the inverting open-collector IEC drivers, so only a high
+// latch bit configured as an output actively pulls a bus line.
+static inline u8 cia2EffectiveIECDrive( u8 latch, u8 ddra )
+{
+	return (u8)( latch & ddra & 0x38 );
+}
+
 // The initialiser list follows the DECLARATION order in the header. GCC warns
 // otherwise (-Wreorder), and rightly: the compiler initialises in declaration
 // order regardless of what is written here, so a list in a different order
@@ -34,10 +41,13 @@ CC64Memory::CC64Memory()
 	  m_HasBasic( false ), m_HasKernal( false ), m_HasChar( false ),
 	  m_HostPerEmuQ16( 0 ), m_HostPerEmuQ16Slow( 0 ), m_PacingAnchor( 0 ),
 	  m_SelectedEmulatedHz( 0 ),
-	  m_IECThrottleEnabled( true ), m_IECHoldCycles( 0 ),
-	  m_LastCIA2PortA( 0 ), m_HaveCIA2PortA( false ),
-	  m_LastVICControl{ 0, 0, 0 }, m_HaveVICControl( 0 ),
-	  m_IOLog{ 0 }, m_IOLogPos( 0 ), m_CIALog{ 0 }, m_CIALogPos( 0 ),
+	  m_IECThrottleEnabled( true ), m_IECHoldCycles( 0 ), m_IECActivityCycles( 0 ),
+	  m_MaxTickChunk( 0 ),
+	  m_CIA2PortALatch( 0 ), m_LastCIA2PortARead( 0 ), m_CIA2DDRA( 0 ),
+	  m_HaveCIA2PortALatch( false ), m_HaveCIA2PortARead( false ),
+	  m_HaveCIA2DDRA( false ),
+	  m_IOLog{ 0 }, m_IOLogPos( 0 ), m_CIALog{ 0 }, m_CIALogCyc{ 0 },
+	  m_CIALastRead( 0xFFFFFFFF ), m_CIALogPos( 0 ), m_EmuCycles( 0 ),
 	  m_TimingHook( 0 ), m_TimingHookCtx( 0 )
 {
 	c64BankingInit();
@@ -55,16 +65,58 @@ void CC64Memory::reset()
 	m_Port00 = 0x2F;
 	m_Port01 = 0x37;
 	m_IOReads = m_IOWrites = m_RamWrites = 0;
+	m_IECThrottleEvents = 0;
+	m_PacingDebtCycles = 0;
 	m_PacerWaitHostCycles = m_SlowPacedCycles = m_IECThrottledCycles = 0;
 	m_IECHoldCycles = 0;
-	m_HaveCIA2PortA = false;
+	m_IECActivityCycles = 0;
+	m_MaxTickChunk = 0;
+	m_CIA2PortALatch = 0;
+	m_LastCIA2PortARead = 0;
+	m_CIA2DDRA = 0;
+	m_HaveCIA2PortALatch = false;
+	m_HaveCIA2PortARead = false;
+	m_HaveCIA2DDRA = false;
+	m_IOLogPos = 0;
+	m_CIALogPos = 0;
+	m_CIALastRead = 0xFFFFFFFF;
+	m_EmuCycles = 0;
+	for ( u32 i = 0; i < 64; i++ )
+	{
+		m_IOLog[ i ] = 0;
+		m_CIALog[ i ] = 0;
+		m_CIALogCyc[ i ] = 0;
+	}
 	m_IntCredit = 0xFFFFF;
 	m_CachedIRQ = m_CachedNMI = false;
+	resyncPacing();
 
 	for ( u32 i = 0; i < C64_RAM_SIZE; i++ )
 		m_RAM[ i ] = 0;
 
 	updateBankMode();
+}
+
+void CC64Memory::noteIECActivity()
+{
+	const bool wasQuiet = ( m_IECActivityCycles == 0 );
+	m_IECActivityCycles = 50000;		// 50ms while the serial path runs at 1MHz
+	if ( wasQuiet && m_TimingHook )
+		m_TimingHook( m_TimingHookCtx );
+
+	// CMD normally selects 1MHz explicitly. The automatic hold is the fallback
+	// for serial code which reaches CIA2 while still nominally in turbo mode.
+	const bool explicitlySlow = m_SelectedEmulatedHz != 0
+	                         && m_SelectedEmulatedHz <= 1000000u;
+	if ( m_IECThrottleEnabled && !explicitlySlow )
+	{
+		const bool wasInactive = ( m_IECHoldCycles == 0 );
+		if ( wasInactive )
+			m_IECThrottleEvents++;
+		m_IECHoldCycles = 100000;
+		if ( wasInactive && m_TimingHook )
+			m_TimingHook( m_TimingHookCtx );
+	}
 }
 
 void CC64Memory::updateBankMode()
@@ -212,8 +264,35 @@ u8 CC64Memory::read8( scpu_addr_t addr )
 			}
 			if ( a == 0xDD00 )
 			{
-				m_LastCIA2PortA = v;
-				m_HaveCIA2PortA = true;
+				// PA6/PA7 are the drive-to-computer CLK/DATA inputs. A changed
+				// input, or an asserted input held across repeated polls, proves
+				// that the serial conversation is still live. Keep this receive
+				// sample separate from the output latch: otherwise the input bits
+				// in a read destroy the baseline for the next PA3-PA5 write.
+				const u8 inputMask = (u8)( 0xC0
+				                   & ( m_HaveCIA2DDRA ? (u8)~m_CIA2DDRA : 0xFF ) );
+				const bool inputChanged = m_HaveCIA2PortARead
+				                       && ( ( m_LastCIA2PortARead ^ v ) & inputMask ) != 0;
+				// PA6/PA7 are direct inputs: an IEC line is idle high and asserted
+				// low. A PRA read reports pin levels, not the CIA's hidden output
+				// latch, so never use it as a PA3-PA5 latch baseline.
+				const bool inputAsserted = ( v & inputMask ) != inputMask;
+				const bool continuingPoll = inputMask != 0
+				                          && m_HaveCIA2PortARead
+				                          && ( m_IECActivityCycles != 0
+				                               || m_IECHoldCycles != 0 );
+				m_LastCIA2PortARead = v;
+				m_HaveCIA2PortARead = true;
+
+				if ( inputChanged || inputAsserted || continuingPoll )
+					noteIECActivity();
+			}
+			else if ( a == 0xDD02 )
+			{
+				// A read establishes the real direction baseline; it does not
+				// itself represent a direction change on the pins.
+				m_CIA2DDRA = v;
+				m_HaveCIA2DDRA = true;
 			}
 			return v;
 		}
@@ -254,170 +333,50 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 			return;
 		}
 
-		// Display-state writes with staged data pending are FLUSH-SYNCHRONISED:
-		// hold the write, wait for the raster to reach the border, drain the
-		// mirror there, and only then let the register write land. This is the
-		// synthesis of two half-right answers that each failed on hardware:
-		//
-		//   * Synchronous flushing at the write ordered the data correctly but
-		//     burst the bus at arbitrary raster positions -- and bursts are
-		//     never display-safe; the CMD splash's own raster interrupt writes
-		//     these registers mid-display BY DESIGN. Rolling screens, one boot
-		//     in two.
-		//   * No flushing at all was raster-safe but broke ordering: the
-		//     splash double-buffers its animation, flipping $D018 between two
-		//     bitmaps while the DRAWING travels through the border-budgeted
-		//     mirror. Each displayed buffer was a stale mix -- logos ghosted
-		//     at two positions -- while the machine sat healthy at READY
-		//     behind an unwatchable display.
-		//
-		// Waiting for the border satisfies both constraints at once: ordered,
-		// and never bursting inside the picture. Cost: the writing instruction
-		// stalls up to about a frame, which paces a double-buffered animation
-		// to the raster -- exactly what such an animation expects.
-		//
-		// Never during serial activity (pauses have protocol meaning there --
-		// and serial code has no business flipping display state mid-byte),
-		// and bounded by a timeout so a backend with no raster cannot wedge.
-		if ( m_Mirror && m_C64 && m_Mirror->pendingBytes() > 8
-		     && m_IECActivityCycles == 0 && m_IECHoldCycles == 0 )
-		{
-			bool displayChanged = false;
-
-			if ( a == 0xDD00 )
-			{
-				displayChanged = !m_HaveCIA2PortA
-				              || ( ( m_LastCIA2PortA ^ value ) & 0x03 ) != 0;
-			}
-			else if ( a == 0xD011 || a == 0xD016 || a == 0xD018 )
-			{
-				const u32 idx  = ( a == 0xD011 ) ? 0 : ( a == 0xD016 ) ? 1 : 2;
-				const u8  mask = ( a == 0xD011 ) ? 0x70			// ECM | BMM | DEN
-				               : ( a == 0xD016 ) ? 0x10			// MCM
-				               : 0xFF;							// $D018: all of it
-				displayChanged = !( m_HaveVICControl & ( 1u << idx ) )
-				              || ( ( m_LastVICControl[ idx ] ^ value ) & mask ) != 0;
-			}
-
-			if ( displayChanged )
-			{
-				// Drain BUDGETED, across as many borders as it takes, with the
-				// flip held throughout. The first version waited for the border
-				// and then issued one unbudgeted flush -- and a large buffer
-				// (the splash's first flip arrives with a whole bitmap pending)
-				// overran the border into the visible display. Whether that
-				// happened depended on how dirty the buffer was at the flip:
-				// another per-boot coin toss, now closed. If the drain has not
-				// finished after a handful of borders, the flip lands anyway --
-				// a one-frame ghost beats an unbounded stall.
-				const C64VideoStandard vid = m_C64->signals().video;
-				const u32 perLine = c64CyclesPerLine( vid );
-				const u32 lines   = c64RasterLines( vid );
-
-				for ( u32 border = 0; border < 6 && m_Mirror->pendingBytes() > 8; border++ )
-				{
-					u16 line = 0xFFFF;
-					for ( u32 guard = 0; guard < 40000; guard++ )
-					{
-						line = m_C64->rasterLine();
-						if ( line == 0xFFFF )
-							break;					// no raster: host bus
-						if ( c64RasterIsSafeForBulkTransfer( vid, line ) )
-							break;
-					}
-
-					if ( line == 0xFFFF )
-					{
-						m_Mirror->flush();			// rasterless backend: just drain
-						break;
-					}
-
-					// Only what fits in the border time remaining, exactly as
-					// the frame scheduler computes it.
-					u32 linesLeft = ( line > c64DisplayLastLine( vid ) )
-					              ? ( lines - line ) + c64DisplayFirstLine( vid )
-					              : c64DisplayFirstLine( vid ) - line;
-					m_Mirror->flushUpTo( ( linesLeft * perLine * 3 ) / 4 );
-				}
-			}
-		}
-
-		// Track the last written control values for the change detection above.
-		if ( a == 0xD011 || a == 0xD016 || a == 0xD018 )
-		{
-			const u32 idx = ( a == 0xD011 ) ? 0 : ( a == 0xD016 ) ? 1 : 2;
-			m_LastVICControl[ idx ] = value;
-			m_HaveVICControl |= (u8)( 1u << idx );
-		}
-
-		// $DD00 is CIA2 port A, which carries ATN, CLK and DATA for the serial
-		// bus as well as the VIC bank select. Only IEC-line changes arm the
-		// fallback; an ordinary VIC bank change must remain at turbo speed.
+		// Work out whether this can affect a physical IEC output. Unknown CIA
+		// state is deliberately treated as a change: a harmless initial 1MHz
+		// interval is preferable to delaying the first protocol edge.
+		bool cia2IECChanged = false;
 		if ( a == 0xDD00 )
 		{
-			// Bits 0-1 select the VIC bank; bits 3-5 drive the IEC lines. A VIC
-			// bank change must not impose a 100ms serial-bus slowdown. A preceding
-			// read supplies the usual baseline; otherwise the first write does.
-			const bool iecChanged = m_HaveCIA2PortA
-			                     && ( ( m_LastCIA2PortA ^ value ) & 0x38 ) != 0;
-			m_LastCIA2PortA = value;
-			m_HaveCIA2PortA = true;
-
-			// TWO separate concepts, learned the hard way:
-			//
-			// IEC ACTIVITY -- "a serial transaction is in progress". Refreshed
-			// on ANY line transition, REGARDLESS of what speed is selected.
-			// This is what suppresses mirror flushing and raster polling in
-			// runFrame: the slow protocol assigns meaning to pauses (a talker
-			// holding ready past 200us is signalling EOI), so nothing may
-			// stall the CPU mid-transaction. Keying that suppression off the
-			// SPEED hold was the bug: when CMD's KERNAL drives the speed
-			// explicitly via $D07A, the hold never arms, and the flushes kept
-			// injecting protocol-visible pauses into the handshake.
-			if ( iecChanged )
-			{
-				const bool wasQuiet = ( m_IECActivityCycles == 0 );
-				m_IECActivityCycles = 50000;	// ~50ms at 1MHz past the last edge
-				if ( wasQuiet && m_TimingHook )
-					m_TimingHook( m_TimingHookCtx );
-			}
-
-			// IEC SPEED HOLD -- "force 1MHz pacing as a compatibility
-			// fallback". Only for code that touches the serial lines while
-			// still nominally in fast mode; when software selects 1MHz
-			// explicitly via $D07A there is nothing to force, and the hold
-			// must not leave a slow tail after $D07B restores turbo.
-			const bool explicitlySlow = m_SelectedEmulatedHz != 0
-			                         && m_SelectedEmulatedHz <= 1000000u;
-			if ( m_IECThrottleEnabled && iecChanged && !explicitlySlow )
-			{
-				const bool wasInactive = m_IECHoldCycles == 0;
-				if ( wasInactive )
-					m_IECThrottleEvents++;
-				m_IECHoldCycles = 100000;
-				if ( wasInactive && m_TimingHook )
-					m_TimingHook( m_TimingHookCtx );
-			}
+			if ( m_HaveCIA2DDRA && m_HaveCIA2PortALatch )
+				cia2IECChanged = cia2EffectiveIECDrive( m_CIA2PortALatch, m_CIA2DDRA )
+				                 != cia2EffectiveIECDrive( value, m_CIA2DDRA );
+			else
+				cia2IECChanged = true;
+		}
+		else if ( a == 0xDD02 )
+		{
+			if ( m_HaveCIA2DDRA && m_HaveCIA2PortALatch )
+				cia2IECChanged = cia2EffectiveIECDrive( m_CIA2PortALatch, m_CIA2DDRA )
+				                 != cia2EffectiveIECDrive( m_CIA2PortALatch, value );
+			else
+				cia2IECChanged = true;
 		}
 
-		// Mirroring is normally asynchronous -- see the note in read8() -- which
-		// means a buffered RAM write and an I/O write can reach the C64 out of
-		// program order. That is fine almost everywhere, because the VIC-II
-		// cannot tell when a byte of screen memory arrived.
-		//
-		// It is NOT fine for the four registers that change what the VIC-II
-		// LOOKS AT. Enabling bitmap mode, or repointing the screen or character
-		// base, makes the chip start displaying memory that our pending writes
-		// have not reached yet -- so the machine shows the previous contents of
-		// the new location, and the intended picture appears only later, when
-		// the buffer happens to drain. A program that draws a screen and then
-		// switches to it sees the two steps in the wrong order.
-		//
-		//   $D011  control 1  -- bitmap mode, display enable, Y scroll
-		//   $D016  control 2  -- multicolour, X scroll
-		//   $D018  memory pointers -- screen base, character/bitmap base
-		//   $DD00  CIA2 port A -- VIC bank select
-		//
+		// Raster programs deliberately change VIC registers at exact scanlines,
+		// and IEC line edges are timing-critical, so VIC/CIA writes are never
+		// delayed behind mirror traffic. In particular, $D015 must stay immediate:
+		// coalescing its transitions breaks sprite multiplexers and delaying a
+		// falling bit leaves an unwanted sprite enabled.
+
+		// $DD00 is the CIA2 output latch and $DD02 its direction register.
+		// Keep both: a latch change only reaches the VIC/IEC pins when the
+		// corresponding DDRA bit makes that pin an output.
+		if ( a == 0xDD00 )
+		{
+			m_CIA2PortALatch = value;
+			m_HaveCIA2PortALatch = true;
+			if ( cia2IECChanged )
+				noteIECActivity();
+		}
+		else if ( a == 0xDD02 )
+		{
+			m_CIA2DDRA = value;
+			m_HaveCIA2DDRA = true;
+			if ( cia2IECChanged )
+				noteIECActivity();
+		}
 
 		m_IOWrites++;
 		m_IOLog[ m_IOLogPos++ & 63 ] = (u32)a | ( (u32)value << 16 ) | ( 1u << 24 );
@@ -480,8 +439,7 @@ void CC64Memory::setPacing( u64 hostCyclesPerSecond, u32 emulatedHz )
 void CC64Memory::resyncPacing()
 {
 	m_PacingDebtCycles = 0;
-	if ( m_C64 )
-		m_PacingAnchor = m_C64->hostCycles();
+	m_PacingAnchor = m_C64 ? m_C64->hostCycles() : 0;
 }
 
 void CC64Memory::tick( u32 nCycles )

@@ -79,7 +79,8 @@ KERNAL with the Pi as the CPU.
       The disk chain alone consumed eleven firmware builds; the fixes that
       mattered: the $D0B2 kernal-window trampoline, immediate speed-register
       pacing, serial-activity-gated mirror suppression (pauses have protocol
-      meaning: >200us means EOI), and border-synchronised display flips.
+      meaning: >200us means EOI), immediate display-register writes, and
+      raster-scheduled mirror drains.
 - [ ] `MVN`/`MVP` range invalidation into the write buffer. A block move into
       shadowed bank 0 can dirty 64KB in one instruction; the buffer currently
       handles that as 65536 individual mirrored writes.

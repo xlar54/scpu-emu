@@ -57,19 +57,24 @@ A bus access costs about twenty emulated cycles. So:
   - *optimization modes* — the SuperCPU's own mechanism for declaring which
     regions the VIC actually reads, so the rest is never mirrored at all.
 
-One ordering rule keeps this correct: **the buffer is flushed before any I/O
-access.** Without it a program could stage a screen and then flip `$D011` to it
-while the data is still buffered. Enforced in `c64_memory.cpp` and tested in
-`Tests/Integration/test_kernal_boot.cpp`.
+Ordinary I/O never flushes this buffer synchronously: doing that issued bursts
+across visible VIC-II fetches and caused flicker. The frame scheduler drains
+queued RAM in at most 64-byte chunks, rechecking the raster before every chunk;
+display-register writes remain immediate, so raster programs keep their exact
+timing. Rewriting one of the possible sprite-pointer bytes moves that commit
+behind the newer shape data, so the physical VIC cannot select that data before
+it has reached C64 DRAM.
 
 ## Boot sequence
 
 1. Circle brings up GPIO, the ARM cycle counter, SD card (`App/main.cpp`).
-2. Read `SCPU/scpu.cfg` for RAD bus timings, snapshot into the cache-resident
+2. Read `SCPU/scpu.cfg` for RAD bus timings and the `CPU_CORE`, `BOOTMAP`, and
+   `JIFFYDOS` selections, then snapshot timings into the cache-resident
    `busTiming` block.
 3. Optionally load `basic.rom` / `kernal.rom` / `chargen.rom` from SD.
-4. Unmount the SD card — the FAT driver takes interrupts and allocates, neither
-   of which is safe once we are driving the bus to a cycle budget.
+4. Unmount the SD card, emit the final startup diagnostics, then mask ARM IRQs.
+   The FAT driver and timer interrupts may preempt or allocate, neither of which
+   is safe once GPIO bus phases have sub-microsecond deadlines.
 5. Reset the C64 and let its KERNAL boot, so `$01` settles at `$37`.
 6. Wait for a badline, assert `/DMA`. The 6510 is now off the bus.
 7. Detect C64 vs C128, PAL vs NTSC.

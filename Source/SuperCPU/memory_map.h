@@ -111,10 +111,11 @@ public:
 		else irq = nmi = false;
 	}
 
-	// True while the serial bus is mid-transaction: the core's run() loop must
-	// tick per instruction then, not in batches, so bus-line edges keep their
-	// paced real-time spacing on the wire.
-	bool fineTicksRequired() const { return m_Bank0 && m_Bank0->iecBusActive(); }
+	// Tick per instruction while IEC is active or bank 0 is effectively at
+	// 1MHz. This covers both the automatic fallback and CMD's explicit $D07A
+	// slow mode; the latter may be in a serial wait even after the activity
+	// timer has expired.
+	bool fineTicksRequired() const { return m_Bank0 && m_Bank0->fineTicksRequired(); }
 	bool nmiAsserted() override { return m_Bank0 ? m_Bank0->nmiFast() : false; }
 	void tick( u32 nCycles ) override { if ( m_Bank0 ) m_Bank0->tickFast( nCycles ); }
 

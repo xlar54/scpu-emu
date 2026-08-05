@@ -93,7 +93,11 @@ static inline u16 c64DisplayLastLine( C64VideoStandard v )
 
 static inline bool c64RasterIsSafeForBulkTransfer( C64VideoStandard v, u16 line )
 {
-	return line < c64DisplayFirstLine( v ) || line > c64DisplayLastLine( v );
+	// A torn $D012/$D011 sample can otherwise look like line 511. Treat every
+	// out-of-range value as unusable; callers must never feed it into unsigned
+	// "lines remaining" arithmetic.
+	return line < c64RasterLines( v )
+	    && ( line < c64DisplayFirstLine( v ) || line > c64DisplayLastLine( v ) );
 }
 
 #endif

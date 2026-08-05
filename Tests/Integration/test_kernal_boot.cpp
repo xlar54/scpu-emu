@@ -140,15 +140,14 @@ TEST( integration_ordinary_io_does_not_flush_the_mirror_buffer )
 
 TEST( integration_display_state_writes_never_flush_synchronously )
 {
-	// The inverse of an earlier contract, and the third revision of this rule;
-	// the history is in c64_memory.cpp. A synchronous flush emits a burst, and
-	// bursts are never display-safe at arbitrary raster positions -- the CMD
-	// splash's raster interrupt toggles $D011 mode bits mid-display by design,
-	// and every "small enough to be safe" threshold turned out to be a per-boot
-	// coin flip on real hardware. Ordering is the border scheduler's job.
-	static const u16 displayRegs[] = { 0xD011, 0xD016, 0xD018, 0xDD00 };
+	// A synchronous flush emits a burst, and bursts are never display-safe at
+	// arbitrary raster positions. Nor may the write wait for a later border:
+	// the CMD splash deliberately toggles $D011 mode bits mid-display, while
+	// sprite multiplexers need every $D015 transition. Preserve immediate I/O
+	// semantics and leave mirror delivery to the frame scheduler.
+	static const u16 displayRegs[] = { 0xD011, 0xD015, 0xD016, 0xD018, 0xDD00 };
 
-	for ( u32 i = 0; i < 4; i++ )
+	for ( u32 i = 0; i < sizeof displayRegs / sizeof displayRegs[ 0 ]; i++ )
 	{
 		const u16 reg = displayRegs[ i ];
 
@@ -378,7 +377,9 @@ TEST( integration_detection_answers_on_both_documented_addresses )
 
 	// $D0B0 is the version/mode register, not the presence flag.
 	CHECK( f.regs.ioRead( 0xD0B0, v ) );
-	CHECK_EQ( v, SCPU_VERSION_V2 );
+	// VICE ORs reset's low optimization flags ($07) into every status read.
+	CHECK_EQ( v & 0xC0, SCPU_VERSION_V2 );
+	CHECK_EQ( v & 0x07, 0x07 );
 
 	// None of it reaches the machine.
 	CHECK_EQ( f.bus.m_Cycles, 0 );
@@ -466,8 +467,9 @@ TEST( integration_status_block_reports_distinct_flags )
 	f.regs.ioWrite( SCPU_REG_SYS_1MHZ_OFF, 0 );
 	CHECK( f.regs.fastMode() );
 
-	// $D0B4: current optimization mode in bits 7-6.
-	f.regs.ioWrite( SCPU_REG_OPT_BASIC, 0 );
+	// $D0B3: the complete optimisation register. Low flags are significant;
+	// $80 maps to the BASIC-only $0400-$07FF range.
+	f.regs.ioWrite( SCPU_REG_OPTIM_V2, 0x80 );
 	CHECK( f.regs.ioRead( 0xD0B4, v ) );
 	CHECK_EQ( v & 0xC0, SCPU_OPTIM_BASIC );
 	CHECK_EQ( f.wb.optMode(), SCPU_OPT_BASIC );
@@ -510,6 +512,102 @@ TEST( integration_status_block_reports_distinct_flags )
 	CHECK_EQ( v & 0xC0, 0x40 );
 }
 
+TEST( integration_d0b5_defaults_on_and_bit7_is_a_writable_virtual_jiffy_switch )
+{
+	SystemFixture f;
+	f.start();
+	f.regs.setSpeedSwitchAllowsTurbo( false );
+
+	u8 v = 0;
+	CHECK( f.regs.ioRead( SCPU_REG_SWITCHES, v ) );
+	CHECK_EQ( v & SCPU_SWITCH_JIFFYDOS, SCPU_SWITCH_JIFFYDOS );
+	CHECK_EQ( v & SCPU_SWITCH_1MHZ, SCPU_SWITCH_1MHZ );
+
+	// This emulator-only switch is deliberately usable as a direct BASIC POKE.
+	// $D07E must not be required: opening that bank also swaps KERNAL windows
+	// immediately and can strand BASIC or an IRQ in mismatched KERNAL code.
+	CHECK( !f.regs.hardwareRegsEnabled() );
+	f.mem.write8( SCPU_REG_SWITCHES, 0 );
+	CHECK( !f.regs.hardwareRegsEnabled() );
+	CHECK( f.regs.ioRead( SCPU_REG_SWITCHES, v ) );
+	CHECK_EQ( v & SCPU_SWITCH_JIFFYDOS, 0x00 );
+	CHECK_EQ( v & SCPU_SWITCH_1MHZ, SCPU_SWITCH_1MHZ );
+	CHECK_EQ( f.bus.m_Cycles, 0 );
+
+	// Reset changes register state, not a physical/virtual switch position.
+	f.regs.reset();
+	CHECK( f.regs.ioRead( SCPU_REG_SWITCHES, v ) );
+	CHECK_EQ( v & SCPU_SWITCH_JIFFYDOS, 0x00 );
+
+	f.mem.write8( SCPU_REG_SWITCHES, SCPU_SWITCH_JIFFYDOS );
+	CHECK( f.regs.ioRead( SCPU_REG_SWITCHES, v ) );
+	CHECK_EQ( v & SCPU_SWITCH_JIFFYDOS, SCPU_SWITCH_JIFFYDOS );
+	CHECK_EQ( v & SCPU_SWITCH_1MHZ, SCPU_SWITCH_1MHZ );
+	CHECK( !f.regs.hardwareRegsEnabled() );
+}
+
+TEST( integration_configured_jiffy_switch_survives_supercpu_init_and_reset )
+{
+	CHostBus bus;
+	CSuperCPU scpu;
+	u8 basic[ C64_BASIC_SIZE ];
+	u8 kernal[ C64_KERNAL_SIZE ];
+	std::memset( basic, 0xEA, sizeof basic );
+	std::memset( kernal, 0xEA, sizeof kernal );
+	kernal[ 0x1FFC ] = 0x00;
+	kernal[ 0x1FFD ] = 0xE0;
+	scpu.setBasicROM( basic );
+	scpu.setKernalROM( kernal );
+
+	// boot.cpp applies JIFFYDOS before init(); init() performs a reset, which
+	// must preserve the configured virtual switch just like physical hardware.
+	scpu.registers().setJiffyDOSSwitch( false );
+	CHECK( scpu.init( &bus, SCPU_CORE_6502, 0 ) );
+
+	u8 v = 0;
+	CHECK( scpu.registers().ioRead( SCPU_REG_SWITCHES, v ) );
+	CHECK_EQ( v & SCPU_SWITCH_JIFFYDOS, 0x00 );
+	scpu.reset();
+	CHECK( scpu.registers().ioRead( SCPU_REG_SWITCHES, v ) );
+	CHECK_EQ( v & SCPU_SWITCH_JIFFYDOS, 0x00 );
+}
+
+TEST( integration_enhanced_optimisation_bits_select_the_vice_mirror_ranges )
+{
+	SystemFixture f;
+	const u8 code[] = { 0xEA };
+	f.installKernal( 0xE000, code, sizeof( code ), 0xE000 );
+	f.start();
+
+	// Hardware reset is $C7, which VICE maps to $0200-$FFFF.
+	CHECK_EQ( f.regs.optimRegister(), 0xC7 );
+	CHECK_EQ( f.wb.optMode(), SCPU_OPT_DEFAULT );
+	CHECK( !f.wb.shouldMirror( 0x01FF ) );
+	CHECK(  f.wb.shouldMirror( 0x0200 ) );
+
+	f.regs.ioWrite( SCPU_REG_HWREGS_ENABLE, 0 );
+
+	f.regs.ioWrite( SCPU_REG_OPTIM_V2, 0x84 );	// VICE mirror index 10: empty
+	CHECK_EQ( f.wb.optMode(), SCPU_OPT_FULL );
+	CHECK( !f.wb.shouldMirror( 0x0400 ) );
+
+	f.regs.ioWrite( SCPU_REG_OPTIM_V2, 0xC1 );	// index 13: $0200-$FFFF
+	CHECK_EQ( f.wb.optMode(), SCPU_OPT_DEFAULT );
+	CHECK( !f.wb.shouldMirror( 0x01FF ) );
+	CHECK(  f.wb.shouldMirror( 0x0200 ) );
+
+	f.regs.ioWrite( SCPU_REG_OPTIM_V2, 0x04 );	// index 2: $0000-$3FFF
+	CHECK_EQ( f.wb.optMode(), SCPU_OPT_VICBANK0 );
+	CHECK(  f.wb.shouldMirror( 0x0000 ) );
+	CHECK(  f.wb.shouldMirror( 0x3FFF ) );
+	CHECK( !f.wb.shouldMirror( 0x4000 ) );
+
+	f.regs.ioWrite( SCPU_REG_OPTIM_V2, 0x44 );	// index 6: $C000-$FFFF
+	CHECK_EQ( f.wb.optMode(), SCPU_OPT_VICBANK3 );
+	CHECK( !f.wb.shouldMirror( 0xBFFF ) );
+	CHECK(  f.wb.shouldMirror( 0xC000 ) );
+}
+
 TEST( integration_low_optim_bits_appear_in_every_status_read )
 {
 	// VICE ORs the low three bits of the optimization register into every read
@@ -548,6 +646,7 @@ TEST( integration_hardware_registers_gate_the_optimisation_selects )
 	f.regs.ioWrite( SCPU_REG_HWREGS_ENABLE, 0 );
 	f.regs.ioWrite( SCPU_REG_OPT_BASIC, 0 );
 	CHECK_EQ( f.wb.optMode(), SCPU_OPT_BASIC );
+	CHECK_EQ( f.regs.optimRegister() & 0x07, 0x00 );
 
 	// Speed selection is NOT gated -- that is what makes POKE 53370,0 work
 	// straight from BASIC without opening the bank first.
@@ -556,6 +655,19 @@ TEST( integration_hardware_registers_gate_the_optimisation_selects )
 	CHECK( !f.regs.fastMode() );
 	f.regs.ioWrite( SCPU_REG_SOFT_1MHZ_OFF, 0 );
 	CHECK( f.regs.fastMode() );
+}
+
+TEST( integration_register_attach_applies_the_power_on_mirror_policy )
+{
+	CWriteBuffer wb;
+	wb.setOptMode( SCPU_OPT_FULL );
+	CSuperCPURegisters regs;
+	regs.attach( &wb );
+
+	CHECK_EQ( regs.optimRegister(), 0xC7 );
+	CHECK_EQ( wb.optMode(), SCPU_OPT_DEFAULT );
+	CHECK( !wb.shouldMirror( 0x0100 ) );
+	CHECK( wb.shouldMirror( 0x0200 ) );
 }
 
 TEST( integration_cia2_port_a_write_arms_the_iec_throttle )
@@ -574,10 +686,10 @@ TEST( integration_cia2_port_a_write_arms_the_iec_throttle )
 	CHECK( !f.mem.iecThrottleActive() );
 
 	f.cpu.step();		// LDA
-	f.cpu.step();		// first STA establishes the CIA2 output baseline
-	CHECK( !f.mem.iecThrottleActive() );
+	f.cpu.step();		// first STA: unknown pin state is conservatively active
+	CHECK( f.mem.iecThrottleActive() );
 	f.cpu.step();
-	f.cpu.step();		// IEC bit change arms the fallback
+	f.cpu.step();		// IEC bit change refreshes the fallback
 
 	CHECK( f.mem.iecThrottleActive() );
 	CHECK_EQ( f.mem.m_IECThrottleEvents, 1 );
@@ -626,14 +738,74 @@ TEST( integration_iec_throttle_can_be_disabled )
 TEST( integration_vic_bank_changes_do_not_arm_iec_throttle )
 {
 	SystemFixture f;
-	const u8 code[] = { 0xA9, 0x37, 0x8D, 0x00, 0xDD,
-	                    0xA9, 0x36, 0x8D, 0x00, 0xDD };
-	f.installKernal( 0xE000, code, sizeof( code ), 0xE000 );
 	f.start();
-	f.cpu.run( 12 );
+
+	// Establish both hidden CIA baselines, then let the conservative first-write
+	// window expire. With PA3-PA5 configured as outputs, changing only PA0/PA1
+	// (the VIC bank) must not look like serial traffic.
+	f.mem.write8( 0xDD02, 0x3F );
+	f.mem.write8( 0xDD00, 0x37 );
+	for ( u32 i = 0; i < 110000; i++ ) f.mem.tickFast( 1 );
+	CHECK( !f.mem.iecThrottleActive() );
+	const u64 events = f.mem.m_IECThrottleEvents;
+
+	f.mem.write8( 0xDD00, 0x36 );
 
 	CHECK( !f.mem.iecThrottleActive() );
-	CHECK_EQ( f.mem.m_IECThrottleEvents, 0 );
+	CHECK_EQ( f.mem.m_IECThrottleEvents, events );
+}
+
+TEST( integration_cia2_receive_inputs_are_active_low )
+{
+	SystemFixture f;
+	f.start();
+
+	// PA6/PA7 are inputs. Both high is the idle IEC bus and must not start a
+	// transaction merely because software sampled it.
+	f.bus.m_Memory[ 0xDD02 ] = 0x00;
+	CHECK_EQ( f.mem.read8( 0xDD02 ), 0x00 );
+	f.bus.m_Memory[ 0xDD00 ] = 0xFF;
+	CHECK_EQ( f.mem.read8( 0xDD00 ), 0xFF );
+	CHECK( !f.mem.iecBusActive() );
+
+	// DATA-IN low means the drive asserted the line. This is the state seen in
+	// the hardware freeze as $DD00=$3F (both receive inputs low).
+	f.bus.m_Memory[ 0xDD00 ] = 0x7F;
+	CHECK_EQ( f.mem.read8( 0xDD00 ), 0x7F );
+	CHECK( f.mem.iecBusActive() );
+}
+
+TEST( integration_cia2_held_receive_line_refreshes_activity )
+{
+	SystemFixture f;
+	f.start();
+	f.bus.m_Memory[ 0xDD02 ] = 0x00;
+	f.mem.read8( 0xDD02 );
+	f.bus.m_Memory[ 0xDD00 ] = 0x7F;
+	f.mem.read8( 0xDD00 );
+
+	// Let the original 50ms activity window expire almost completely, then a
+	// repeated poll of the still-low line must extend the live transaction.
+	for ( u32 i = 0; i < 90000; i++ ) f.mem.tickFast( 1 );
+	f.mem.read8( 0xDD00 );
+	for ( u32 i = 0; i < 20000; i++ ) f.mem.tickFast( 1 );
+	CHECK( f.mem.iecBusActive() );
+}
+
+TEST( integration_dd02_direction_change_can_start_iec_activity )
+{
+	SystemFixture f;
+	f.start();
+
+	// Store a high ATN latch while PA3 is an input: no physical drive yet.
+	f.mem.write8( 0xDD02, 0x00 );
+	f.mem.write8( 0xDD00, 0x08 );
+	for ( u32 i = 0; i < 110000; i++ ) f.mem.tickFast( 1 );
+	CHECK( !f.mem.iecBusActive() );
+
+	// Making PA3 an output now asserts the inverted open-collector line.
+	f.mem.write8( 0xDD02, 0x08 );
+	CHECK( f.mem.iecBusActive() );
 }
 
 TEST( integration_cia2_read_provides_iec_throttle_baseline )
@@ -709,10 +881,21 @@ TEST( integration_reset_expires_iec_and_refreshes_interrupt_cache )
 	mem.write8( 0xDD00, 0x07 );
 	mem.write8( 0xDD00, 0x17 );
 	CHECK( mem.iecThrottleActive() );
+	mem.tickFast( 7 );
+	CHECK( mem.m_EmuCycles > 0 );
+	CHECK( mem.m_MaxTickChunk > 0 );
+	CHECK( mem.m_IOLogPos > 0 );
+	CHECK( mem.m_CIALogPos > 0 );
 
 	bus.m_NMI = false;
 	mem.reset();
 	CHECK( !mem.iecThrottleActive() );
+	CHECK( !mem.iecBusActive() );
+	CHECK_EQ( mem.m_IECThrottleEvents, 0 );
+	CHECK_EQ( mem.m_EmuCycles, 0 );
+	CHECK_EQ( mem.m_MaxTickChunk, 0 );
+	CHECK_EQ( mem.m_IOLogPos, 0 );
+	CHECK_EQ( mem.m_CIALogPos, 0 );
 	CHECK( !mem.nmiAsserted() );
 	CHECK_EQ( bus.samples, 2 );
 }
@@ -829,12 +1012,12 @@ TEST( integration_iec_activity_window_expires )
 	CHECK( !f.mem.iecBusActive() );
 }
 
-TEST( integration_display_flip_with_bulk_pending_flushes_at_border )
+TEST( integration_bulk_display_flip_never_waits_or_flushes_synchronously )
 {
-	// The synthesis rule: a display-state change with real data pending holds
-	// the write until the raster is in the border, drains there, then lands.
-	// Ordered AND raster-safe -- see the note in c64_memory.cpp. Small buffers
-	// (<=8) skip the wait entirely, which the never-flush test above pins.
+	// Raster IRQ code changes these registers at exact scanlines. Delaying the
+	// I/O write while polling toward a border changes program semantics and the
+	// polling itself consumes the physical bus through visible VIC fetches.
+	// Large queues therefore follow the same immediate-write rule as small ones.
 	SystemFixture f;
 	const u8 code[] = { 0xA9, 0x3B, 0x8D, 0x18, 0xD0 };	// LDA #$3B / STA $D018
 	f.installKernal( 0xE000, code, sizeof( code ), 0xE000 );
@@ -844,11 +1027,95 @@ TEST( integration_display_flip_with_bulk_pending_flushes_at_border )
 	// Stage a bitmap's worth of data -- well past the trivial threshold.
 	for ( u32 i = 0; i < 100; i++ ) f.mem.write8( (u16)( 0x2000 + i ), (u8)i );
 	CHECK( f.wb.pending() >= 100 );
+	f.bus.resetStats();
 
 	f.cpu.step(); f.cpu.step();		// LDA, then the flip
 
-	// The flip waited for the border and drained everything first.
-	CHECK_EQ( f.wb.pending(), 0 );
-	CHECK_EQ( f.bus.m_Memory[ 0x2000 ], 0 );
+	CHECK_EQ( f.wb.pending(), 100 );
+	CHECK_EQ( f.bus.m_Reads, 0 );		// no raster polling
+	CHECK_EQ( f.bus.m_Writes, 1 );		// only the direct $D018 write
+	CHECK_EQ( f.bus.m_Memory[ 0xD018 ], 0x3B );
+
+	// The normal raster scheduler (represented here by an explicit test drain)
+	// owns delivery of the queued RAM bytes.
+	f.wb.flush();
 	CHECK_EQ( f.bus.m_Memory[ 0x2063 ], 0x63 );
+}
+
+TEST( integration_unknown_raster_never_authorizes_a_flush )
+{
+	struct UnknownRasterBus : CHostBus
+	{
+		u32 samples = 0;
+		u16 rasterLine() override { samples++; return 0xFFFF; }
+	} bus;
+
+	CSuperCPU scpu;
+	u8 basic[ C64_BASIC_SIZE ];
+	u8 kernal[ C64_KERNAL_SIZE ];
+	std::memset( basic, 0xEA, sizeof basic );
+	std::memset( kernal, 0xEA, sizeof kernal );
+	kernal[ 0 ] = 0x4C;		// JMP $E000
+	kernal[ 1 ] = 0x00;
+	kernal[ 2 ] = 0xE0;
+	kernal[ 0x1FFC ] = 0x00;
+	kernal[ 0x1FFD ] = 0xE0;
+	scpu.setBasicROM( basic );
+	scpu.setKernalROM( kernal );
+	CHECK( scpu.init( &bus, SCPU_CORE_6502, 0 ) );
+	scpu.writeBuffer().setOptMode( SCPU_OPT_NONE );
+
+	for ( u32 i = 0; i < 100; i++ )
+		scpu.memory().write8( (u16)( 0x2000 + i ), (u8)i );
+	bus.resetStats();
+
+	scpu.runFrame();
+	CHECK( bus.samples > 0 );
+	CHECK_EQ( bus.m_BurstWrites, 0 );
+	CHECK_EQ( scpu.writeBuffer().pending(), 100 );
+
+	CHECK( !c64RasterIsSafeForBulkTransfer( VIDEO_PAL, 0xFFFF ) );
+	CHECK( !c64RasterIsSafeForBulkTransfer( VIDEO_PAL, 312 ) );
+	CHECK( !c64RasterIsSafeForBulkTransfer( VIDEO_NTSC_R56A, 511 ) );
+}
+
+TEST( integration_mirror_drain_rechecks_raster_before_each_small_chunk )
+{
+	struct OneSafeSampleBus : CHostBus
+	{
+		u32 samples = 0;
+		u16 rasterLine() override
+		{
+			// The first sample is in the top border. Every later sample is in
+			// the visible display, so exactly one guarded chunk may leave.
+			return samples++ == 0 ? 0 : 100;
+		}
+	} bus;
+
+	CSuperCPU scpu;
+	u8 basic[ C64_BASIC_SIZE ];
+	u8 kernal[ C64_KERNAL_SIZE ];
+	std::memset( basic, 0xEA, sizeof basic );
+	std::memset( kernal, 0xEA, sizeof kernal );
+	kernal[ 0 ] = 0x4C;              // JMP $E000
+	kernal[ 1 ] = 0x00;
+	kernal[ 2 ] = 0xE0;
+	kernal[ 0x1FFC ] = 0x00;
+	kernal[ 0x1FFD ] = 0xE0;
+	scpu.setBasicROM( basic );
+	scpu.setKernalROM( kernal );
+	CHECK( scpu.init( &bus, SCPU_CORE_6502, 0 ) );
+	scpu.writeBuffer().setOptMode( SCPU_OPT_NONE );
+
+	for ( u32 i = 0; i < 200; i++ )
+		scpu.memory().write8( (u16)( 0x2000 + i ), (u8)i );
+	CHECK_EQ( scpu.writeBuffer().pending(), 200 );
+	bus.resetStats();
+	bus.samples = 0;
+
+	scpu.runFrame();
+
+	CHECK( bus.samples > 1 );
+	CHECK_EQ( bus.m_BurstWrites, 64 );
+	CHECK_EQ( scpu.writeBuffer().pending(), 136 );
 }

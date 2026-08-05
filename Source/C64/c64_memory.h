@@ -333,11 +333,23 @@ public:
 	//
 	// A real SuperCPU has exactly this problem and solves it the same way: CMD
 	// document that it "always throttles to 1MHz for disk access regardless of
-	// the speed setting". Writing to CIA2 port A -- which carries ATN, CLK and
-	// DATA -- arms a hold-off, during which pacing runs at 1MHz whatever speed
-	// the accelerator is nominally set to.
+	// the speed setting". Changes to CIA2's IEC outputs, receive-side activity,
+	// and DDRA transitions arm a hold-off during which pacing runs at 1MHz
+	// whatever speed the accelerator is nominally set to.
 	void setIECThrottle( bool enabled ) { m_IECThrottleEnabled = enabled; }
 	bool iecThrottleActive() const { return m_IECHoldCycles > 0; }
+
+	// The 65816 normally batches several instructions before ticking the C64
+	// bus. That is safe at turbo speed, but not at an effective/selected 1MHz:
+	// IEC code depends on the real-time spacing between individual
+	// instructions even when CMD selected slow mode itself (and therefore the
+	// automatic throttle timer is not armed).
+	bool fineTicksRequired() const
+	{
+		return m_IECHoldCycles != 0 || m_IECActivityCycles != 0
+		    || ( m_SelectedEmulatedHz != 0
+		         && m_SelectedEmulatedHz <= 1000000u );
+	}
 
 	// True while a serial TRANSACTION is in progress, independent of what
 	// speed is selected. This is the flag that suppresses mirror flushing and
@@ -388,9 +400,16 @@ public:
 	// so a test can PROVE the granularity contract instead of trusting it.
 	u32  m_MaxTickChunk = 0;
 private:
-	u8   m_LastCIA2PortA;
-	bool m_HaveCIA2PortA;
-	u8   m_LastVICControl[ 3 ];		// last written $D011 / $D016 / $D018
+	// CIA2 port A has three different pieces of state. A port read contains
+	// live PA6/PA7 input pins, so it must never replace the output-latch
+	// baseline used to recognise PA3-PA5 IEC transitions. DDRA determines
+	// whether a latch change actually reaches the VIC-bank/IEC pins.
+	u8   m_CIA2PortALatch;
+	u8   m_LastCIA2PortARead;
+	u8   m_CIA2DDRA;
+	bool m_HaveCIA2PortALatch;
+	bool m_HaveCIA2PortARead;
+	bool m_HaveCIA2DDRA;
 public:
 	// The last 16 I/O accesses, newest last: addr | value<<16 | (write?1:0)<<24.
 	// Costs a store on the I/O path only -- never on the RAM hot path -- and
@@ -415,7 +434,7 @@ public:
 	// instruction.
 	u64 m_EmuCycles = 0;
 private:
-	u8   m_HaveVICControl;			// bitmask of which of those have a baseline
+	void noteIECActivity();
 	TimingHook m_TimingHook;
 	void      *m_TimingHookCtx;
 };

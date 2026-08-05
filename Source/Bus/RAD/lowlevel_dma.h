@@ -136,7 +136,8 @@ __attribute__( ( always_inline ) ) inline u8 flipByte( u8 x )
 
 #define HANDLE_BUS_AVAILABLE \
 	WAIT_UP_TO_CYCLE( busTiming.TIMING_READ_BA_WRITING );			\
-	/*g2 = read32( ARM_GPIO_GPLEV0 );*/						\
+	/* g2 came from the phase wait and may predate BA becoming valid. */	\
+	g2 = read32( ARM_GPIO_GPLEV0 );							\
 	while ( !( g2 & bBA ) )	{								\
 		WAIT_FOR_CPU_HALFCYCLE								\
 		WAIT_FOR_VIC_HALFCYCLE								\
@@ -273,12 +274,14 @@ void busWriteByteBurst_p1( register u32 &g2, u16 addr, u8 data )
 	CLR_GPIO( ( D_FLAG & ( ~DD ) ) );
 	SET_GPIO( DD );
 
-	/*if ( ( g2 & bBA ) )
+	// A cached BA-low is already conservative. If cached BA says the bus is
+	// available, verify it at the configured in-cycle sampling point before the
+	// write is allowed to proceed; BA may have fallen since the phase wait.
+	if ( ( g2 & bBA ) )
 	{
 		WAIT_UP_TO_CYCLE( busTiming.TIMING_READ_BA_WRITING );			
 		g2 = read32( ARM_GPIO_GPLEV0 );
-	}*/
-//		WAIT_UP_TO_CYCLE( busTiming.TIMING_READ_BA_WRITING );			
+	}
 	u8 resync = 0;
 	while ( !( g2 & bBA ) )	
 	{
@@ -378,4 +381,3 @@ void busWriteByte_p2( register u32 &g2, bool releaseDMA )
 	WAIT_UP_TO_CYCLE( busTiming.TIMING_DATA_HOLD );
 	DISABLE_ADDRESS_LATCH_AND_BUSTRANSCEIVER( releaseDMA )
 }
-

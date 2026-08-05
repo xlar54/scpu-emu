@@ -330,3 +330,31 @@ TEST( integration_run_ticks_per_instruction_while_iec_active )
 	CHECK( m.mem.iecBusActive() );
 	CHECK( m.mem.m_MaxTickChunk <= 3 );
 }
+
+TEST( integration_run_ticks_per_instruction_while_speed_is_explicitly_1mhz )
+{
+	Machine816 m;
+	if ( !m.haveROMs ) { std::printf( "(skipped: no ROMs) " ); return; }
+	m.cpu.attachFastBus( &m.map );
+
+	for ( u32 i = 0; i < 16; i++ ) m.mem.m_RAM[ 0x1000 + i ] = 0xEA;
+	m.mem.m_RAM[ 0x1010 ] = 0x4C;
+	m.mem.m_RAM[ 0x1011 ] = 0x00;
+	m.mem.m_RAM[ 0x1012 ] = 0x10;
+	m.cpu.m_PBR = 0x00;
+	m.cpu.m_PC  = 0x1000;
+	m.cpu.m_P  |= W65_I;
+
+	// CMD selects 1MHz itself before some serial waits, so the automatic IEC
+	// timer can legitimately be quiet while instruction-level pacing is still
+	// required.
+	m.mem.setPacing( 0, 1000000u );
+	m.mem.m_MaxTickChunk = 0;
+	m.cpu.run( 400 );
+	CHECK( m.mem.m_MaxTickChunk <= 3 );
+
+	m.mem.setPacing( 0, 20000000u );
+	m.mem.m_MaxTickChunk = 0;
+	m.cpu.run( 400 );
+	CHECK( m.mem.m_MaxTickChunk > 8 );
+}

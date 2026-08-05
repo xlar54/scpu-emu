@@ -92,7 +92,7 @@ Documentation warns that software should toggle these promptly to avoid
 conflicts — while open, `$D074-$D079` are stolen from whatever else might decode
 there.
 
-## Status block, `$D0B0-$D0BF` (read)
+## Status block, `$D0B0-$D0BF` (read, selected writes)
 
 **This is not a mirrored block** — each address carries distinct flags. Earlier
 notes here treated it as a single status byte; the SuperCPU 128 register list
@@ -108,6 +108,27 @@ corrected that. Implemented in full.
 | `$D0B6` | 53430 | bit7 processor emulation mode, bit6 reset switch (v1) | **confirmed** |
 | `$D0B8` | 53432 | bit7 software speed flag, bit6 master speed flag (1 = Normal) | **confirmed** |
 | `$D0BC` | 53436 | bit7 DOS extension mode, bit6 RAMLink registers | **confirmed** |
+
+On a physical SuperCPU `$D0B5` reports switches and VICE treats writes as a
+no-op. SCPU-EMU has no JiffyDOS switch input, so it intentionally adds one
+software control: writing `$D0B5` directly sets the virtual Jiffy switch from
+bit 7. Bit 6 remains read-only. From BASIC:
+
+```basic
+POKE 53429,128 : REM JIFFY ON
+POKE 53429,0   : REM JIFFY OFF
+```
+
+Do not open the hardware-register bank with `POKE 53374,0` for this. `$D07E`
+also swaps the active KERNAL window immediately, so it is not a safe BASIC
+configuration wrapper. The direct `$D0B5` write is deliberately the exception
+to the normal bank gating of writable `$D0Bx` controls.
+
+At Pi startup, `JIFFYDOS 1` or `JIFFYDOS 0` in `SCPU/scpu.cfg` sets the initial
+position; the built-in default is enabled. A direct `$D0B5` POKE overrides that
+position and persists across an emulated reset, matching a physical switch. A
+Pi reboot reads `scpu.cfg` again. Reset the emulated C64 after changing the
+switch so CMD's boot code installs the selected KERNAL image.
 
 `$D0B0` bits 7-6:
 

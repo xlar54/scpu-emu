@@ -141,7 +141,10 @@ bool CSuperCPU::init( IC64Bus *bus, SCPUCoreType core, u32 simmMB )
 
 void CSuperCPU::reset()
 {
-	m_WriteBuffer.flush();
+	// A reset invalidates the old program's staged display writes. Sending them
+	// now would be an unbounded burst at an arbitrary raster position, followed
+	// immediately by clearing the shadow anyway.
+	m_WriteBuffer.discard();
 	m_Memory.reset();
 
 	// Bootmap, before the registers are reset -- CSuperCPURegisters::reset()
@@ -188,11 +191,9 @@ void CSuperCPU::reset()
 
 	m_Registers.reset();
 
-	// Put the mirroring policy back to its power-on state too, or a reset would
-	// inherit whatever optimization mode the previous program happened to leave
-	// selected.
-	m_WriteBuffer.setExcludeZeroPageStack( true );
-	m_WriteBuffer.setOptMode( SCPU_OPT_DEFAULT );
+	// CSuperCPURegisters::reset() applied the hardware's $C7 power-on mirror
+	// policy. Do not override it out of band: the value reported at $D0B3/$D0B4
+	// and the policy actually used by the buffer must remain the same state.
 	m_WriteBuffer.resetStats();
 
 	m_Memory.resyncPacing();
@@ -282,6 +283,44 @@ u32 CSuperCPU::currentClockHz() const
 	return m_Registers.turboEnabled() ? SCPU_TURBO_HZ : SCPU_NORMAL_HZ;
 }
 
+// Drain mirrored RAM only in small, independently raster-guarded bursts. A
+// single border sample cannot safely authorize thousands of writes: sprite DMA,
+// badlines and ordinary beam progress can consume that window while the burst is
+// still running. Re-sampling before every chunk lets the physical VIC stop us as
+// soon as the display becomes active again.
+static void flushMirrorsWhileRasterSafe( CWriteBuffer &buffer, IC64Bus &bus,
+                                         const C64Signals &sig )
+{
+	const u32 perLine = c64CyclesPerLine( sig.video );
+	const u32 lines   = c64RasterLines( sig.video );
+	const u32 maxChunk = 64;
+
+	while ( !buffer.empty() )
+	{
+		const u16 line = bus.rasterLine();
+		if ( !c64RasterIsSafeForBulkTransfer( sig.video, line ) )
+			break;
+
+		// Recompute the time left from this fresh sample. Below the display the
+		// window includes bottom border, vertical blank and top border; above it,
+		// only the remaining top border is available.
+		const u32 linesLeft = ( line > c64DisplayLastLine( sig.video ) )
+		                    ? ( lines - line ) + c64DisplayFirstLine( sig.video )
+		                    : c64DisplayFirstLine( sig.video ) - line;
+		const u32 budgetBytes = ( linesLeft * perLine * 3 ) / 4;
+		if ( budgetBytes == 0 )
+			break;
+
+		const u32 chunk = budgetBytes < maxChunk ? budgetBytes : maxChunk;
+		const u32 before = buffer.pending();
+		buffer.flushUpTo( chunk );
+
+		// A detached or failing sink must not turn this safety loop into a spin.
+		if ( buffer.pending() >= before )
+			break;
+	}
+}
+
 u64 CSuperCPU::runFrame()
 {
 	if ( !m_CPU || !m_Bus )
@@ -310,9 +349,9 @@ u64 CSuperCPU::runFrame()
 	// the safe border window by luck -- roughly a third of the time. Screen
 	// writes then reach the C64 in visible ~quarter-second bursts. Eight
 	// chances per frame instead of one makes hitting the border a near
-	// certainty, at the cost of one raster read per slice.
+	// certainty. Once a safe window is found, the helper below rechecks the
+	// raster between every small transfer chunk.
 	const u64 sliceTicks = frameTicks / 8;
-	const u32 perLine = c64CyclesPerLine( sig.video );
 
 	while ( ticksUsed < frameTicks )
 	{
@@ -347,18 +386,7 @@ u64 CSuperCPU::runFrame()
 		// always wait 100ms; the serial bus cannot.
 		if ( !m_Memory.iecBusActive()
 		     && !m_WriteBuffer.empty() && ticksUsed < frameTicks )
-		{
-			const u16 line = m_Bus->rasterLine();
-			if ( line != 0xFFFF
-			     && c64RasterIsSafeForBulkTransfer( sig.video, line ) )
-			{
-				const u32 lines = c64RasterLines( sig.video );
-				u32 linesLeft = ( line > c64DisplayLastLine( sig.video ) )
-				              ? ( lines - line ) + c64DisplayFirstLine( sig.video )
-				              : c64DisplayFirstLine( sig.video ) - line;
-				m_WriteBuffer.flushUpTo( ( linesLeft * perLine * 3 ) / 4 );
-			}
-		}
+			flushMirrorsWhileRasterSafe( m_WriteBuffer, *m_Bus, sig );
 	}
 
 	// --- raster-scheduled mirroring ----------------------------------------
@@ -370,49 +398,10 @@ u64 CSuperCPU::runFrame()
 	// many scanlines its transfer needs and waits so it lands in the border and
 	// vertical blank.
 	//
-	// So: wait for the beam to leave the display window, then send only as much
-	// as fits in the time remaining before it comes back.
+	// So: send only when the sampled beam is already outside the display window,
+	// and only as much as fits before it comes back.
 	if ( !m_WriteBuffer.empty() && !m_Memory.iecBusActive() )
-	{
-		const u32 perLine = c64CyclesPerLine( sig.video );
-		const u32 lines   = c64RasterLines( sig.video );
-
-		// Look once, briefly. Each poll costs two bus cycles, and the previous
-		// version was willing to spend 400 of them -- up to 800us per frame with
-		// the CPU stopped dead, which showed up as visible stuttering.
-		//
-		// If the beam is not somewhere useful within a short look, give up and
-		// try next frame. Nothing is lost: the buffer holds its contents, the
-		// safe window is over a third of every frame, and the CPU keeps running
-		// in the meantime, which matters more than flushing promptly.
-		u16 line = 0;
-		bool safe = false;
-		for ( u32 poll = 0; poll < 24; poll++ )
-		{
-			line = m_Bus->rasterLine();
-			if ( line == 0xFFFF ) break;			// backend cannot tell
-			if ( c64RasterIsSafeForBulkTransfer( sig.video, line ) ) { safe = true; break; }
-		}
-
-		if ( safe )
-		{
-			// Lines left before the display window resumes. Below the window we
-			// have the bottom border, the vertical blank and the top border;
-			// above it, only the remaining top border.
-			u32 linesLeft = ( line > c64DisplayLastLine( sig.video ) )
-			              ? ( lines - line ) + c64DisplayFirstLine( sig.video )
-			              : c64DisplayFirstLine( sig.video ) - line;
-
-			// One byte per C64 cycle, less a margin so the transfer finishes
-			// before the display resumes rather than running into it.
-			u32 budgetBytes = ( linesLeft * perLine * 3 ) / 4;
-
-			m_WriteBuffer.flushUpTo( budgetBytes );
-		} else if ( line == 0xFFFF )
-		{
-			m_WriteBuffer.flush();				// host backend: no raster to respect
-		}
-	}
+		flushMirrorsWhileRasterSafe( m_WriteBuffer, *m_Bus, sig );
 
 	// Pacing is no longer done here. It happens after every instruction in
 	// CC64Memory::tick(), because frame granularity (~20ms) is far too coarse

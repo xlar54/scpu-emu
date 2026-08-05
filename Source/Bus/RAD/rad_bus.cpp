@@ -478,11 +478,30 @@ u64 CRADBus::hostCycles()
 u16 CRADBus::rasterLine()
 {
 	register u32 g2;
-	u8 lo = 0, hi = 0;
+	const u16 rasterLines = (u16)c64RasterLines( m_Signals.video );
 
-	RAD_SPEEK( 0xD012, lo );
-	RAD_SPEEK( 0xD011, hi );
-	m_Reads += 2;
+	// $D012 contains the low eight raster bits and $D011 bit 7 contains bit 8.
+	// Reading low then high can straddle either the 255 -> 256 transition or
+	// the end-of-frame wrap and manufacture a line which never existed (most
+	// notably $1FF). Bracket the low byte with two high-bit reads and accept the
+	// sample only when both sides agree. The range check is a second line of
+	// defence and also keeps a bad bus read out of the transfer scheduler.
+	for ( u32 attempt = 0; attempt < 4; attempt++ )
+	{
+		u8 hiBefore = 0, lo = 0, hiAfter = 0;
 
-	return (u16)( lo | ( ( hi & 0x80 ) ? 0x100 : 0 ) );
+		RAD_SPEEK( 0xD011, hiBefore );
+		RAD_SPEEK( 0xD012, lo );
+		RAD_SPEEK( 0xD011, hiAfter );
+		m_Reads += 3;
+
+		if ( ( ( hiBefore ^ hiAfter ) & 0x80 ) != 0 )
+			continue;
+
+		const u16 line = (u16)( lo | ( ( hiAfter & 0x80 ) ? 0x100 : 0 ) );
+		if ( line < rasterLines )
+			return line;
+	}
+
+	return 0xFFFF;
 }

@@ -11,7 +11,7 @@ keeping the SCPU/ subdirectory.
   config.txt         Pi boot configuration -- READ THE NOTE BELOW
   kernel8.img        SCPU-EMU firmware
 
-  SCPU/scpu.cfg      RAD bus timings
+  SCPU/scpu.cfg      RAD bus timings and SuperCPU/JiffyDOS selections
   SCPU/kernal.rom    stock C64 KERNAL
   SCPU/basic.rom     stock C64 BASIC
   SCPU/chargen.rom   stock C64 character generator
@@ -51,7 +51,9 @@ ABOUT THE ROM FILES
 -------------------
 Keep them. With kernal.rom present, SCPU-EMU runs that image and never executes
 your machine's own KERNAL, so it does not matter what is fitted -- including
-JiffyDOS, which does not need to be disabled.
+JiffyDOS, which does not need to be disabled. When SCPU/scpu.rom is present,
+the virtual SuperCPU switch is selected in SCPU/scpu.cfg with JIFFYDOS 1
+(enabled, the default) or JIFFYDOS 0 (disabled).
 
 Deleting them makes SCPU-EMU read BASIC and KERNAL off your running machine
 instead. That is the more faithful option eventually, but not for a first

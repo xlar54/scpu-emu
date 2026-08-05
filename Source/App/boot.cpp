@@ -33,6 +33,7 @@
 #include "boot.h"
 #include <circle/actled.h>
 #include <circle/startup.h>
+#include <circle/synchronize.h>
 
 #include "../Common/config.h"
 #include "../Common/helpers.h"
@@ -49,15 +50,51 @@ static bool radBusButtonPressed();
 static bool radBusHardwareResetPressed();
 static void radBusSampleInterrupts( bool &irq, bool &nmi );
 
-// Bare metal: no snprintf. Enough formatter for the freeze dumps.
-static int scpuHexByte( char *dst, u8 v )
+// Bare metal: no snprintf. Keep every freeze-dump append explicitly bounded:
+// a CIA timing row can be about 240 characters, substantially more than the
+// old 128-byte scratch buffer allowed.
+static const u32 SCPU_DUMP_LINE_SIZE = 256;
+
+static void scpuLineStart( char *dst, u32 capacity, u32 &length )
+{
+	length = 0;
+	if ( capacity ) dst[ 0 ] = 0;
+}
+
+static bool scpuLineChar( char *dst, u32 capacity, u32 &length, char c )
+{
+	if ( !capacity || length + 1 >= capacity )
+		return false;
+	dst[ length++ ] = c;
+	dst[ length ] = 0;
+	return true;
+}
+
+static bool scpuLineHexByte( char *dst, u32 capacity, u32 &length, u8 v )
 {
 	static const char *h = "0123456789ABCDEF";
-	dst[ 0 ] = h[ v >> 4 ]; dst[ 1 ] = h[ v & 15 ]; dst[ 2 ] = ' ';
-	return 3;
+	return scpuLineChar( dst, capacity, length, h[ v >> 4 ] )
+	    && scpuLineChar( dst, capacity, length, h[ v & 15 ] );
+}
+
+static bool scpuLineDecimal( char *dst, u32 capacity, u32 &length, u32 v )
+{
+	char reversed[ 10 ];
+	u32 digits = 0;
+	do
+	{
+		reversed[ digits++ ] = (char)( '0' + v % 10 );
+		v /= 10;
+	} while ( v && digits < sizeof reversed );
+
+	while ( digits )
+		if ( !scpuLineChar( dst, capacity, length, reversed[ --digits ] ) )
+			return false;
+	return true;
 }
 static void scpuWaitForButtonThenReboot();
 static CLogger *s_Logger;
+static bool s_RebootRequested = false;
 
 // Frame hook: reboot the Pi when the RAD's button is pressed, so the card can
 // be swapped and retried without power-cycling anything.
@@ -77,170 +114,319 @@ static CLogger *s_Logger;
 // contaminated several rounds of serial forensics before this existed.
 static u8  s_PreResetDD00 = 0, s_PreResetDD02 = 0;
 static u32 s_PreResetSampleFrame = 0;
+static bool s_PreResetSampleValid = false;
+static const u32 SCPU_RESET_RELEASE_STABLE_SAMPLES = 100000;
+
+// A reset press also resets the physical VIC and CIAs.  Keep the time between
+// noticing /RESET and waiting for its release as short as possible: emitting a
+// multi-line logger dump here used to leave the physical machine released
+// while the emulated CPU was still stopped if the user let go during logging.
+// Everything needed by the dump is therefore copied into this fixed-size
+// snapshot first, and the frame hook emits it later in an IEC-idle frame.
+struct SCPUResetDiagnostic
+{
+	bool pending;
+	bool haveCPU;
+	bool haveCore;
+	bool haveCode;
+	bool preResetSampleValid;
+	u32 pc;
+	u16 sp;
+	u64 cycles;
+	u8  p;
+	u8  e;
+	u32 irqsTaken;
+	u32 nmisTaken;
+	bool liveIRQ;
+	bool liveNMI;
+	u8 stack[ 16 ];
+	u8 code[ 16 ];
+	u32 cia[ 64 ];
+	u32 ciaIntervalEntry[ 16 ];
+	u32 ciaIntervalUS[ 16 ];
+	u32 io[ 64 ];
+	u8 preResetDD00;
+	u8 preResetDD02;
+};
+
+static SCPUResetDiagnostic s_ResetDiagnostic = {};
+static u32 s_ResetDiagnosticQuietFrames = 0;
+static u32 s_HardwareResetGeneration = 0;
+
+static void scpuSnapshotResetDiagnostic( CSuperCPU *scpu )
+{
+	SCPUResetDiagnostic &d = s_ResetDiagnostic;
+	d.pending = false;
+	d.haveCPU = scpu && scpu->cpu();
+	d.haveCore = false;
+	d.haveCode = false;
+	d.preResetSampleValid = s_PreResetSampleValid;
+	d.preResetDD00 = s_PreResetDD00;
+	d.preResetDD02 = s_PreResetDD02;
+
+	if ( !d.haveCPU )
+	{
+		d.pending = true;
+		s_ResetDiagnosticQuietFrames = 0;
+		return;
+	}
+
+	d.pc = (u32)scpu->cpu()->pc();
+	d.sp = scpu->cpu()->stackPointer();
+	d.cycles = scpu->cpu()->cycles();
+
+	if ( CW65C816 *core = scpu->core65816() )
+	{
+		d.haveCore = true;
+		d.p = core->m_P;
+		d.e = core->m_E ? 1 : 0;
+		d.irqsTaken = core->m_IRQsTaken;
+		d.nmisTaken = core->m_NMIsTaken;
+		radBusSampleInterrupts( d.liveIRQ, d.liveNMI );
+	}
+
+	for ( u32 i = 0; i < 16; i++ )
+	{
+		// The 6502 and emulation-mode 65816 wrap S inside page $01. In
+		// native mode S is a full 16-bit bank-0 address.
+		const u16 stackAddr = ( d.haveCore && !d.e )
+		                    ? (u16)( d.sp + i + 1 )
+		                    : (u16)( 0x0100 | ( ( d.sp + i + 1 ) & 0xFF ) );
+		d.stack[ i ] = scpu->memory().m_RAM[ stackAddr ];
+	}
+
+	// This deliberately excludes bank 0's I/O page. No diagnostic snapshot may
+	// add a physical CIA access while /RESET is asserted. Check the whole window,
+	// not just PC: a PC near $CFFF can make PC+11 cross into $D000. Code in the
+	// 65816's private banks is safe and retains its full 24-bit address.
+	bool codeWindowSafe = true;
+	for ( int i = -4; i < 12; i++ )
+	{
+		const u32 addr = ( d.pc + i ) & SCPU_ADDR_MASK;
+		if ( ( addr & 0xFF0000 ) == 0 && ( addr & 0xF000 ) == 0xD000 )
+		{
+			codeWindowSafe = false;
+			break;
+		}
+	}
+	if ( codeWindowSafe )
+	{
+		d.haveCode = true;
+		for ( int i = -4; i < 12; i++ )
+			d.code[ i + 4 ] = scpu->memoryMap().read8(
+				( d.pc + i ) & SCPU_ADDR_MASK );
+	}
+
+	for ( u32 i = 0; i < 64; i++ )
+	{
+		d.cia[ i ] = scpu->memory().m_CIALog[
+			( scpu->memory().m_CIALogPos + i ) & 63 ];
+		d.io[ i ] = scpu->memory().m_IOLog[
+			( scpu->memory().m_IOLogPos + i ) & 63 ];
+	}
+
+	for ( u32 i = 0; i < 16; i++ )
+	{
+		const u32 age = i + 1;
+		const u32 idx  = ( scpu->memory().m_CIALogPos + 64 - age ) & 63;
+		const u32 prev = ( scpu->memory().m_CIALogPos + 64 - age - 1 ) & 63;
+		d.ciaIntervalEntry[ i ] = scpu->memory().m_CIALog[ idx ];
+		u32 dt = ( scpu->memory().m_CIALogCyc[ idx ]
+		         - scpu->memory().m_CIALogCyc[ prev ] )
+		       / ( SCPU_ARM_CLOCK_HZ / 1000000u );
+		if ( dt > 99999 ) dt = 99999;
+		d.ciaIntervalUS[ i ] = dt;
+	}
+
+	// Publish the snapshot only after every field is complete.
+	d.pending = true;
+	s_ResetDiagnosticQuietFrames = 0;
+}
+
+static void scpuEmitResetDiagnostic()
+{
+	SCPUResetDiagnostic &d = s_ResetDiagnostic;
+	if ( !d.pending || !s_Logger )
+		return;
+
+	// Clear first so this is one bounded emission even if logging itself is
+	// interrupted. A later reset press will simply publish a fresh snapshot.
+	d.pending = false;
+	s_ResetDiagnosticQuietFrames = 0;
+
+	if ( !d.haveCPU )
+	{
+		s_Logger->Write( "SCPU", LogNotice,
+		                 "reset pressed: CPU diagnostic unavailable" );
+		return;
+	}
+
+	s_Logger->Write( "SCPU", LogNotice,
+	               "reset pressed: PC=$%06X S=$%04X cycles=%llu",
+	               (unsigned)d.pc, (unsigned)d.sp,
+	               (unsigned long long)d.cycles );
+
+	if ( d.haveCore )
+		s_Logger->Write( "SCPU", LogNotice,
+		               "  P=$%02X (I=%u) E=%u  irqsTaken=%u nmisTaken=%u  line: IRQ=%u NMI=%u",
+		               d.p, ( d.p & W65_I ) ? 1 : 0, d.e,
+		               (unsigned)d.irqsTaken, (unsigned)d.nmisTaken,
+		               d.liveIRQ ? 1 : 0, d.liveNMI ? 1 : 0 );
+
+	char line[ SCPU_DUMP_LINE_SIZE ];
+	u32 n = 0;
+	scpuLineStart( line, sizeof line, n );
+	for ( u32 i = 0; i < 16; i++ )
+	{
+		scpuLineHexByte( line, sizeof line, n, d.stack[ i ] );
+		scpuLineChar( line, sizeof line, n, ' ' );
+	}
+	s_Logger->Write( "SCPU", LogNotice, "  stack: %s", line );
+
+	if ( d.haveCode )
+	{
+		scpuLineStart( line, sizeof line, n );
+		for ( u32 i = 0; i < 16; i++ )
+		{
+			scpuLineHexByte( line, sizeof line, n, d.code[ i ] );
+			scpuLineChar( line, sizeof line, n, ' ' );
+		}
+		s_Logger->Write( "SCPU", LogNotice, "  code@PC-4: %s", line );
+	}
+
+	for ( u32 row = 0; row < 4; row++ )
+	{
+		scpuLineStart( line, sizeof line, n );
+		for ( u32 i = 0; i < 16; i++ )
+		{
+			const u32 e = d.cia[ row * 16 + i ];
+			if ( !scpuLineChar( line, sizeof line, n, ( e >> 24 ) ? 'w' : 'r' )
+			     || !scpuLineHexByte( line, sizeof line, n, (u8)( ( e >> 8 ) & 0xFF ) )
+			     || !scpuLineHexByte( line, sizeof line, n, (u8)( e & 0xFF ) )
+			     || !scpuLineChar( line, sizeof line, n, '=' )
+			     || !scpuLineHexByte( line, sizeof line, n, (u8)( ( e >> 16 ) & 0xFF ) )
+			     || !scpuLineChar( line, sizeof line, n, ' ' ) )
+				break;
+		}
+		s_Logger->Write( "SCPU", LogNotice, "  cia%u: %s", row, line );
+	}
+
+	scpuLineStart( line, sizeof line, n );
+	for ( u32 i = 0; i < 16; i++ )
+	{
+		const u32 e = d.ciaIntervalEntry[ i ];
+		if ( !scpuLineChar( line, sizeof line, n, ( e >> 24 ) ? 'w' : 'r' )
+		     || !scpuLineHexByte( line, sizeof line, n, (u8)( ( e >> 8 ) & 0xFF ) )
+		     || !scpuLineHexByte( line, sizeof line, n, (u8)( e & 0xFF ) )
+		     || !scpuLineChar( line, sizeof line, n, '=' )
+		     || !scpuLineHexByte( line, sizeof line, n, (u8)( ( e >> 16 ) & 0xFF ) )
+		     || !scpuLineChar( line, sizeof line, n, '+' )
+		     || !scpuLineDecimal( line, sizeof line, n, d.ciaIntervalUS[ i ] )
+		     || !scpuLineChar( line, sizeof line, n, ' ' ) )
+			break;
+	}
+	s_Logger->Write( "SCPU", LogNotice, "  ciaT: %s", line );
+
+	if ( d.preResetSampleValid )
+		s_Logger->Write( "SCPU", LogNotice,
+		               "  pre-reset (last IEC-idle sample): $DD00=$%02X $DD02=$%02X",
+		               d.preResetDD00, d.preResetDD02 );
+	else
+		s_Logger->Write( "SCPU", LogNotice,
+		               "  pre-reset: no IEC-idle CIA sample available" );
+	s_Logger->Write( "SCPU", LogNotice,
+	               "  live CIA state not sampled while physical /RESET was asserted" );
+
+	for ( u32 row = 0; row < 4; row++ )
+	{
+		scpuLineStart( line, sizeof line, n );
+		for ( u32 i = 0; i < 16; i++ )
+		{
+			const u32 e = d.io[ row * 16 + i ];
+			if ( !scpuLineChar( line, sizeof line, n,
+			                    ( e & ( 1u << 25 ) ) ? 'W' : ( ( e >> 24 ) ? 'w' : 'r' ) )
+			     || !scpuLineHexByte( line, sizeof line, n, (u8)( ( e >> 8 ) & 0xFF ) )
+			     || !scpuLineHexByte( line, sizeof line, n, (u8)( e & 0xFF ) )
+			     || !scpuLineChar( line, sizeof line, n, '=' )
+			     || !scpuLineHexByte( line, sizeof line, n, (u8)( ( e >> 16 ) & 0xFF ) )
+			     || !scpuLineChar( line, sizeof line, n, ' ' ) )
+				break;
+		}
+		s_Logger->Write( "SCPU", LogNotice, "  io%u: %s", row, line );
+	}
+}
 
 static bool scpuCheckButton( void *ctx )
 {
 	CSuperCPU *scpu = (CSuperCPU *)ctx;
+	const bool hardwareResetPressed = radBusHardwareResetPressed();
 
-	if ( scpu && ( ++s_PreResetSampleFrame % 50 ) == 0 )
+	// These reads go to the physical CIA. Do not insert them into an active
+	// serial transaction merely for diagnostics; take the next scheduled
+	// sample once IEC is quiet instead.
+	if ( scpu && !hardwareResetPressed
+	     && ( ++s_PreResetSampleFrame % 50 ) == 0
+	     && !scpu->memory().iecBusActive() )
 	{
 		s_PreResetDD00 = scpu->memory().read8( 0xDD00 );
 		s_PreResetDD02 = scpu->memory().read8( 0xDD02 );
+		s_PreResetSampleValid = true;
 	}
 
 	if ( radBusButtonPressed() )
-		return true;					// stop the run loop; caller reboots
-
-	if ( radBusHardwareResetPressed() )
 	{
-		// Before resetting, say where the machine was -- and what it was
-		// doing. Three freezes in a row sampled the identical PC, which no
-		// scattered busy-wait produces; either the stack is corrupt (an RTS
-		// storm cycles through one or two addresses) or the code itself is.
-		// The stack bytes, the code around the PC as the CPU actually sees it,
-		// and the last I/O accesses decide between those from one photo.
-		if ( s_Logger && scpu && scpu->cpu() )
+		s_RebootRequested = true;
+		return true;					// stop the run loop; caller reboots
+	}
+
+	if ( hardwareResetPressed )
+	{
+		// Take a bounded snapshot first; do not log or sample a physical CIA
+		// until the machine has been released and normal execution has resumed.
+		scpuSnapshotResetDiagnostic( scpu );
+
+		// The physical VIC and CIAs remain in reset while the line is low, so the
+		// emulator must not resume bus traffic until release. Require a long run
+		// of agreeing high samples; any bounce resets the count. This remains
+		// responsive to however long the user holds the button while preventing a
+		// single press from becoming several emulated resets.
+		u32 released = 0;
+		while ( released < SCPU_RESET_RELEASE_STABLE_SAMPLES )
 		{
-			const u32 pc = (u32)scpu->cpu()->pc();
-			const u16 sp = scpu->cpu()->stackPointer();
-
-			s_Logger->Write( "SCPU", LogNotice,
-			               "reset pressed: PC=$%06X S=$%04X cycles=%u",
-			               (unsigned)pc, (unsigned)sp,
-			               (unsigned)scpu->cpu()->cycles() );
-
-			// The interrupt picture, which is what an idle-loop freeze is
-			// about: P says whether IRQs are masked, the taken-counters say
-			// whether delivery ever stopped, and the live line sample says
-			// whether the hardware is even asking.
-			if ( CW65C816 *core = scpu->core65816() )
-			{
-				bool liveIRQ = false, liveNMI = false;
-				radBusSampleInterrupts( liveIRQ, liveNMI );
-				s_Logger->Write( "SCPU", LogNotice,
-				               "  P=$%02X (I=%u) E=%u  irqsTaken=%u nmisTaken=%u  line: IRQ=%u NMI=%u",
-				               core->m_P, ( core->m_P & W65_I ) ? 1 : 0,
-				               core->m_E ? 1 : 0,
-				               (unsigned)core->m_IRQsTaken,
-				               (unsigned)core->m_NMIsTaken,
-				               liveIRQ ? 1 : 0, liveNMI ? 1 : 0 );
-			}
-
-			// 16 stack bytes upward from S (the return addresses).
-			char line[ 128 ]; int n = 0;
-			for ( u32 i = 1; i <= 16; i++ )
-				n += scpuHexByte( line + n,
-				               scpu->memory().m_RAM[ 0x0100 | ( ( sp + i ) & 0xFF ) ] );
-			line[ n ] = 0;
-			s_Logger->Write( "SCPU", LogNotice, "  stack: %s", line );
-
-			// The code around the PC, read the way the CPU reads it -- through
-			// the live map, so a corrupted shadow shows itself here.
-			if ( ( pc & 0xF000 ) != 0xD000 )
-			{
-				n = 0;
-				for ( int i = -4; i < 12; i++ )
-					n += scpuHexByte( line + n,
-					               scpu->memory().read8( (u16)( pc + i ) ) );
-				line[ n ] = 0;
-				s_Logger->Write( "SCPU", LogNotice, "  code@PC-4: %s", line );
-			}
-
-			// Last 16 I/O accesses, oldest first: rWADDR=VAL.
-			// The CIA conversation, which the idle loop cannot flood: the DDR
-			// and interrupt-mask setup, then every ATN/CLK/DATA toggle. This is
-			// the serial transaction itself, however long ago it stalled.
-			for ( u32 row = 0; row < 4; row++ )
-			{
-				n = 0;
-				for ( u32 i = 0; i < 16; i++ )
-				{
-					const u32 e = scpu->memory().m_CIALog[ ( scpu->memory().m_CIALogPos + row * 16 + i ) & 63 ];
-					line[ n++ ] = ( e >> 24 ) ? 'w' : 'r';
-					n += scpuHexByte( line + n, (u8)( ( e >> 8 ) & 0xFF ) ) - 1;
-					n += scpuHexByte( line + n, (u8)( e & 0xFF ) ) - 1;
-					line[ n++ ] = '=';
-					n += scpuHexByte( line + n, (u8)( ( e >> 16 ) & 0xFF ) );
-				}
-				line[ n ] = 0;
-				s_Logger->Write( "SCPU", LogNotice, "  cia%u: %s", row, line );
-			}
-
-			// The same entries as INTERVALS, in REAL microseconds (ARM cycles
-			// / 1400) -- the pulse widths and gaps the DRIVE actually
-			// experienced, including every stall the emulated-cycle view
-			// cannot see. An ACK shorter than ~20us or a ready-gap beyond
-			// ~200us names the desync directly. The ring is edge-compressed,
-			// so these entries are transitions, not poll spam.
-			n = 0;
-			u32 shown = 0;
-			for ( u32 i = 1; i < 64 && shown < 16; i++ )
-			{
-				const u32 idx  = ( scpu->memory().m_CIALogPos + 64 - i ) & 63;
-				const u32 prev = ( scpu->memory().m_CIALogPos + 64 - i - 1 ) & 63;
-				const u32 e = scpu->memory().m_CIALog[ idx ];
-				u32 dt = ( scpu->memory().m_CIALogCyc[ idx ] - scpu->memory().m_CIALogCyc[ prev ] )
-				       / ( SCPU_ARM_CLOCK_HZ / 1000000u );
-				if ( dt > 99999 ) dt = 99999;
-				line[ n++ ] = ( e >> 24 ) ? 'w' : 'r';
-				n += scpuHexByte( line + n, (u8)( ( e >> 8 ) & 0xFF ) ) - 1;
-				n += scpuHexByte( line + n, (u8)( e & 0xFF ) ) - 1;
-				line[ n++ ] = '=';
-				n += scpuHexByte( line + n, (u8)( ( e >> 16 ) & 0xFF ) ) - 1;
-				line[ n++ ] = '+';
-				// decimal microseconds
-				char tmp[ 8 ]; int tn = 0;
-				do { tmp[ tn++ ] = (char)( '0' + dt % 10 ); dt /= 10; } while ( dt );
-				while ( tn ) line[ n++ ] = tmp[ --tn ];
-				line[ n++ ] = ' ';
-				shown++;
-			}
-			line[ n ] = 0;
-			s_Logger->Write( "SCPU", LogNotice, "  ciaT: %s", line );
-
-			// Live serial line state, read once, non-destructively ($DD0D is
-			// deliberately NOT read -- reading the ICR clears it).
-			if ( scpu->memory().read8( 0x0001 ) != 0 )	// cheap always-true guard
-			{
-				const u8 dd00 = scpu->memory().read8( 0xDD00 );
-				const u8 dd02 = scpu->memory().read8( 0xDD02 );
-				s_Logger->Write( "SCPU", LogNotice,
-				               "  live: $DD00=$%02X (DATAin=%u CLKin=%u) $DD02=$%02X"
-				               "  [POST-RESET: CIAs already cleared by the button]",
-				               dd00, ( dd00 >> 7 ) & 1, ( dd00 >> 6 ) & 1, dd02 );
-				s_Logger->Write( "SCPU", LogNotice,
-				               "  pre-reset (~1s before): $DD00=$%02X $DD02=$%02X",
-				               s_PreResetDD00, s_PreResetDD02 );
-			}
-
-			// 64 accesses, oldest first, 16 per line. Lower-case = went to the
-			// real machine; upper-case W = intercepted SuperCPU register.
-			for ( u32 row = 0; row < 4; row++ )
-			{
-				n = 0;
-				for ( u32 i = 0; i < 16; i++ )
-				{
-					const u32 e = scpu->memory().m_IOLog[ ( scpu->memory().m_IOLogPos + row * 16 + i ) & 63 ];
-					line[ n++ ] = ( e & ( 1u << 25 ) ) ? 'W' : ( ( e >> 24 ) ? 'w' : 'r' );
-					n += scpuHexByte( line + n, (u8)( ( e >> 8 ) & 0xFF ) ) - 1;
-					n += scpuHexByte( line + n, (u8)( e & 0xFF ) ) - 1;
-					line[ n++ ] = '=';
-					n += scpuHexByte( line + n, (u8)( ( e >> 16 ) & 0xFF ) );
-				}
-				line[ n ] = 0;
-				s_Logger->Write( "SCPU", LogNotice, "  io%u: %s", row, line );
-			}
+			if ( radBusHardwareResetPressed() ) released = 0;
+			else                                  released++;
 		}
 
-		// Wait for release so one press is one reset, then restart the
-		// emulated machine from its reset vector. The Pi keeps running and the
-		// bus stays ours -- no need to renegotiate the handover.
-		while ( radBusHardwareResetPressed() )
-			;
 		if ( scpu ) scpu->reset();
+		s_HardwareResetGeneration++;
+		s_PreResetSampleFrame = 0;
+		s_PreResetSampleValid = false;
+		return false;
+	}
+
+	// Emit the saved pre-reset state on a later hook invocation, after several
+	// complete IEC-idle frames. No values are read from the reset CIAs here.
+	if ( s_ResetDiagnostic.pending && scpu )
+	{
+		if ( scpu->memory().iecBusActive() )
+			s_ResetDiagnosticQuietFrames = 0;
+		else if ( ++s_ResetDiagnosticQuietFrames >= 3 )
+			scpuEmitResetDiagnostic();
 	}
 
 	return false;
+}
+
+// runFrame() does not invoke the normal frame hook. Startup and diagnostic
+// loops use this wrapper so the physical reset button is still serviced before
+// the emulator enters its permanent run() loop. A reset aborts the diagnostic
+// currently in progress; normal execution can then resume immediately.
+static bool scpuRunFrameAndCheckButtons( CSuperCPU &scpu )
+{
+	const u32 resetGeneration = s_HardwareResetGeneration;
+	scpu.runFrame();
+	const bool stop = scpuCheckButton( &scpu );
+	return stop || resetGeneration != s_HardwareResetGeneration;
 }
 
 static CRADBus   radBus;
@@ -359,6 +545,12 @@ static char scpuScreenChar( u8 c )
 // while the mirroring fails to get its output across the bus.
 static void scpuDumpEmulatedScreen( CLogger *logger, CSuperCPU &scpu )
 {
+	// Logging stops the emulated CPU while the physical drive keeps running.
+	// The caller seeks a quiet window, but keep this defensive check here so a
+	// future caller cannot accidentally pause an active IEC transaction.
+	if ( scpu.memory().iecBusActive() )
+		return;
+
 	const u8 *ram = scpu.memory().m_RAM;
 
 	logger->Write( "SCPU", LogNotice, "--- emulated screen, from SHADOW RAM $0400 ---" );
@@ -396,7 +588,17 @@ static void scpuDumpEmulatedScreen( CLogger *logger, CSuperCPU &scpu )
 		const u64 slow0 = scpu.memory().m_SlowPacedCycles;
 		const u64 iec0 = scpu.memory().m_IECThrottledCycles;
 
-		for ( u32 i = 0; i < 60; i++ ) scpu.runFrame();
+		// A transaction can begin during the benchmark. Abort before producing
+		// any more synchronous log output and return to the free-running loop.
+		for ( u32 i = 0; i < 60; i++ )
+		{
+			if ( scpu.memory().iecBusActive() )
+				return;
+			if ( scpuRunFrameAndCheckButtons( scpu ) )
+				return;
+			if ( scpu.memory().iecBusActive() )
+				return;
+		}
 
 		const u64 dc  = scpu.cpu()->cycles() - c0;
 		const u64 dh  = radBus.hostCycles() - h0;
@@ -471,6 +673,33 @@ static void scpuDumpEmulatedScreen( CLogger *logger, CSuperCPU &scpu )
 	               (unsigned)scpu.writeBuffer().m_BytesFlushed );
 }
 
+// Startup diagnostics are useful, but logger output and the snapshot benchmark
+// both stop normal execution at frame boundaries. Wait only by running normal
+// frames, require IEC to remain quiet across several of them, and give up after
+// a bounded interval if the machine is still probing or loading from a drive.
+static bool scpuWaitForDiagnosticWindow( CSuperCPU &scpu )
+{
+	static const u32 MAX_WAIT_FRAMES = 180;
+	static const u32 QUIET_FRAMES_REQUIRED = 3;
+	u32 quietFrames = 0;
+
+	for ( u32 i = 0; i < MAX_WAIT_FRAMES; i++ )
+	{
+		if ( !scpu.memory().iecBusActive() )
+		{
+			if ( ++quietFrames >= QUIET_FRAMES_REQUIRED )
+				return true;
+		}
+		else
+			quietFrames = 0;
+
+		if ( scpuRunFrameAndCheckButtons( scpu ) )
+			return false;
+	}
+
+	return false;
+}
+
 void scpuBootRun( CLogger *logger )
 {
 	logger->Write( "SCPU", LogNotice, "SCPU-EMU starting" );
@@ -528,11 +757,28 @@ void scpuBootRun( CLogger *logger )
 	logger->Write( "SCPU", LogNotice, "CPU core: %s",
 	               ( core == SCPU_CORE_6502 ) ? "MOS 6502 (fallback)" : "WDC 65C816" );
 
+	// This replaces the physical JiffyDOS switch on the cartridge. Set it before
+	// init() resets and starts the SuperCPU ROM; reset deliberately preserves the
+	// switch position, so CMD's boot code sees the configured value when it
+	// chooses which KERNAL to install. A later $D0B5 POKE remains in effect until
+	// the Pi is rebooted and this configuration is read again.
+	superCPU.registers().setJiffyDOSSwitch( cfgJiffyDOS != 0 );
+	logger->Write( "SCPU", LogNotice, "JiffyDOS: %s (scpu.cfg)",
+	               cfgJiffyDOS ? "enabled" : "disabled" );
+
 	// Bootmap runs CMD's own boot code before the C64's KERNAL, which is where
 	// the SuperCPU banner comes from. It is read from the config here, on the
 	// Pi, well before any emulation starts -- so BOOTMAP 0 on the SD card is
 	// always effective, however badly the emulated machine behaves with it on.
 	superCPU.setBootmapEnabled( cfgBootmap != 0 );
+
+	// From superCPU.init() onward the Pi owns and accesses the C64 bus in
+	// sub-microsecond GPIO windows. Circle's timer/SD IRQs may pre-empt at any
+	// instruction, so leaving them enabled can stretch a nominally valid bus
+	// phase into the VIC-II's half-cycle. The filesystem is already unmounted
+	// above and all configuration-dependent startup messages have been emitted;
+	// match upstream RAD and keep ARM IRQs masked for timed bus operation.
+	DisableIRQs();
 
 	if ( !superCPU.init( &radBus, core, SCPU_SIMM_16MB ) )
 	{
@@ -590,14 +836,30 @@ void scpuBootRun( CLogger *logger )
 	               "buttons: LEFT = reboot the Pi, RIGHT = reset the emulated C64" );
 
 	// Run about two seconds of emulated time, then report what the emulator
-	// thinks it has drawn before handing over to the free-running loop.
+	// thinks it has drawn only after a bounded wait for an IEC-quiet window.
+	// If boot-time drive probing never settles, skip diagnostics rather than
+	// stopping the emulated CPU while the physical drive continues.
+	bool startupInterrupted = false;
 	for ( u32 i = 0; i < 120; i++ )
-		superCPU.runFrame();
+	{
+		if ( scpuRunFrameAndCheckButtons( superCPU ) )
+		{
+			startupInterrupted = true;
+			break;
+		}
+	}
 
-	scpuDumpEmulatedScreen( logger, superCPU );
+	if ( !startupInterrupted && scpuWaitForDiagnosticWindow( superCPU ) )
+		scpuDumpEmulatedScreen( logger, superCPU );
 
-	superCPU.setFrameHook( scpuCheckButton, &superCPU );
-	superCPU.run();
+	// A short LEFT press can happen inside one of the startup wrappers above.
+	// Preserve that request instead of consuming it merely as "stop this
+	// diagnostic" and then entering the permanent run loop.
+	if ( !s_RebootRequested )
+	{
+		superCPU.setFrameHook( scpuCheckButton, &superCPU );
+		superCPU.run();
+	}
 
 	// The button was pressed. Release the machine and restart the Pi so a fresh
 	// kernel8.img on the card is picked up.

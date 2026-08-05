@@ -91,7 +91,8 @@ public:
 	}
 
 	// Current VIC-II raster line, or 0xFFFF if the backend cannot tell.
-	// Costs two bus cycles on real hardware ($D012 plus $D011 bit 7).
+	// A coherent sample costs three bus cycles on real hardware
+	// ($D011/$D012/$D011), and up to twelve when a boundary forces retries.
 	virtual u16 rasterLine() { return 0xFFFF; }
 
 	// --- host time source, for pacing ------------------------------------

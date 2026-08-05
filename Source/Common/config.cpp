@@ -82,6 +82,7 @@ int timingValues[ TIMING_NAMES ] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
 int cfgCPUCore = SCPU_CFG_CORE_DEFAULT;
 int cfgBootmap = SCPU_CFG_BOOTMAP_DEFAULT;
+int cfgJiffyDOS = SCPU_CFG_JIFFYDOS_DEFAULT;
 
 char cfg[ 65536 ];
 
@@ -89,6 +90,14 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 {
 	u32 cfgBytes;
 	memset( cfg, 0, 65536 );
+	memset( timingValues, 0, sizeof timingValues );
+
+	// A missing file or missing key means built-in defaults, even if this
+	// function is called again after an earlier configuration. In particular,
+	// JIFFYDOS 0 must not leak into a later parse with no JIFFYDOS line.
+	cfgCPUCore = SCPU_CFG_CORE_DEFAULT;
+	cfgBootmap = SCPU_CFG_BOOTMAP_DEFAULT;
+	cfgJiffyDOS = SCPU_CFG_JIFFYDOS_DEFAULT;
 
 	// Leave a byte spare so cfg is always NUL-terminated for the line scanner.
 	if ( !readFile( logger, DRIVE, FILENAME, (u8*)cfg, &cfgBytes, sizeof( cfg ) - 1 ) )
@@ -98,6 +107,7 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 
 	bool cpuCoreSeen = false;
 	bool bootmapSeen = false;
+	bool jiffyDOSSeen = false;
 
 	while ( *cfgPos != 0 )
 	{
@@ -119,6 +129,7 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 						timingValues[ i ] = atoi( ptr );
 						if ( i == 21 ) cpuCoreSeen = true;
 						if ( i == 22 ) bootmapSeen = true;
+						if ( i == 23 ) jiffyDOSSeen = true;
 						while ( *ptr == '\t' || *ptr == ' ' ) ptr++;
 					#ifdef DEBUG_OUT
 						logger->Write( "RaspiMenu", LogNotice, "  %s >%d< (%s)", timingNames[ i ], timingValues[ i ], ptr );
@@ -163,6 +174,10 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	if ( bootmapSeen )
 		cfgBootmap = ( timingValues[ 22 ] != 0 ) ? 1 : 0;
 
+	// JIFFYDOS is a physical-switch replacement, so 0 and 1 are both explicit
+	// values. It defaults on when the key is absent.
+	if ( jiffyDOSSeen )
+		cfgJiffyDOS = ( timingValues[ 23 ] != 0 ) ? 1 : 0;
+
 	return 1;
 }
-

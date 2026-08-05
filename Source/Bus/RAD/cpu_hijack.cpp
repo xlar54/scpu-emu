@@ -195,32 +195,57 @@ C64MachineType radDetectMachine()
 C64VideoStandard radDetectVideoStandard()
 {
 	register u32 g2;
-	u8 y;
-	u16 curRasterLine;
+	u16 curRasterLine  = 0;
 	u16 maxRasterLine  = 0;
-	u16 lastRasterLine = 9999;
+	u16 lastRasterLine = 0xFFFF;
+	u32 wraps           = 0;
 
 	BUS_RESYNC
 
-	// Sample a full frame's worth of rasterlines and keep the maximum. PAL
-	// reaches 311, NTSC only 261 (6567R56A) or 262 (6567R8).
-	for ( int i = 0; i < 313; i++ )
+	// Locate two frame wraps. Everything between them is one complete frame,
+	// regardless of the raster line at which probing began. PAL reaches 311,
+	// NTSC only 261 (6567R56A) or 262 (6567R8).
+	//
+	// Each sample uses high/low/high rather than the former low/high pair. A
+	// pair which straddled line 255 could manufacture line 511 and falsely
+	// identify an NTSC machine as PAL. Reads are still self-synchronising, as
+	// they are everywhere else in this low-level probe. The cap is generous
+	// enough for several frames and bounds a frozen raster counter. As with all
+	// post-acquire bus operations, this still assumes the PHI2 liveness check
+	// completed immediately beforehand.
+	for ( u32 attempt = 0; attempt < 32768 && wraps < 2; attempt++ )
 	{
-		do {
-			RAD_SPEEK( 0xD012, y );
-			curRasterLine = y;
-		} while ( curRasterLine == lastRasterLine );
-		lastRasterLine = curRasterLine;
+		u8 hiBefore = 0, lo = 0, hiAfter = 0;
 
-		RAD_SPEEK( 0xD011, y );
-		if ( y & 128 ) curRasterLine += 256;
+		RAD_SPEEK( 0xD011, hiBefore );
+		RAD_SPEEK( 0xD012, lo );
+		RAD_SPEEK( 0xD011, hiAfter );
+
+		if ( ( ( hiBefore ^ hiAfter ) & 0x80 ) != 0 )
+			continue;
+
+		curRasterLine = (u16)( lo | ( ( hiAfter & 0x80 ) ? 0x100 : 0 ) );
+		if ( curRasterLine >= 312 || curRasterLine == lastRasterLine )
+			continue;
+
+		if ( lastRasterLine != 0xFFFF && curRasterLine < lastRasterLine )
+		{
+			wraps++;
+			if ( wraps == 1 )
+				maxRasterLine = 0;
+		}
 
 		if ( curRasterLine > maxRasterLine )
 			maxRasterLine = curRasterLine;
+
+		lastRasterLine = curRasterLine;
 	}
 
+	// If the bounded scan did not encompass a complete frame, retain the old
+	// best-effort behaviour using whatever coherent samples were obtained.
+	// A normally advancing VIC always reaches two wraps well inside the cap.
 	if ( maxRasterLine >= 300 )
 		return VIDEO_PAL;
 
-	return ( maxRasterLine - 260 ) >= 2 ? VIDEO_NTSC_R8 : VIDEO_NTSC_R56A;
+	return maxRasterLine >= 262 ? VIDEO_NTSC_R8 : VIDEO_NTSC_R56A;
 }

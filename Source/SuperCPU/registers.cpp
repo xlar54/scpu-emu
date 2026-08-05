@@ -23,12 +23,12 @@
 CSuperCPURegisters::CSuperCPURegisters()
 	: m_RegWrites( 0 ), m_WriteBuffer( 0 ), m_Version( SCPU_V2 ),
 	  m_Sys1MHz( false ), m_Soft1MHz( false ),
-	  m_SwitchSlow( false ), m_SwitchJiffy( false ),
+	  m_SwitchSlow( false ), m_SwitchJiffy( true ),
 	  m_HWRegsEnabled( false ), m_Bootmap( true ), m_BootmapFlag( 0 ),
 	  m_KernalShadowBase( 0 ),
 	  m_DOSExt( false ), m_RAMLink( false ),
 	  m_EmulationMode( true ), m_EmulationFlag( 0 ), m_SpeedChanged( true ),
-	  m_Optim( SCPU_OPTIM_NONE ), m_SIMMConfig( 0 )
+	  m_Optim( 0xC7 ), m_SIMMConfig( 4 )
 {
 	reset();
 }
@@ -48,8 +48,10 @@ void CSuperCPURegisters::reset()
 	m_RAMLink       = false;
 	m_SpeedChanged  = true;
 	m_RegWrites     = 0;
-	m_Optim         = SCPU_OPTIM_NONE;
-	m_SIMMConfig    = 0;
+	// VICE and the v2 hardware reset to $C7: no-optimisation mode with the
+	// B/Z flags selecting $0200-$FFFF (zero page and stack excluded).
+	m_Optim         = 0xC7;
+	m_SIMMConfig    = 4;
 
 	for ( u32 i = 0; i < SCPU_SYSRAM_SIZE; i++ )  m_SysRAM[ i ]  = 0;
 	for ( u32 i = 0; i < SCPU_USERRAM_SIZE; i++ ) m_UserRAM[ i ] = 0;
@@ -87,14 +89,36 @@ void CSuperCPURegisters::applyOptimisation()
 	if ( !m_WriteBuffer )
 		return;
 
-	// Bits 7-6 select which region stays coherent with the VIC-II.
-	switch ( m_Optim & 0xC0 )
+	// The hardware reduces bits 7, 6, 2 and 0 to a four-bit mirror selector.
+	// The bundled VICE reference's mem_mirrors[] table is the authoritative
+	// mapping. The low B/Z flags are not merely status bits: ignoring them can
+	// select the opposite VIC bank or turn "no mirroring" into heavy mirroring.
+	const u8 mirror = (u8)( ( ( m_Optim & 0x01 ) ? 0x01 : 0 )
+	                      | ( ( m_Optim & 0x04 ) ? 0x02 : 0 )
+	                      | ( ( m_Optim & 0x40 ) ? 0x04 : 0 )
+	                      | ( ( m_Optim & 0x80 ) ? 0x08 : 0 ) );
+
+	m_WriteBuffer->setExcludeZeroPageStack( false );
+	switch ( mirror )
 	{
-	case SCPU_OPTIM_VICBANK2: m_WriteBuffer->setOptMode( SCPU_OPT_VICBANK2 ); break;
-	case SCPU_OPTIM_VICBANK1: m_WriteBuffer->setOptMode( SCPU_OPT_VICBANK1 ); break;
-	case SCPU_OPTIM_BASIC:    m_WriteBuffer->setOptMode( SCPU_OPT_BASIC );    break;
-	case SCPU_OPTIM_NONE:
-	default:                  m_WriteBuffer->setOptMode( SCPU_OPT_NONE );     break;
+	case 0:
+	case 1:  m_WriteBuffer->setOptMode( SCPU_OPT_VICBANK2 ); break; // $8000-$BFFF
+	case 2:  m_WriteBuffer->setOptMode( SCPU_OPT_VICBANK0 ); break; // $0000-$3FFF
+	case 3:  m_WriteBuffer->setExcludeZeroPageStack( true );
+	         m_WriteBuffer->setOptMode( SCPU_OPT_VICBANK0 ); break; // $0200-$3FFF
+	case 4:
+	case 5:  m_WriteBuffer->setOptMode( SCPU_OPT_VICBANK1 ); break; // $4000-$7FFF
+	case 6:
+	case 7:  m_WriteBuffer->setOptMode( SCPU_OPT_VICBANK3 ); break; // $C000-$FFFF
+	case 8:
+	case 9:  m_WriteBuffer->setOptMode( SCPU_OPT_BASIC );    break; // $0400-$07FF
+	case 10:
+	case 11: m_WriteBuffer->setOptMode( SCPU_OPT_FULL );     break; // nothing
+	case 12:
+	case 14: m_WriteBuffer->setOptMode( SCPU_OPT_NONE );     break; // $0000-$FFFF
+	case 13:
+	case 15: m_WriteBuffer->setExcludeZeroPageStack( true );
+	         m_WriteBuffer->setOptMode( SCPU_OPT_DEFAULT );  break; // $0200-$FFFF
 	}
 }
 
@@ -227,9 +251,11 @@ bool CSuperCPURegisters::ioWrite( u16 addr, u8 value )
 	case SCPU_REG_OPT_NONE:
 		if ( m_HWRegsEnabled )
 		{
-			// The mode lives in bits 7-6 and comes from the low two bits of the
-			// address: $D074 -> 00, $D075 -> 01, $D076 -> 10, $D077 -> 11.
-			m_Optim = (u8)( ( m_Optim & 0x3F ) | ( ( addr & 3 ) << 6 ) );
+			// VICE models these legacy switches as a complete assignment, not a
+			// read/modify/write: the address supplies bits 7-6 and the enhanced
+			// B/Z flags are cleared. Preserving reset's low $07 here would make
+			// $D076 select mirror-table entry 11 (empty) instead of BASIC.
+			m_Optim = (u8)( ( addr & 3 ) << 6 );
 			applyOptimisation();
 		}
 		break;
@@ -286,6 +312,17 @@ bool CSuperCPURegisters::ioWrite( u16 addr, u8 value )
 			m_Optim = (u8)( ( m_Optim & 0x3F ) | ( value & 0xC0 ) );
 			applyOptimisation();
 		}
+		break;
+
+	case SCPU_REG_SWITCHES:
+		// Emulator extension: real hardware reads two physical switches here,
+		// but this build has no JiffyDOS switch input. Make bit 7 directly
+		// writable as the virtual switch; unlike the real $D0Bx controls this is
+		// intentionally NOT gated by $D07E. Opening the hardware-register bank
+		// immediately swaps the active KERNAL window and is unsafe as a BASIC
+		// configuration sequence. Bit 6 remains the separately configured,
+		// read-only speed-switch state.
+		m_SwitchJiffy = ( value & SCPU_SWITCH_JIFFYDOS ) != 0;
 		break;
 
 	case SCPU_REG_PROCMODE:		// write side: disable bootmap
