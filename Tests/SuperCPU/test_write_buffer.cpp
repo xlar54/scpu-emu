@@ -516,3 +516,203 @@ TEST( writebuf_hot_shape_blocks_wait_for_the_border )
 	CHECK_EQ( bus.m_Memory[ 0x3000 ], 0x44 );
 	CHECK_EQ( wb.pending(), 0u );
 }
+
+// ---------------------------------------------------------------------------
+// Under-I/O sprite-shape relocation
+//
+// In VIC bank 3 a sprite pointer of $40-$7F selects DRAM at $D000-$DFFF --
+// RAM to the VIC, chip registers to our bus writes, so the mirror can never
+// put the shape there. 3D Pool /SCPU double-buffers across banks 1 and 3
+// with its ball shapes under I/O; the fix delivers TRANSLATED pointers into
+// relocated copies at $C000-$CBFF. These tests wire CC64Memory to the buffer
+// exactly as CSuperCPU::init does and replay the game's configuration:
+// bank 3 via $DD00, screen $CC00 / bitmap $E000 via $D018=$38, shapes staged
+// under $01=$34 banking.
+// ---------------------------------------------------------------------------
+
+struct RelocFixture
+{
+	CHostBus     bus;
+	CC64Memory   mem;
+	CWriteBuffer wb;
+
+	RelocFixture()
+	{
+		mem.attachBus( &bus );
+		mem.setMirrorSink( &wb );
+		wb.attach( &bus, mem.m_RAM );
+		wb.setOptMode( SCPU_OPT_NONE );
+		wb.attachRelocation( mem.m_PtrReloc, mem.m_RelocInUse,
+		                     &mem.m_RelocCount );
+		mem.reset();
+		bus.resetStats();
+
+		// The 3D Pool configuration: VIC bank 3, bitmap $E000, screen $CC00,
+		// so the pointer row is $CFF8.
+		mem.write8( 0xDD00, 0xC4 );
+		mem.write8( 0xD011, 0x3B );
+		mem.write8( 0xD018, 0x38 );
+	}
+
+	// Bank I/O out, store into RAM under it, bank I/O back in -- the game's
+	// own staging pattern ($4521: SEI / LDA #$34 / STA $01).
+	void pokeUnderIO( u16 addr, u8 v )
+	{
+		mem.write8( 0x0001, 0x34 );
+		mem.writeFast( addr, v );
+		mem.write8( 0x0001, 0x35 );
+	}
+};
+
+TEST( reloc_pointer_into_under_io_block_delivers_translated_copy )
+{
+	RelocFixture f;
+
+	// Shapes staged first, pointer after -- the common order. Block $43 is
+	// $D0C0-$D0FF, the snapshot's actual cue-ball block.
+	for ( u32 i = 0; i < 63; i++ )
+		f.pokeUnderIO( (u16)( 0xD0C0 + i ), (u8)( 0x80 + i ) );
+
+	// Sentinel: block 0 is also the value zero, which a zeroed bus array
+	// would fake. Prove the delivery actually happened.
+	f.bus.m_Memory[ 0xCFF8 ] = 0xEE;
+	f.mem.writeFast( 0xCFF8, 0x43 );
+
+	// The immediate pointer delivery carried the RELOCATED block -- the first
+	// free one, $C000/64 = 0 -- not the raw $43 the shadow holds.
+	CHECK_EQ( f.bus.m_Memory[ 0xCFF8 ], 0x00 );
+	CHECK_EQ( f.mem.m_RAM[ 0xCFF8 ], 0x43 );		// shadow stays faithful
+	CHECK_EQ( f.mem.m_RelocAllocs, 1u );
+	CHECK_EQ( f.mem.m_PtrReloc[ 0x43 - 0x40 ], 0x00 );
+	CHECK_EQ( f.mem.m_RelocInUse[ 0 ], 0x43 );
+
+	// The hot-shape tracking follows the relocated block: bank 3, block 0.
+	const u32 blk = ( 3u << 8 ) + 0;
+	CHECK( ( f.mem.m_HotShapeBlocks[ blk >> 6 ] >> ( blk & 63 ) ) & 1 );
+	const u32 raw = ( 3u << 8 ) + 0x43;
+	CHECK( !( ( f.mem.m_HotShapeBlocks[ raw >> 6 ] >> ( raw & 63 ) ) & 1 ) );
+
+	// Flushing delivers the shape bytes at the relocated address, and the
+	// QUEUED copy of the pointer byte goes out translated too.
+	f.wb.flush();
+	for ( u32 i = 0; i < 63; i++ )
+		CHECK_EQ( f.bus.m_Memory[ 0xC000 + i ], (u8)( 0x80 + i ) );
+	CHECK_EQ( f.bus.m_Memory[ 0xCFF8 ], 0x00 );
+	// Real DRAM under I/O was never touched ($D0C0 on the host bus).
+	CHECK_EQ( f.bus.m_Memory[ 0xD0C0 ], 0x00 );
+}
+
+TEST( reloc_shapes_written_after_the_pointer_forward_per_write )
+{
+	RelocFixture f;
+
+	// Pointer first: allocation replays the (still empty) block, then each
+	// later shape write is forwarded as it happens.
+	f.bus.m_Memory[ 0xCFF8 ] = 0xEE;
+	f.mem.writeFast( 0xCFF8, 0x52 );			// block $52 = $D480
+	CHECK_EQ( f.bus.m_Memory[ 0xCFF8 ], 0x00 );	// relocated to block 0
+
+	f.pokeUnderIO( 0xD481, 0xAB );
+	f.wb.flush();
+	CHECK_EQ( f.bus.m_Memory[ 0xC001 ], 0xAB );
+	CHECK( f.wb.m_RelocForwarded >= 1u );
+}
+
+TEST( reloc_sweep_heals_stolen_blocks_from_the_under_io_source )
+{
+	RelocFixture f;
+
+	for ( u32 i = 0; i < 63; i++ )
+		f.pokeUnderIO( (u16)( 0xD0C0 + i ), (u8)( 0x80 + i ) );
+	f.mem.writeFast( 0xCFF8, 0x43 );
+	f.wb.flush();
+	CHECK_EQ( f.bus.m_Memory[ 0xC005 ], 0x85 );
+
+	// A glitched burst corrupts the relocated copy in DRAM. The sweep must
+	// heal it from the under-I/O SOURCE bytes -- the shadow underneath the
+	// stolen block holds program data that must NOT be delivered.
+	f.bus.m_Memory[ 0xC005 ] = 0x99;
+	f.mem.m_RAM[ 0xC005 ] = 0x77;				// program data in the shadow
+	for ( u32 i = 0; i < 0x10000 / 512; i++ )
+		f.wb.resyncSweep( 512 );
+	CHECK_EQ( f.bus.m_Memory[ 0xC005 ], 0x85 );	// healed, from $D0C5
+}
+
+TEST( reloc_program_writes_into_stolen_blocks_are_shielded )
+{
+	RelocFixture f;
+
+	for ( u32 i = 0; i < 63; i++ )
+		f.pokeUnderIO( (u16)( 0xD0C0 + i ), (u8)( 0x80 + i ) );
+	f.mem.writeFast( 0xCFF8, 0x43 );
+	f.wb.flush();
+
+	// The program updates its own data at $C000 -- an address whose DRAM now
+	// belongs to the relocated shape. The write reaches the shadow (programs
+	// read it back) but never the bus.
+	f.mem.writeFast( 0xC000, 0x77 );
+	CHECK_EQ( f.mem.m_RAM[ 0xC000 ], 0x77 );
+	CHECK_EQ( f.wb.m_RelocShielded, 1u );
+	f.wb.flush();
+	CHECK_EQ( f.bus.m_Memory[ 0xC000 ], 0x80 );	// still the shape byte
+}
+
+TEST( reloc_bank1_pointers_pass_through_untranslated )
+{
+	RelocFixture f;
+	f.mem.write8( 0xDD00, 0xC6 );				// bank bits 10 -> bank 1
+	// Pointer row is now $4FF8; the same value $43 selects plain RAM $50C0
+	// and must go out untouched.
+	f.mem.writeFast( 0x4FF8, 0x43 );
+	CHECK_EQ( f.bus.m_Memory[ 0x4FF8 ], 0x43 );
+	CHECK_EQ( f.mem.m_RelocCount, 0 );
+}
+
+TEST( reloc_disabled_delivers_raw_pointers )
+{
+	RelocFixture f;
+	f.mem.m_RelocEnable = false;
+	f.mem.writeFast( 0xCFF8, 0x43 );
+	CHECK_EQ( f.bus.m_Memory[ 0xCFF8 ], 0x43 );
+	CHECK_EQ( f.mem.m_RelocAllocs, 0u );
+	CHECK_EQ( f.mem.m_RelocCount, 0 );
+}
+
+TEST( reloc_survives_the_double_buffer_bank_flip )
+{
+	// 3D Pool's raster IRQ flips $DD00 between banks 3 and 1 every frame. A
+	// queued $CFF8 row byte regularly FLUSHES while bank 1 is active, and the
+	// sweep re-delivers the inactive row wholesale. Translation is decided by
+	// address shape, not by the currently active row -- otherwise both paths
+	// put the raw under-I/O value back and the flicker returns at flip rate.
+	RelocFixture f;
+
+	for ( u32 i = 0; i < 63; i++ )
+		f.pokeUnderIO( (u16)( 0xD0C0 + i ), (u8)( 0x80 + i ) );
+	f.mem.writeFast( 0xCFF8, 0x43 );		// queues raw $43, delivers translated
+
+	// The IRQ flips to bank 1 BEFORE the queue drains -- the raced order.
+	f.mem.write8( 0xDD00, 0xC6 );
+	f.wb.flush();
+	CHECK_EQ( f.bus.m_Memory[ 0xCFF8 ], 0x00 );	// still the relocated block
+
+	// And the sweep, crossing the now-INACTIVE bank-3 row, must not undo it.
+	f.bus.m_Memory[ 0xCFF8 ] = 0xEE;
+	for ( u32 i = 0; i < 0x10000 / 512; i++ )
+		f.wb.resyncSweep( 512 );
+	CHECK_EQ( f.bus.m_Memory[ 0xCFF8 ], 0x00 );
+}
+
+TEST( reloc_low_bitmap_leaves_no_pool_and_falls_back_to_raw )
+{
+	RelocFixture f;
+	// Bitmap in the LOW half of bank 3 ($D018 bit 3 clear): the 8K bitmap
+	// spans $C000-$DF3F, covering the whole relocation window. Allocation
+	// must refuse and the pointer goes out raw -- stale, but honest, and
+	// counted.
+	f.mem.write8( 0xD018, 0x30 );
+	f.mem.writeFast( 0xCFF8, 0x43 );
+	CHECK_EQ( f.bus.m_Memory[ 0xCFF8 ], 0x43 );
+	CHECK_EQ( f.mem.m_RelocExhausted, 1u );
+	CHECK_EQ( f.mem.m_RelocCount, 0 );
+}

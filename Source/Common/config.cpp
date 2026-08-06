@@ -86,6 +86,7 @@ int cfgJiffyDOS = SCPU_CFG_JIFFYDOS_DEFAULT;
 int cfgMirrorDisplayBytes = SCPU_CFG_MIRROR_DISPLAY_DEFAULT;
 int cfgBootAnimation = 1;
 int cfgMirrorHaltAfterS = 0;
+int cfgMirrorD000Relocate = 1;
 
 char cfg[ 65536 ];
 
@@ -104,6 +105,7 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	cfgMirrorDisplayBytes = SCPU_CFG_MIRROR_DISPLAY_DEFAULT;
 	cfgBootAnimation = 1;
 	cfgMirrorHaltAfterS = 0;
+	cfgMirrorD000Relocate = 1;
 
 	// Leave a byte spare so cfg is always NUL-terminated for the line scanner.
 	if ( !readFile( logger, DRIVE, FILENAME, (u8*)cfg, &cfgBytes, sizeof( cfg ) - 1 ) )
@@ -116,6 +118,7 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	bool jiffyDOSSeen = false;
 	bool mirrorDisplaySeen = false;
 	bool bootAnimSeen = false;
+	bool relocSeen = false;
 
 	while ( *cfgPos != 0 )
 	{
@@ -140,6 +143,7 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 						if ( i == 23 ) jiffyDOSSeen = true;
 						if ( i == 24 ) mirrorDisplaySeen = true;
 						if ( i == 26 ) bootAnimSeen = true;
+						if ( i == 28 ) relocSeen = true;
 						while ( *ptr == '\t' || *ptr == ' ' ) ptr++;
 					#ifdef DEBUG_OUT
 						logger->Write( "RaspiMenu", LogNotice, "  %s >%d< (%s)", timingNames[ i ], timingValues[ i ], ptr );
@@ -200,6 +204,10 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 		cfgBootAnimation = ( timingValues[ 26 ] != 0 ) ? 1 : 0;
 
 	if ( timingValues[ 27 ] > 0 ) cfgMirrorHaltAfterS = timingValues[ 27 ];
+
+	// A flag: MIRROR_D000_RELOCATE 0 must be able to switch relocation off.
+	if ( relocSeen )
+		cfgMirrorD000Relocate = ( timingValues[ 28 ] != 0 ) ? 1 : 0;
 
 	return 1;
 }

@@ -137,6 +137,47 @@ public:
 	// The IMirrorSink flushUpTo() delegates here with deferHot=false.
 	u32 flushUpToPolicy( u32 maxBytes, bool deferHot );
 
+	// Under-I/O shape relocation wiring; the tables are owned by CC64Memory
+	// (see its relocation section for the why). ptrReloc maps an under-I/O
+	// block (V-$40, 64 entries) to its relocated block; inUse maps a
+	// relocated block (48 entries) back to its source V, $FF meaning free;
+	// count is the live allocation total and the fast-out for every check
+	// here.
+	void attachRelocation( const u8 *ptrReloc, const u8 *inUse,
+	                       const u8 *count )
+	{
+		m_PtrReloc   = ptrReloc;
+		m_RelocInUse = inUse;
+		m_RelocCount = count;
+	}
+
+	// Deliver-time translation for pointer-row bytes: a bank-3 row byte
+	// selecting an under-I/O block goes out as its relocated block, the only
+	// address the real VIC can be fed the shape at. Identity otherwise.
+	//
+	// "Row byte" is decided by address SHAPE -- the last eight bytes of any
+	// 1K screen slot in bank 3 -- not by the currently active row. A
+	// double-buffering game has TWO live rows and flips between them every
+	// frame (3D Pool flips $DD00 in its raster IRQ); a queued row byte
+	// regularly flushes while the OTHER row is active, and the background
+	// sweep periodically re-delivers the inactive row. Both would put the
+	// raw under-I/O value back on the real screen's next flip. A data byte
+	// that merely LOOKS like a row entry gets translated too; that only
+	// touches its dead DRAM copy -- visible solely if the VIC displays it as
+	// a pointer row, in which case translating it was correct.
+	inline u8 deliverValue( u16 a, u8 v ) const
+	{
+		if ( m_RelocCount && *m_RelocCount
+		     && a >= 0xC000 && ( a & 0x3FF ) >= 0x3F8
+		     && v >= 0x40 && v < 0x80 )
+		{
+			const u8 r = m_PtrReloc[ v - 0x40 ];
+			if ( r != 0xFF )
+				return r;
+		}
+		return v;
+	}
+
 	u32 pending() const { return m_Count; }
 	u32 pendingBytes() override { return m_Count; }
 
@@ -146,6 +187,8 @@ public:
 	// --- statistics -------------------------------------------------------
 	u64 m_WritesAccepted;	// writes that the policy said to mirror
 	u64 m_WritesEliminated;	// writes dropped because DRAM already held the value
+	u64 m_RelocForwarded;	// under-I/O writes redirected to a relocated block
+	u64 m_RelocShielded;	// program writes into stolen blocks, suppressed
 	u64 m_BytesResynced;	// background-sweep bytes re-delivered
 	u64 m_WritesSkipped;	// writes the policy discarded
 	u64 m_WritesCoalesced;	// accepted writes that hit an already-dirty address
@@ -182,6 +225,10 @@ private:
 	u64 m_Synced[ 0x10000 / 64 ];
 	u16 m_ResyncCursor = 0;
 	const u64 *m_HotBlocks = 0;
+	// Relocation wiring; see attachRelocation().
+	const u8  *m_PtrReloc = 0;
+	const u8  *m_RelocInUse = 0;
+	const u8  *m_RelocCount = 0;
 	// Value accepted under the policy in force at the time of the write. Keeping
 	// it here lets an optimisation-mode change take effect immediately without
 	// synchronously flushing the old queue. A later write excluded by the new

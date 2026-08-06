@@ -103,6 +103,11 @@ public:
 	// screen shows exactly what it holds. See MIRROR_HALT_AFTER_S.
 	void setMirrorHalted( bool halted ) { m_MirrorHalted = halted; }
 	bool mirrorHalted() const           { return m_MirrorHalted; }
+
+	// Under-I/O sprite-shape relocation (MIRROR_D000_RELOCATE); see
+	// CC64Memory's relocation section. On by default; the switch exists so a
+	// game that goes wrong with it can prove it with one config line.
+	void setUnderIORelocate( bool e ) { m_Memory.m_RelocEnable = e; }
 	u32  mirrorDisplayBudget() const         { return m_MirrorDisplayBudget; }
 
 	void reset();

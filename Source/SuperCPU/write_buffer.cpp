@@ -20,7 +20,8 @@
 #include "write_buffer.h"
 
 CWriteBuffer::CWriteBuffer()
-	: m_WritesAccepted( 0 ), m_WritesEliminated( 0 ), m_BytesResynced( 0 ),
+	: m_WritesAccepted( 0 ), m_WritesEliminated( 0 ),
+	  m_RelocForwarded( 0 ), m_RelocShielded( 0 ), m_BytesResynced( 0 ),
 	  m_WritesSkipped( 0 ), m_WritesCoalesced( 0 ),
 	  m_BytesFlushed( 0 ), m_Flushes( 0 ),
 	  m_IOWindowSuppressed( 0 ),
@@ -77,6 +78,7 @@ void CWriteBuffer::moveDirtyToTail( u16 addr )
 void CWriteBuffer::resetStats()
 {
 	m_WritesAccepted = m_WritesEliminated = m_WritesSkipped = m_WritesCoalesced = 0;
+	m_RelocForwarded = m_RelocShielded = 0;
 	m_BytesResynced = 0;
 	m_BytesFlushed = m_Flushes = 0;
 	m_IOWindowSuppressed = 0;
@@ -136,6 +138,34 @@ bool CWriteBuffer::shouldMirror( u16 addr ) const
 
 void CWriteBuffer::onRamWrite( u16 addr, u8 value )
 {
+	// Under-I/O shape relocation, when armed. A write into a relocated
+	// $D000-$DFFF block is forwarded to the block's deliverable copy; a
+	// program write into the copy's own underlying address is suppressed,
+	// because that DRAM now belongs to the relocated shape and is only ever
+	// fetched by the VIC through the translated pointer. Both directions
+	// disarm same-value elimination: the shadow at the delivery address holds
+	// the program's data, not what was last put on the bus.
+	if ( m_RelocCount && *m_RelocCount )
+	{
+		if ( addr >= 0xD000 )
+		{
+			const u8 r = m_PtrReloc[ ( addr >> 6 ) & 0x3F ];
+			if ( addr <= 0xDFFF && r != 0xFF )
+			{
+				addr = (u16)( 0xC000 + ( (u16)r << 6 ) + ( addr & 63 ) );
+				m_RelocForwarded++;
+				m_Synced[ addr >> 6 ] &= ~( 1ULL << ( addr & 63 ) );
+			}
+		}
+		else if ( addr >= 0xC000 && addr < 0xCC00
+		          && m_RelocInUse[ ( (u32)addr - 0xC000 ) >> 6 ] != 0xFF )
+		{
+			m_RelocShielded++;
+			m_Synced[ addr >> 6 ] &= ~( 1ULL << ( addr & 63 ) );
+			return;
+		}
+	}
+
 	if ( !shouldMirror( addr ) )
 	{
 		m_WritesSkipped++;
@@ -255,7 +285,9 @@ u32 CWriteBuffer::flushUpToPolicy( u32 maxBytes, bool deferHot )
 				}
 			}
 			m_Burst[ i ].addr  = a;
-			m_Burst[ i ].value = m_PendingValue[ a ];
+			// Active-row pointer bytes translate at delivery; everything else
+			// goes out as queued.
+			m_Burst[ i ].value = deliverValue( a, m_PendingValue[ a ] );
 		}
 		if ( n == 0 )
 			return m_Count;		// hot byte at the head; nothing to send
@@ -303,8 +335,19 @@ void CWriteBuffer::resyncSweep( u32 maxBytes )
 		if ( isDirty( a ) )
 			continue;				// pending value owns this address
 
+		u8 v = m_RAM[ a ];
+		if ( m_RelocCount && *m_RelocCount && a >= 0xC000 && a < 0xCC00 )
+		{
+			// A stolen block heals from its under-I/O SOURCE, not from the
+			// shadow underneath it -- the shadow there is program data whose
+			// DRAM copy is deliberately dead. This is also what repairs the
+			// rare mis-elimination a value-collision can cause.
+			const u8 srcV = m_RelocInUse[ ( (u32)a - 0xC000 ) >> 6 ];
+			if ( srcV != 0xFF )
+				v = m_RAM[ 0xC000 + ( (u32)srcV << 6 ) + ( a & 63 ) ];
+		}
 		m_Burst[ n ].addr  = a;
-		m_Burst[ n ].value = m_RAM[ a ];
+		m_Burst[ n ].value = deliverValue( a, v );
 		m_Synced[ a >> 6 ] |= 1ULL << ( a & 63 );
 		if ( ++n == SCPU_WRITEBUF_CHUNK )
 			break;

@@ -29,7 +29,7 @@
 #define _config_h
 
 
-#define TIMING_NAMES 28
+#define TIMING_NAMES 29
 const char timingNames[TIMING_NAMES][32] = {
 	"WAIT_FOR_SIGNALS", 
 	"WAIT_CYCLE_READ", 
@@ -77,7 +77,12 @@ const char timingNames[TIMING_NAMES][32] = {
 	// traffic (flushes and the resync sweep) so the display shows whatever
 	// real DRAM holds, undisturbed. Separates "our traffic corrupts fetches"
 	// from "our writes corrupt DRAM". 0 = never halt (normal operation).
-	"MIRROR_HALT_AFTER_S"
+	"MIRROR_HALT_AFTER_S",
+	// Not a timing: when a VIC-bank-3 sprite pointer selects a shape block at
+	// $D000-$DFFF (RAM to the VIC, chip registers to our bus writes), deliver
+	// a translated pointer into a relocated copy at $C000-$CBFF instead of
+	// silently showing stale DRAM. 3D Pool needs it; see CC64Memory.
+	"MIRROR_D000_RELOCATE"
 };
 
 // Which CPU core boot.cpp should install. Set from CPU_CORE in the config file;
@@ -115,6 +120,10 @@ extern int cfgBootAnimation;
 
 // Diagnostic; see MIRROR_HALT_AFTER_S in the names table.
 extern int cfgMirrorHaltAfterS;
+
+// Under-I/O sprite-shape relocation; see MIRROR_D000_RELOCATE in the names
+// table. Default on.
+extern int cfgMirrorD000Relocate;
 
 #define SCPU_CFG_MIRROR_DISPLAY_DEFAULT 1024
 

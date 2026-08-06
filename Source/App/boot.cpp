@@ -932,6 +932,13 @@ void scpuBootRun( CLogger *logger )
 	               (unsigned)cfgMirrorDisplayBytes,
 	               cfgMirrorDisplayBytes ? "" : " (border-only)" );
 
+	// Shape blocks a bank-3 game keeps under $D000-$DFFF are unreachable to
+	// bus writes (the halted 6510 keeps real I/O banked in), so their sprite
+	// pointers are delivered translated into relocated copies at $C000-$CBFF.
+	superCPU.setUnderIORelocate( cfgMirrorD000Relocate != 0 );
+	logger->Write( "SCPU", LogNotice, "mirror: under-I/O sprite relocation %s",
+	               cfgMirrorD000Relocate ? "on" : "off" );
+
 	// From superCPU.init() onward the Pi owns and accesses the C64 bus in
 	// sub-microsecond GPIO windows. Circle's timer/SD IRQs may pre-empt at any
 	// instruction, so leaving them enabled can stretch a nominally valid bus

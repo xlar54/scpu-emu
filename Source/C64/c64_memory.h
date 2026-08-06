@@ -224,7 +224,12 @@ public:
 				m_PtrRowWrites++;
 				if ( old != v )
 				{
-					if ( m_C64 ) m_C64->write( a, v );
+					// The VALUE delivered may differ from the value stored:
+					// a bank-3 pointer selecting a shape block under the I/O
+					// window is remapped to the block's relocated copy, the
+					// only place the real VIC can actually be fed from. See
+					// relocPointerValue().
+					if ( m_C64 ) m_C64->write( a, relocPointerValue( v ) );
 					updateHotShapeBlocks();
 				}
 			}
@@ -463,12 +468,72 @@ public:
 	// diagnostic that distinguishes pointer-flip animation from multiplexing.
 	u64  m_PtrRowWrites = 0;
 
+	// --- under-I/O sprite-shape relocation --------------------------------
+	// In VIC bank 3 a sprite pointer of $40-$7F selects a shape block at
+	// $D000-$DFFF: RAM to the VIC, which always fetches DRAM there, but
+	// unreachable to our mirror, because the halted 6510 keeps the real
+	// machine's I/O banked in and a bus write lands on a chip register (see
+	// CWriteBuffer::shouldMirror). A real SuperCPU-side program can still put
+	// shapes there -- 3D Pool /SCPU double-buffers across banks 1 and 3 and
+	// keeps thirty rotation blocks at $D080-$D77F, which is exactly why its
+	// balls alternated between correct (bank-1 frame, deliverable) and garbage
+	// (bank-3 frame, never delivered) at frame rate.
+	//
+	// The one lever we do control is the pointer VALUE we deliver. So: remap
+	// each under-I/O block, on first use, to a free block in $C000-$CBFF,
+	// mirror the shape bytes to the relocated copy, and deliver the remapped
+	// pointer. The real VIC then fetches identical bytes from an address it
+	// can be fed at. The shadow stays faithful throughout -- the program
+	// rereads its own values, and only deliveries are translated.
+	//
+	// The relocated blocks' underlying DRAM belongs to us from then on: the
+	// write buffer shields them from ordinary game-write delivery and the
+	// resync sweep heals them from the under-I/O source. That is safe because
+	// DRAM is only ever read by the VIC, and the VIC only reads what screen,
+	// bitmap and pointers select; a block both selected raw AND stolen would
+	// conflict, so allocation refuses blocks the current screen or bitmap
+	// spans.
+	bool m_RelocEnable = true;		// config MIRROR_D000_RELOCATE
+	u8   m_PtrReloc[ 0x40 ];		// under-I/O block (V-$40) -> reloc block, $FF none
+	u8   m_RelocInUse[ 0x30 ];		// reloc block -> source pointer V, $FF free
+	u8   m_RelocCount = 0;			// allocated blocks; the buffer's fast-out
+	u64  m_RelocAllocs = 0;			// statistics
+	u64  m_RelocDelivered = 0;		// pointer values delivered translated
+	u64  m_RelocExhausted = 0;		// translation wanted, no free block
+
+	// Deliverable stand-in for pointer value v written to the ACTIVE row.
+	// Identity for everything except bank-3 pointers into $D000-$DFFF.
+	u8 relocPointerValue( u8 v )
+	{
+		if ( !m_RelocEnable || v < 0x40 || v >= 0x80
+		     || m_SpritePtrBase < 0xC000 || m_SpritePtrBase == 0xFFFFFFFF )
+			return v;
+		const u8 slot = v - 0x40;
+		if ( m_PtrReloc[ slot ] != 0xFF )
+		{
+			m_RelocDelivered++;
+			return m_PtrReloc[ slot ];
+		}
+		const u8 r = allocRelocBlock( v );
+		if ( r == 0xFF )
+		{
+			m_RelocExhausted++;
+			return v;
+		}
+		m_RelocDelivered++;
+		return r;
+	}
+	u8 allocRelocBlock( u8 v );
+
 	// One bit per 64-byte block of the 64K space: set when an ACTIVE sprite
 	// pointer selects that block. The write buffer defers these bytes to the
 	// border so a re-rendered shape is only ever delivered whole -- the VIC
 	// fetches shapes on the sprite's own display lines, and a block updated
 	// mid-display shows the render's cleared/partial transient as a torn,
 	// flickering sprite. Kept fresh by pointer-row writes and $D018/$DD00.
+	//
+	// Under-I/O pointers are tracked as their RELOCATED block when one exists:
+	// that is the block actually being delivered to and fetched from.
 	u64  m_HotShapeBlocks[ 1024 / 64 ] = { 0 };
 	void updateHotShapeBlocks()
 	{
@@ -478,7 +543,11 @@ public:
 		const u32 bank = ( m_SpritePtrBase >> 14 ) & 3;
 		for ( u32 n = 0; n < 8; n++ )
 		{
-			const u32 blk = ( bank << 8 ) + m_RAM[ (u16)( m_SpritePtrBase + n ) ];
+			u32 v = m_RAM[ (u16)( m_SpritePtrBase + n ) ];
+			if ( m_RelocEnable && bank == 3 && v >= 0x40 && v < 0x80
+			     && m_PtrReloc[ v - 0x40 ] != 0xFF )
+				v = m_PtrReloc[ v - 0x40 ];
+			const u32 blk = ( bank << 8 ) + v;
 			m_HotShapeBlocks[ blk >> 6 ] |= 1ULL << ( blk & 63 );
 		}
 	}

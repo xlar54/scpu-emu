@@ -56,8 +56,63 @@ CC64Memory::CC64Memory()
 	for ( u32 i = 0; i < C64_BASIC_SIZE; i++ )    m_Basic[ i ] = 0xFF;
 	for ( u32 i = 0; i < C64_KERNAL_SIZE; i++ )   m_Kernal[ i ] = 0xFF;
 	for ( u32 i = 0; i < C64_CHARROM_SIZE; i++ )  m_CharROM[ i ] = 0;
+	for ( u32 i = 0; i < 0x40; i++ ) m_PtrReloc[ i ] = 0xFF;
+	for ( u32 i = 0; i < 0x30; i++ ) m_RelocInUse[ i ] = 0xFF;
 
 	updateBankMode();
+}
+
+// Claim a free deliverable block in $C000-$CBFF as the relocated home of
+// under-I/O shape block v ($40-$7F), and queue the block's current shadow
+// content at its new address. Returns the relocated block value, or $FF when
+// nothing usable is free.
+//
+// A block is usable when the VIC cannot be displaying it as anything else:
+// not inside the active screen matrix (whose pointer row the translation
+// serves) and not inside an active bank-3 bitmap. The blocks may well hold
+// program data -- 3D Pool keeps tables in all of $C000-$CBFF -- but that data
+// is only ever read back through the shadow; its DRAM copy is dead weight
+// unless displayed, and allocation just ruled displaying out.
+u8 CC64Memory::allocRelocBlock( u8 v )
+{
+	// Forbidden span 1: the active screen matrix, as blocks.
+	const u32 screenBase = ( m_SpritePtrBase - 0x3F8 ) & 0xFFFF;
+	// Forbidden span 2: a bitmap in the low half of bank 3. $D011 bit 5 turns
+	// bitmap mode on; $D018 bit 3 picks the half. 8K starting at $C000 covers
+	// the whole window -- in that configuration there is nothing to allocate.
+	const bool lowBitmap = ( m_VICRegShadow[ 0x11 ] & 0x20 )
+	                    && !( m_LastD018 & 0x08 );
+
+	for ( u8 r = 0; r < 0x30; r++ )
+	{
+		if ( m_RelocInUse[ r ] != 0xFF )
+			continue;
+		const u32 addr = 0xC000 + ( (u32)r << 6 );
+		if ( addr >= screenBase && addr < screenBase + 0x400 )
+			continue;
+		if ( lowBitmap )
+			continue;
+
+		m_PtrReloc[ v - 0x40 ] = r;
+		m_RelocInUse[ r ] = v;
+		m_RelocCount++;
+		m_RelocAllocs++;
+
+		// Re-issue the shape's current shadow bytes at their under-I/O source
+		// addresses, with the tables already armed: the write buffer's
+		// translation queues them at the relocated block, bypassing same-value
+		// elimination the way every translated write does. Shapes written
+		// before the pointer arrive through this replay; shapes written after
+		// are translated per-write as they happen.
+		if ( m_Mirror )
+		{
+			const u32 src = 0xC000 + ( (u32)v << 6 );
+			for ( u32 i = 0; i < 64; i++ )
+				m_Mirror->onRamWrite( (u16)( src + i ), m_RAM[ src + i ] );
+		}
+		return r;
+	}
+	return 0xFF;
 }
 
 void CC64Memory::reset()
@@ -74,6 +129,13 @@ void CC64Memory::reset()
 	m_CIA2PortALatch = 0;
 	m_LastCIA2PortARead = 0;
 	m_LastD018 = 0x14;			// the KERNAL default: screen $0400, charset $1000
+	// Relocation tables before updateHotShapeBlocks, which consults them.
+	// Cleared on reset: the game that allocated them is gone, and stale
+	// mappings would translate a NEW program's pointers to blocks holding the
+	// OLD program's shapes.
+	for ( u32 i = 0; i < 0x40; i++ ) m_PtrReloc[ i ] = 0xFF;
+	for ( u32 i = 0; i < 0x30; i++ ) m_RelocInUse[ i ] = 0xFF;
+	m_RelocCount = 0;
 	updateSpritePtrBase();
 	updateHotShapeBlocks();
 	for ( u32 i = 0; i < 0x40; i++ ) m_VICRegShadow[ i ] = 0;
@@ -425,9 +487,10 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 
 		// Active-screen sprite pointers go to the real bus immediately; see
 		// the note in writeFast, which is the path that usually takes them.
+		// Delivered through the same under-I/O relocation as writeFast.
 		if ( old != value && ( (u32)a & ~7u ) == m_SpritePtrBase )
 		{
-			if ( m_C64 ) m_C64->write( a, value );
+			if ( m_C64 ) m_C64->write( a, relocPointerValue( value ) );
 			updateHotShapeBlocks();
 		}
 	}
