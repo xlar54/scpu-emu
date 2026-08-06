@@ -46,6 +46,17 @@
 // Defined in main.cpp, which owns the FAT filesystem object.
 extern "C" void radUnmountFileSystem();
 
+// Diagnostics have to run with interrupts ENABLED to reach the screen: Circle
+// cannot complete a logger write while they are masked. The frame hook runs
+// between frames with no bus access in flight, so briefly unmasking there
+// cannot disturb a timed bus window.
+class CScopedLoggingIRQs
+{
+public:
+	CScopedLoggingIRQs()  { EnableIRQs(); }
+	~CScopedLoggingIRQs() { DisableIRQs(); }
+};
+
 // Bus waits that hit their ceiling instead of seeing the signal they wanted.
 // Defined in Bus/RAD/gpio_defs.cpp; declared here rather than including
 // lowlevel_dma.h, which needs the whole GPIO header stack ahead of it.
@@ -392,6 +403,7 @@ static bool scpuCheckButton( void *ctx )
 		{
 			lastBA = radBAWaitTimeouts;
 			lastPHI = radPHIWaitTimeouts;
+			CScopedLoggingIRQs irqs;
 			s_Logger->Write( "SCPU", LogNotice,
 			               "BUS WAIT TIMEOUT: BA=%u PHI=%u (bus stopped answering)",
 			               (unsigned)lastBA, (unsigned)lastPHI );
@@ -465,6 +477,7 @@ static bool scpuCheckButton( void *ctx )
 			const u32 span = s_HeartbeatPCHigh - s_HeartbeatPCLow;
 			const bool stalled = ( span < 64 );
 
+			CScopedLoggingIRQs irqs;
 			s_Logger->Write( "SCPU", LogNotice,
 			               "hb PC=$%06X..$%06X wb=%u iec=%u BA=%u PHI=%u%s",
 			               (unsigned)s_HeartbeatPCLow, (unsigned)s_HeartbeatPCHigh,
@@ -481,9 +494,10 @@ static bool scpuCheckButton( void *ctx )
 				if ( ++s_HeartbeatStalledRuns == 3 && !s_HeartbeatDumped )
 				{
 					s_HeartbeatDumped = true;
+					scpuSnapshotResetDiagnostic( scpu );
+					CScopedLoggingIRQs dumpIRQs;
 					s_Logger->Write( "SCPU", LogNotice,
 					               "STALL DETECTED -- dumping state (no reset pressed)" );
-					scpuSnapshotResetDiagnostic( scpu );
 					scpuEmitResetDiagnostic();
 				}
 			}
@@ -506,7 +520,10 @@ static bool scpuCheckButton( void *ctx )
 		if ( scpu->memory().iecBusActive() )
 			s_ResetDiagnosticQuietFrames = 0;
 		else if ( ++s_ResetDiagnosticQuietFrames >= 3 )
+		{
+			CScopedLoggingIRQs irqs;
 			scpuEmitResetDiagnostic();
+		}
 	}
 
 	return false;
@@ -875,13 +892,19 @@ void scpuBootRun( CLogger *logger )
 	               (unsigned)cfgMirrorDisplayBytes,
 	               cfgMirrorDisplayBytes ? "" : " (border-only)" );
 
-	// From superCPU.init() onward the Pi owns and accesses the C64 bus in
-	// sub-microsecond GPIO windows. Circle's timer/SD IRQs may pre-empt at any
-	// instruction, so leaving them enabled can stretch a nominally valid bus
-	// phase into the VIC-II's half-cycle. The filesystem is already unmounted
-	// above and all configuration-dependent startup messages have been emitted;
-	// match upstream RAD and keep ARM IRQs masked for timed bus operation.
-	DisableIRQs();
+	// The Pi owns the C64 bus in sub-microsecond GPIO windows from here on, and
+	// Circle's timer/SD IRQs can pre-empt mid-window and stretch a valid bus
+	// phase into the VIC-II's half-cycle. So the bus runs IRQ-masked -- but
+	// masking them around the whole of startup silently killed the log.
+	//
+	// Circle cannot complete a logger write with IRQs masked. Masking here, with
+	// no matching enable anywhere, meant every line after this point went
+	// nowhere: the startup banner, the interpreter benchmark, the bus self-test
+	// result, and -- worst -- the freeze diagnostics added specifically to
+	// explain the hangs. Silence read as evidence when it was only a muted log.
+	//
+	// Masking is therefore scoped to where it is needed (see scpuLogSafely and
+	// the run loop below) instead of latched on here.
 
 	if ( !superCPU.init( &radBus, core, SCPU_SIMM_16MB ) )
 	{
@@ -937,6 +960,10 @@ void scpuBootRun( CLogger *logger )
 	logger->Write( "SCPU", LogNotice, "starting the CPU core" );
 	logger->Write( "SCPU", LogNotice,
 	               "buttons: LEFT = reboot the Pi, RIGHT = reset the emulated C64" );
+
+	// Bus work starts here, so mask interrupts from here on. Every diagnostic
+	// path re-enables them for the duration of its own logging.
+	DisableIRQs();
 
 	// Run about two seconds of emulated time, then report what the emulator
 	// thinks it has drawn only after a bounded wait for an IEC-quiet window.
