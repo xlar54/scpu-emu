@@ -116,6 +116,10 @@ public:
 	// slow mode; the latter may be in a serial wait even after the activity
 	// timer has expired.
 	bool fineTicksRequired() const { return m_Bank0 && m_Bank0->fineTicksRequired(); }
+	void notifyInterruptAcknowledged()
+	{
+		if ( m_Bank0 ) m_Bank0->notifyInterruptAcknowledged();
+	}
 	bool nmiAsserted() override { return m_Bank0 ? m_Bank0->nmiFast() : false; }
 	void tick( u32 nCycles ) override { if ( m_Bank0 ) m_Bank0->tickFast( nCycles ); }
 

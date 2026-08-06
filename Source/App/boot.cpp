@@ -479,12 +479,13 @@ static bool scpuCheckButton( void *ctx )
 
 			CScopedLoggingIRQs irqs;
 			s_Logger->Write( "SCPU", LogNotice,
-			               "hb PC=$%06X..$%06X wb=%u iec=%u BA=%u PHI=%u%s",
+			               "hb PC=$%06X..$%06X wb=%u iec=%u BA=%u PHI=%u irqbank=%u%s",
 			               (unsigned)s_HeartbeatPCLow, (unsigned)s_HeartbeatPCHigh,
 			               (unsigned)scpu->writeBuffer().pending(),
 			               (unsigned)( scpu->memory().iecBusActive() ? 1 : 0 ),
 			               (unsigned)radBAWaitTimeouts,
 			               (unsigned)radPHIWaitTimeouts,
+			               (unsigned)scpu->registers().m_InterruptBankCloses,
 			               stalled ? "  <-- STALLED" : "" );
 
 			if ( stalled )

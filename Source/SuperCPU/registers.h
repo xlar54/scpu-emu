@@ -165,6 +165,34 @@ public:
 	bool turboEnabled() const        { return fastMode(); }
 	bool hardwareRegsEnabled() const { return m_HWRegsEnabled; }
 
+	// Servicing an interrupt closes the register bank.
+	//
+	// CMD's own vector table proves it. With the bank OPEN, $E000-$FFFF is the
+	// KS image, whose IRQ vector reads $FF48 -- and $FF48 sits inside a HOLE in
+	// that same image ($FF2D-$FF74 is zeros in both the 1.4 and 2.04 ROMs).
+	// A vector pointing at a hole in the image that supplied it is only
+	// coherent if the handler runs from somewhere else, and $FF48 in the KT
+	// image is the genuine KERNAL IRQ entry. So the bank must close as the
+	// interrupt is taken, which is also what lets CMD leave it open across long
+	// stretches of code without disabling interrupts.
+	//
+	// Without this the machine executes $00 = BRK at $FF48, which vectors
+	// straight back to $FF48: an infinite BRK loop with the stack filling,
+	// captured on hardware as a frozen C64 and a live Pi.
+	void onInterruptAcknowledged() override
+	{
+		if ( m_HWRegsEnabled )
+		{
+			m_HWRegsEnabled = false;
+			m_InterruptBankCloses++;
+			applyKernalShadow();
+		}
+	}
+
+	// How often an interrupt arrived with the bank open. Reported by the
+	// firmware heartbeat: a healthy machine does this routinely.
+	u64 m_InterruptBankCloses = 0;
+
 	// Diagnostics only: peek the $D200 scratch window without going through
 	// the I/O path.
 	u8 sysRAM( u8 offset ) const { return m_SysRAM[ offset ]; }

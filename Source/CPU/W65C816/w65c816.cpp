@@ -188,6 +188,14 @@ void CW65C816::opBIT( u16 v, bool immediate )
 
 void CW65C816::serviceInterrupt( u32 vectorNative, u32 vectorEmu, bool isBRKorCOP )
 {
+	// A HARDWARE interrupt closes the accelerator's register bank before the
+	// handler runs. BRK and COP are instructions, not interrupts, and leave it
+	// alone. See CSuperCPURegisters::onInterruptAcknowledged for why the
+	// hardware must behave this way -- the short version is that the KS image's
+	// own IRQ vector points into a hole in the KS image.
+	if ( !isBRKorCOP && m_FastBus )
+		m_FastBus->notifyInterruptAcknowledged();
+
 	// Interrupts and COP use the "old" stack class, so they stay inside page 1
 	// in emulation mode.
 	if ( m_E )

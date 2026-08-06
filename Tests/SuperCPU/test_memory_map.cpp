@@ -407,3 +407,37 @@ TEST( scpu_private_ram_writes_need_the_register_bank_open )
 	CHECK( regs.ioRead( 0xD20C, v ) );
 	CHECK_EQ( v, 0x5A );
 }
+
+TEST( integration_hardware_interrupt_closes_the_register_bank )
+{
+	// The "@$" freeze, pinned. With the register bank OPEN, $E000-$FFFF is the
+	// KS image -- and CMD's KS image is not a whole KERNAL. ROM $9F2D-$9F74,
+	// which is $FF2D-$FF74 through that window, is zeros in BOTH the 1.4 and
+	// 2.04 images, and $FF48 (the KERNAL IRQ entry) sits inside it.
+	//
+	// Yet the KS vector table's own IRQ vector reads $FF48. A vector pointing
+	// into a hole in the image that supplied it is only coherent if the handler
+	// runs from the OTHER image, where $FF48 is the real KERNAL entry. So a
+	// hardware interrupt must close the bank as it is taken. Without that the
+	// machine executes $00 = BRK at $FF48, which vectors back to $FF48: an
+	// infinite loop with the stack filling, seen on hardware as a frozen C64.
+	//
+	// BRK and COP are instructions, not interrupts, and must NOT close it.
+	CSuperCPURegisters regs;
+	u32 kernalShadowBase = 0xE000;
+	regs.reset();
+	regs.trackKernalShadow( &kernalShadowBase );
+
+	regs.ioWrite( SCPU_REG_HWREGS_ENABLE, 0 );
+	CHECK( regs.hardwareRegsEnabled() );
+	CHECK_EQ( kernalShadowBase, 0x6000u );		// KS while open
+
+	regs.onInterruptAcknowledged();
+	CHECK( !regs.hardwareRegsEnabled() );
+	CHECK_EQ( kernalShadowBase, 0xE000u );		// KT for the handler
+	CHECK_EQ( regs.m_InterruptBankCloses, 1u );
+
+	// Already closed: acknowledging again is a no-op, not a second count.
+	regs.onInterruptAcknowledged();
+	CHECK_EQ( regs.m_InterruptBankCloses, 1u );
+}
