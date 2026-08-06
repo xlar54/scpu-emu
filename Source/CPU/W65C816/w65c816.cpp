@@ -68,6 +68,8 @@ void CW65C816::reset()
 	m_EABank0 = false;
 
 	m_PC = read16Bank0( (u16)W65_VEC_EMU_RESET );
+
+	rebuildPending();
 }
 
 // ---------------------------------------------------------------------------
@@ -245,8 +247,22 @@ u32 CW65C816::step()
 	return used;
 }
 
+// Single-step entry: force the full cold prologue, so behaviour is
+// byte-identical to the historical per-instruction path. The differential
+// suite runs through here.
 u32 CW65C816::stepNoTick()
 {
+	rebuildPending();
+	return stepInner();
+}
+
+u32 CW65C816::stepInner()
+{
+	if ( m_Pending )
+	{
+	// Cold prologue. Ordering is load-bearing and kept verbatim from the
+	// per-instruction original: stopped -> sample -> NMI -> WAI -> IRQ.
+
 	// STP stops the clock, and only RESET restarts it -- not IRQ, not NMI. Burn
 	// a cycle and keep ticking the bus so the C64 around us carries on.
 	if ( m_Stopped )
@@ -256,16 +272,28 @@ u32 CW65C816::stepNoTick()
 	}
 
 	// NMI is edge triggered, IRQ level triggered. One combined sample pays
-	// the cache-refresh check once for both lines.
-	bool irq = false, nmiLevel = false;
-	busInterrupts( irq, nmiLevel );
-	if ( nmiLevel && !m_NMIPrevLevel ) m_NMIPending = true;
-	m_NMIPrevLevel = nmiLevel;
+	// the cache-refresh check once for both lines. Between bus ticks the
+	// cache cannot change, so the batch loop requests a sample only for its
+	// first instruction; a high-but-masked IRQ line keeps W65_PEND_IRQLINE
+	// set so CLI still takes the interrupt on the very next instruction.
+	bool irq = ( m_Pending & W65_PEND_IRQLINE ) != 0;
+	if ( m_Pending & W65_PEND_SAMPLE )
+	{
+		bool nmiLevel = false;
+		busInterrupts( irq, nmiLevel );
+		if ( nmiLevel && !m_NMIPrevLevel ) m_NMIPending = true;
+		m_NMIPrevLevel = nmiLevel;
+		m_Pending = (u8)( ( m_Pending
+		            & (u8)~( W65_PEND_SAMPLE | W65_PEND_IRQLINE | W65_PEND_NMI ) )
+		          | ( irq ? W65_PEND_IRQLINE : 0 )
+		          | ( m_NMIPending ? W65_PEND_NMI : 0 ) );
+	}
 
 	if ( m_NMIPending )
 	{
 		m_NMIPending = false;
 		m_Waiting = false;
+		m_Pending &= (u8)~( W65_PEND_NMI | W65_PEND_WAITING );
 		m_NMIsTaken++;
 		const u32 c = m_E ? 7 : 8;
 		serviceInterrupt( W65_VEC_NATIVE_NMI, W65_VEC_EMU_NMI, false );
@@ -285,6 +313,7 @@ u32 CW65C816::stepNoTick()
 			return 1;
 		}
 		m_Waiting = false;
+		m_Pending &= (u8)~W65_PEND_WAITING;
 	}
 
 	if ( irq && !( m_P & W65_I ) )
@@ -294,6 +323,7 @@ u32 CW65C816::stepNoTick()
 		serviceInterrupt( W65_VEC_NATIVE_IRQ, W65_VEC_EMU_IRQ, false );
 		m_Cycles += c;
 		return c;
+	}
 	}
 
 	// Captured before dispatch: REP, SEP, PLP, RTI and XCE change the register
@@ -845,8 +875,8 @@ u32 CW65C816::stepNoTick()
 	case 0x00: fetch8(); serviceInterrupt( W65_VEC_NATIVE_BRK, W65_VEC_EMU_BRK, true ); break;
 	case 0x02: fetch8(); serviceInterrupt( W65_VEC_NATIVE_COP, W65_VEC_EMU_COP, true ); break;
 
-	case 0xDB: m_Stopped = true; break;									// STP
-	case 0xCB: m_Waiting = true; break;									// WAI
+	case 0xDB: m_Stopped = true; m_Pending |= W65_PEND_STOPPED; break;	// STP
+	case 0xCB: m_Waiting = true; m_Pending |= W65_PEND_WAITING; break;	// WAI
 	case 0xEA: break;													// NOP
 
 	case 0x42:															// WDM
@@ -884,24 +914,46 @@ u64 CW65C816::run( u64 nCycles )
 	// edges sampled that close together. busFineTicks() drops the loop to
 	// per-instruction ticks for the duration; it also catches the arming
 	// write itself, because the check runs after every instruction.
+	// The batch runs up to eight instructions with NO interrupt bookkeeping
+	// between them: the interrupt cache can only refresh inside busTick, so
+	// sampling is requested once per batch (W65_PEND_SAMPLE below) and the
+	// pending byte keeps the cold prologue out of the loop entirely. Ticks
+	// are accounted by cycle delta rather than a per-instruction accumulator.
+	//
+	// The fixed batch is only entered with more than 80 cycles of budget
+	// left: the most expensive single instruction is 9 cycles (see the
+	// max-cycles host assert), so eight of them cannot overrun the bound.
+	// Below that the tail runs one instruction at a time, preserving the
+	// exact stopping point.
 	const u64 start = m_Cycles;
 	m_RunBreak = false;
-	u32 pending = 0;
-	u32 sinceTick = 0;
+	rebuildPending();
 
 	while ( m_Cycles - start < nCycles && !m_RunBreak )
 	{
-		pending += stepNoTick();
+		const u64 tickBase = m_Cycles;
+		if ( nCycles - ( m_Cycles - start ) > 80 )
+		{
+			for ( u32 i = 0; i < 8; i++ )
+			{
+				stepInner();
+				if ( m_RunBreak || m_Stopped )
+					break;
+				// Serial-bus edge pacing needs per-instruction ticks, and
+				// this check is also what catches the arming write itself.
+				if ( busFineTicks() )
+					break;
+			}
+		}
+		else
+		{
+			stepInner();
+		}
+
+		busTick( (u32)( m_Cycles - tickBase ) );
+		m_Pending |= W65_PEND_SAMPLE;
 		if ( m_Stopped )
 			break;
-		if ( ++sinceTick >= 8 || busFineTicks() )
-		{
-			busTick( pending );
-			pending = 0;
-			sinceTick = 0;
-		}
 	}
-	if ( pending )
-		busTick( pending );
 	return m_Cycles - start;
 }

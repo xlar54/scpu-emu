@@ -79,6 +79,13 @@ class CSuperCPUMemoryMap;
 #define W65_VEC_EMU_IRQ       0x00FFFE
 #define W65_VEC_EMU_BRK       0x00FFFE
 
+// Bits of CW65C816::m_Pending. See the member note.
+#define W65_PEND_STOPPED 1
+#define W65_PEND_WAITING 2
+#define W65_PEND_NMI     4
+#define W65_PEND_SAMPLE  8
+#define W65_PEND_IRQLINE 16
+
 class CW65C816 : public ICpu
 {
 public:
@@ -210,6 +217,26 @@ private:
 	bool     m_RunBreak;
 	bool     m_NMIPrevLevel;
 	bool     m_NMIPending;
+
+	// Pending-work byte: nonzero when the NEXT instruction needs the cold
+	// prologue -- interrupt sample, NMI/IRQ dispatch, WAI, STP. Zero is the
+	// common case inside a run() batch, where one byte load and branch
+	// replaces ~47 instructions of per-instruction interrupt bookkeeping.
+	// That bookkeeping is provably redundant there: the interrupt cache can
+	// only refresh in tickFast, and run() ticks once per batch, so the
+	// sampled lines cannot change between the batch's instructions. The
+	// underlying members (m_Stopped, m_Waiting, m_NMIPending) stay
+	// authoritative; this byte is derived state, rebuilt by rebuildPending().
+	u8       m_Pending;
+
+	void rebuildPending()
+	{
+		m_Pending = (u8)( ( m_Stopped    ? W65_PEND_STOPPED : 0 )
+		                | ( m_Waiting    ? W65_PEND_WAITING : 0 )
+		                | ( m_NMIPending ? W65_PEND_NMI     : 0 )
+		                | W65_PEND_SAMPLE );
+	}
+	u32 stepInner();
 
 	// Set during address calculation and branching, consumed by w65c816Cycles().
 	bool m_PageCross;

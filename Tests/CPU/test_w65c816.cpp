@@ -1107,3 +1107,26 @@ TEST( w65c816_dispatch_consumes_exactly_the_table_length )
 
 	CHECK( true );
 }
+
+TEST( w65c816_no_instruction_exceeds_ten_cycles )
+{
+	// run()'s batch loop enters a fixed eight-instruction batch only when
+	// more than 80 cycles of budget remain, on the guarantee that no single
+	// instruction costs more than 10. This pins that guarantee against the
+	// cycle table: if a future correction pushes an instruction past 10, the
+	// batch could overrun its budget and this must fail loudly.
+	u32 worst = 0;
+	for ( u32 op = 0; op < 256; op++ )
+		for ( int m8 = 0; m8 <= 1; m8++ )
+			for ( int x8 = 0; x8 <= 1; x8++ )
+				for ( int e = 0; e <= 1; e++ )
+					for ( int dp = 0; dp <= 1; dp++ )
+						for ( int px = 0; px <= 1; px++ )
+							for ( int bt = 0; bt <= 1; bt++ )
+							{
+								const u32 c = w65c816Cycles( (u8)op, m8 != 0, x8 != 0,
+								                             e != 0, dp != 0, px != 0, bt != 0 );
+								if ( c > worst ) worst = c;
+							}
+	CHECK( worst <= 10 );
+}
