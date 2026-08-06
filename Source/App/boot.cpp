@@ -893,19 +893,19 @@ void scpuBootRun( CLogger *logger )
 	               (unsigned)cfgMirrorDisplayBytes,
 	               cfgMirrorDisplayBytes ? "" : " (border-only)" );
 
-	// The Pi owns the C64 bus in sub-microsecond GPIO windows from here on, and
-	// Circle's timer/SD IRQs can pre-empt mid-window and stretch a valid bus
-	// phase into the VIC-II's half-cycle. So the bus runs IRQ-masked -- but
-	// masking them around the whole of startup silently killed the log.
+	// From superCPU.init() onward the Pi owns and accesses the C64 bus in
+	// sub-microsecond GPIO windows. Circle's timer/SD IRQs may pre-empt at any
+	// instruction, so leaving them enabled can stretch a nominally valid bus
+	// phase into the VIC-II's half-cycle. Match upstream RAD and keep ARM IRQs
+	// masked for timed bus operation.
 	//
-	// Circle cannot complete a logger write with IRQs masked. Masking here, with
-	// no matching enable anywhere, meant every line after this point went
-	// nowhere: the startup banner, the interpreter benchmark, the bus self-test
-	// result, and -- worst -- the freeze diagnostics added specifically to
-	// explain the hangs. Silence read as evidence when it was only a muted log.
-	//
-	// Masking is therefore scoped to where it is needed (see scpuLogSafely and
-	// the run loop below) instead of latched on here.
+	// This masking is LOAD-BEARING, established by bisection: moving it later
+	// so that startup logging would work stopped games loading at all, because
+	// init(), the bus self-test and the first frames then ran with interrupts
+	// live. Logging is bought back the other way instead -- CScopedLoggingIRQs
+	// unmasks around individual log writes, which happen between bus
+	// operations, never inside one.
+	DisableIRQs();
 
 	if ( !superCPU.init( &radBus, core, SCPU_SIMM_16MB ) )
 	{
@@ -921,6 +921,11 @@ void scpuBootRun( CLogger *logger )
 	}
 
 	actLED.Blink( 3 );		// milestone: bus acquired
+
+	// Interrupts are masked from here to the end of the run loop, so every
+	// remaining startup message needs the same brief unmask the frame-hook
+	// diagnostics use. These all sit between bus operations, never inside one.
+	CScopedLoggingIRQs startupIRQs;
 
 	// The pure-interpreter figure, no bus and no scheduler: 70 means 20MHz.
 	if ( superCPU.benchArmPerEmuCycle() )
@@ -962,8 +967,7 @@ void scpuBootRun( CLogger *logger )
 	logger->Write( "SCPU", LogNotice,
 	               "buttons: LEFT = reboot the Pi, RIGHT = reset the emulated C64" );
 
-	// Bus work starts here, so mask interrupts from here on. Every diagnostic
-	// path re-enables them for the duration of its own logging.
+	// Startup reporting is done; interrupts go back to masked for the run.
 	DisableIRQs();
 
 	// Run about two seconds of emulated time, then report what the emulator
