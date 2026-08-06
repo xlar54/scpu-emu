@@ -98,6 +98,11 @@ extern int cfgJiffyDOS;
 // can carry. See CSuperCPU::setMirrorDisplayBudget.
 extern int cfgMirrorDisplayBytes;
 
+// Run SuperCPU DOS 2.04's C64 startup animation, which the ROM carries but
+// skips on the faithful path. One-byte read deviation; see
+// CSuperCPURegisters::ioRead.
+extern int cfgBootAnimation;
+
 #define SCPU_CFG_MIRROR_DISPLAY_DEFAULT 1024
 
 extern int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME );
