@@ -123,8 +123,15 @@ public:
 	// --- register width ---------------------------------------------------
 	// Emulation mode forces both to 8 bits regardless of the flag bits, so
 	// these are the only correct way to ask.
-	inline bool memory8() const { return m_E || ( m_P & W65_M ) != 0; }
-	inline bool index8()  const { return m_E || ( m_P & W65_X ) != 0; }
+	// always_inline on exactly these five: at -Os the compiler outlines them
+	// into comdat functions that every OTHER outlined helper then calls --
+	// setZNM became a 16-instruction body plus a call to memory8 plus a tail
+	// call to setZN8. Forcing just these five makes the mid-level helpers
+	// self-contained leaves, for +400 bytes of step(). Do NOT widen the set:
+	// adding the accumulator/index accessors as well measured +13.2KB, which
+	// blows the 32K L1I budget and reintroduces the refills -Os eliminated.
+	__attribute__((always_inline)) inline bool memory8() const { return m_E || ( m_P & W65_M ) != 0; }
+	__attribute__((always_inline)) inline bool index8()  const { return m_E || ( m_P & W65_X ) != 0; }
 
 	// While E=1 the hardware CONTINUOUSLY forces SH=$01, m=1, x=1 and the high
 	// bytes of X and Y to $00 -- writes to them simply do not take.
@@ -292,9 +299,9 @@ private:
 	inline u16 immediateX() { return index8()  ? (u16)fetch8() : fetch16(); }
 
 	// --- flags ------------------------------------------------------------
-	inline void setFlag( u8 mask, bool on ) { if ( on ) m_P |= mask; else m_P = (u8)( m_P & ~mask ); }
-	inline void setZN8( u8 v )  { setFlag( W65_Z, v == 0 ); setFlag( W65_N, ( v & 0x80 ) != 0 ); }
-	inline void setZN16( u16 v ){ setFlag( W65_Z, v == 0 ); setFlag( W65_N, ( v & 0x8000 ) != 0 ); }
+	__attribute__((always_inline)) inline void setFlag( u8 mask, bool on ) { if ( on ) m_P |= mask; else m_P = (u8)( m_P & ~mask ); }
+	__attribute__((always_inline)) inline void setZN8( u8 v )  { setFlag( W65_Z, v == 0 ); setFlag( W65_N, ( v & 0x80 ) != 0 ); }
+	__attribute__((always_inline)) inline void setZN16( u16 v ){ setFlag( W65_Z, v == 0 ); setFlag( W65_N, ( v & 0x8000 ) != 0 ); }
 	inline void setZNM( u16 v ) { if ( memory8() ) setZN8( (u8)v ); else setZN16( v ); }
 	inline void setZNX( u16 v ) { if ( index8() )  setZN8( (u8)v ); else setZN16( v ); }
 
