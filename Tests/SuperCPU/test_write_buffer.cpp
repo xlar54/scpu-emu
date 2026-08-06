@@ -472,3 +472,47 @@ TEST( writebuf_resync_sweep_converges_dram_to_shadow )
 	wb.flush();
 	CHECK_EQ( bus.m_Memory[ 0x8000 ], 0x11 );	// delivered by the queue
 }
+
+TEST( writebuf_hot_shape_blocks_wait_for_the_border )
+{
+	// A re-rendered sprite shape must reach real DRAM whole. The render
+	// passes through a cleared/partial transient, and at queue latency that
+	// transient would sit in DRAM for milliseconds -- the VIC fetches shapes
+	// on the sprite's own display lines and shows it as a torn, flickering
+	// sprite. So bytes in ACTIVE shape blocks are delivered only by border
+	// drains (deferHot=false); a display drain stops when it reaches one.
+	CHostBus bus;
+	u8 ram[ 0x10000 ] = { 0 };
+	u64 hot[ 1024 / 64 ] = { 0 };
+	CWriteBuffer wb;
+	wb.attach( &bus, ram );
+	wb.setOptMode( SCPU_OPT_NONE );
+	wb.attachHotShapeBlocks( hot );
+
+	// Block 64 ($1000-$103F) is an active shape block.
+	hot[ 64 >> 6 ] |= 1ULL << ( 64 & 63 );
+
+	// Queue: two cold bytes, one hot byte, one more cold byte -- FIFO order.
+	wb.onRamWrite( 0x2000, 0x11 ); ram[ 0x2000 ] = 0x11;
+	wb.onRamWrite( 0x2001, 0x22 ); ram[ 0x2001 ] = 0x22;
+	wb.onRamWrite( 0x1010, 0x33 ); ram[ 0x1010 ] = 0x33;	// hot
+	wb.onRamWrite( 0x3000, 0x44 ); ram[ 0x3000 ] = 0x44;
+	CHECK_EQ( wb.pending(), 4u );
+
+	// Display drain: delivers up to the hot byte, then stops.
+	wb.flushUpToPolicy( 64, true );
+	CHECK_EQ( bus.m_Memory[ 0x2000 ], 0x11 );
+	CHECK_EQ( bus.m_Memory[ 0x2001 ], 0x22 );
+	CHECK( bus.m_Memory[ 0x1010 ] != 0x33 );
+	CHECK_EQ( wb.pending(), 2u );
+
+	// Another display drain makes no progress: hot byte is at the head.
+	wb.flushUpToPolicy( 64, true );
+	CHECK_EQ( wb.pending(), 2u );
+
+	// Border drain delivers the rest, hot block included.
+	wb.flushUpToPolicy( 64, false );
+	CHECK_EQ( bus.m_Memory[ 0x1010 ], 0x33 );
+	CHECK_EQ( bus.m_Memory[ 0x3000 ], 0x44 );
+	CHECK_EQ( wb.pending(), 0u );
+}

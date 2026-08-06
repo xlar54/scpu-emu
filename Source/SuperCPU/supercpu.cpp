@@ -38,6 +38,7 @@ bool CSuperCPU::init( IC64Bus *bus, SCPUCoreType core, u32 simmMB )
 	m_Memory.setIOInterceptor( &m_Registers );
 
 	m_WriteBuffer.attach( m_Bus, m_Memory.m_RAM );
+	m_WriteBuffer.attachHotShapeBlocks( m_Memory.m_HotShapeBlocks );
 
 	// SuperRAM, and the 24-bit space it lives in. Bank 0 of that space is the
 	// C64 itself; everything above is the accelerator's own memory and never
@@ -380,7 +381,7 @@ static void flushMirrorsRasterAware( CWriteBuffer &buffer, IC64Bus &bus,
 			break;
 
 		const u32 before = buffer.pending();
-		buffer.flushUpTo( chunk );
+		buffer.flushUpToPolicy( chunk, inDisplay );
 		const u32 after = buffer.pending();
 
 		// A detached or failing sink must not turn this loop into a spin.

@@ -219,8 +219,15 @@ public:
 			// later; coalescing holds the latest value, so re-sending it is
 			// harmless. Same-value rewrites are a no-op on real hardware and
 			// are skipped.
-			if ( old != v && ( (u32)a & ~7u ) == m_SpritePtrBase && m_C64 )
-				m_C64->write( a, v );
+			if ( ( (u32)a & ~7u ) == m_SpritePtrBase )
+			{
+				m_PtrRowWrites++;
+				if ( old != v )
+				{
+					if ( m_C64 ) m_C64->write( a, v );
+					updateHotShapeBlocks();
+				}
+			}
 			return;
 		}
 		write8( a, v );
@@ -450,6 +457,32 @@ private:
 	// mirrored at all. Kept fresh by writes to $D018 and $DD00.
 	u32  m_SpritePtrBase;
 	u8   m_LastD018;
+public:
+	// Writes aimed at the active sprite-pointer row, same-value or not. A
+	// multiplexer rewrites this row several times per FRAME; the rate is the
+	// diagnostic that distinguishes pointer-flip animation from multiplexing.
+	u64  m_PtrRowWrites = 0;
+
+	// One bit per 64-byte block of the 64K space: set when an ACTIVE sprite
+	// pointer selects that block. The write buffer defers these bytes to the
+	// border so a re-rendered shape is only ever delivered whole -- the VIC
+	// fetches shapes on the sprite's own display lines, and a block updated
+	// mid-display shows the render's cleared/partial transient as a torn,
+	// flickering sprite. Kept fresh by pointer-row writes and $D018/$DD00.
+	u64  m_HotShapeBlocks[ 1024 / 64 ] = { 0 };
+	void updateHotShapeBlocks()
+	{
+		for ( u32 i = 0; i < 1024 / 64; i++ ) m_HotShapeBlocks[ i ] = 0;
+		if ( m_SpritePtrBase == 0xFFFFFFFF )
+			return;
+		const u32 bank = ( m_SpritePtrBase >> 14 ) & 3;
+		for ( u32 n = 0; n < 8; n++ )
+		{
+			const u32 blk = ( bank << 8 ) + m_RAM[ (u16)( m_SpritePtrBase + n ) ];
+			m_HotShapeBlocks[ blk >> 6 ] |= 1ULL << ( blk & 63 );
+		}
+	}
+private:
 public:
 	// Last value written to each VIC register, maintained on the I/O write
 	// path. The mirror scheduler reads sprite Y positions and the enable mask

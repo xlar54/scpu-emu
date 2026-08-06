@@ -208,6 +208,11 @@ void CWriteBuffer::invalidateRange( u16 addr, u32 length )
 
 u32 CWriteBuffer::flushUpTo( u32 maxBytes )
 {
+	return flushUpToPolicy( maxBytes, false );
+}
+
+u32 CWriteBuffer::flushUpToPolicy( u32 maxBytes, bool deferHot )
+{
 	if ( m_Count == 0 || maxBytes == 0 )
 		return m_Count;
 
@@ -232,12 +237,28 @@ u32 CWriteBuffer::flushUpTo( u32 maxBytes )
 		// m_List -- flushing newest-first starves the head under continuous
 		// re-dirtying, which shows up as regions of the real screen frozen at
 		// stale contents while the rest updates.
+		bool stoppedAtHot = false;
 		for ( u32 i = 0; i < n; i++ )
 		{
 			u16 a = m_List[ ( m_Head + i ) & ( SCPU_WRITEBUF_CAPACITY - 1 ) ];
+			if ( deferHot && m_HotBlocks )
+			{
+				const u32 blk = (u32)a >> 6;
+				if ( ( m_HotBlocks[ blk >> 6 ] >> ( blk & 63 ) ) & 1 )
+				{
+					// An active sprite-shape byte: the rest of this drain
+					// waits for the border, keeping the block's delivery
+					// atomic from the VIC's point of view.
+					n = i;
+					stoppedAtHot = true;
+					break;
+				}
+			}
 			m_Burst[ i ].addr  = a;
 			m_Burst[ i ].value = m_PendingValue[ a ];
 		}
+		if ( n == 0 )
+			return m_Count;		// hot byte at the head; nothing to send
 
 		m_Bus->writeBurst( m_Burst, n );
 
@@ -253,6 +274,9 @@ u32 CWriteBuffer::flushUpTo( u32 maxBytes )
 		m_Head  = ( m_Head + n ) & ( SCPU_WRITEBUF_CAPACITY - 1 );
 		m_Count -= n;
 		sent    += n;
+
+		if ( stoppedAtHot )
+			break;
 	}
 
 	m_BytesFlushed += sent;

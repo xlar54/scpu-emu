@@ -125,6 +125,18 @@ public:
 	// the raster is somewhere safe; the caller owns that judgement.
 	void resyncSweep( u32 maxBytes );
 
+	// Bitmap of 64-byte blocks currently selected by ACTIVE sprite pointers
+	// (owned by CC64Memory). Bytes inside them are delivered only by border
+	// drains, and a display drain stops when it meets one: a re-rendered
+	// sprite shape must reach real DRAM whole, never as the render's
+	// cleared/partial transient, because the VIC fetches shapes on the
+	// sprite's own display lines.
+	void attachHotShapeBlocks( const u64 *bits ) { m_HotBlocks = bits; }
+
+	// flushUpTo with a policy: deferHot stops at the first hot-shape byte.
+	// The IMirrorSink flushUpTo() delegates here with deferHot=false.
+	u32 flushUpToPolicy( u32 maxBytes, bool deferHot );
+
 	u32 pending() const { return m_Count; }
 	u32 pendingBytes() override { return m_Count; }
 
@@ -169,6 +181,7 @@ private:
 	// stale DRAM on screen forever.
 	u64 m_Synced[ 0x10000 / 64 ];
 	u16 m_ResyncCursor = 0;
+	const u64 *m_HotBlocks = 0;
 	// Value accepted under the policy in force at the time of the write. Keeping
 	// it here lets an optimisation-mode change take effect immediately without
 	// synchronously flushing the old queue. A later write excluded by the new

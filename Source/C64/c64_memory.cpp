@@ -75,6 +75,7 @@ void CC64Memory::reset()
 	m_LastCIA2PortARead = 0;
 	m_LastD018 = 0x14;			// the KERNAL default: screen $0400, charset $1000
 	updateSpritePtrBase();
+	updateHotShapeBlocks();
 	for ( u32 i = 0; i < 0x40; i++ ) m_VICRegShadow[ i ] = 0;
 	m_CIA2DDRA = 0;
 	m_HaveCIA2PortALatch = false;
@@ -380,6 +381,7 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 			m_CIA2PortALatch = value;
 			m_HaveCIA2PortALatch = true;
 			updateSpritePtrBase();		// VIC bank lives in bits 0-1
+			updateHotShapeBlocks();
 			if ( cia2IECChanged )
 				noteIECActivity();
 		}
@@ -387,6 +389,7 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 		{
 			m_LastD018 = value;
 			updateSpritePtrBase();
+			updateHotShapeBlocks();
 		}
 		else if ( a == 0xDD02 )
 		{
@@ -422,8 +425,11 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 
 		// Active-screen sprite pointers go to the real bus immediately; see
 		// the note in writeFast, which is the path that usually takes them.
-		if ( old != value && ( (u32)a & ~7u ) == m_SpritePtrBase && m_C64 )
-			m_C64->write( a, value );
+		if ( old != value && ( (u32)a & ~7u ) == m_SpritePtrBase )
+		{
+			if ( m_C64 ) m_C64->write( a, value );
+			updateHotShapeBlocks();
+		}
 	}
 }
 
