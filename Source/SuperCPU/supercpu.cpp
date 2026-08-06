@@ -506,9 +506,29 @@ u64 CSuperCPU::runFrame()
 
 		// Re-check the serial bus: the approach run may have started one.
 		if ( !m_Memory.iecBusActive() )
+		{
 			flushMirrorsRasterAware( m_WriteBuffer, *m_Bus, sig,
 			                         m_MirrorDisplayBudget,
 			                         m_Memory.m_VICRegShadow );
+
+			// Spare border time goes to convergence: re-deliver a slice of
+			// clean shadow so real DRAM provably approaches shadow no matter
+			// what made them differ (boot-era policy skips, mode switches,
+			// a glitched burst). 512 bytes/frame laps the full 64K in ~2s.
+			if ( m_WriteBuffer.empty() )
+			{
+				const u16 line = m_Bus->rasterLine();
+				if ( c64RasterIsSafeForBulkTransfer( sig.video, line ) )
+				{
+					const u32 lines = c64RasterLines( sig.video );
+					const u32 linesLeft = ( line > c64DisplayLastLine( sig.video ) )
+					                    ? ( lines - line ) + c64DisplayFirstLine( sig.video )
+					                    : c64DisplayFirstLine( sig.video ) - line;
+					if ( linesLeft >= 12 )
+						m_WriteBuffer.resyncSweep( 512 );
+				}
+			}
+		}
 	}
 
 	// Pacing is no longer done here. It happens after every instruction in

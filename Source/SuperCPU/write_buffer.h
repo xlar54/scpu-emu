@@ -114,6 +114,17 @@ public:
 	// funnelling every byte through onRamWrite().
 	void invalidateRange( u16 addr, u32 length );
 
+	// Background convergence: deliver up to maxBytes of CLEAN shadow bytes
+	// from a rotating cursor over the mirrored range, marking them synced.
+	// Real DRAM is write-only from the Pi, so shadow==DRAM can never be
+	// verified -- only re-established. Divergence has real sources: CMD's
+	// boot RAM test writes under a mirror-skipping policy, optimisation-mode
+	// switches strand earlier writes, and a glitched burst write can corrupt
+	// a byte the eliminator will then never resend. The sweep makes all of
+	// them heal within seconds instead of persisting forever. Call only when
+	// the raster is somewhere safe; the caller owns that judgement.
+	void resyncSweep( u32 maxBytes );
+
 	u32 pending() const { return m_Count; }
 	u32 pendingBytes() override { return m_Count; }
 
@@ -123,6 +134,7 @@ public:
 	// --- statistics -------------------------------------------------------
 	u64 m_WritesAccepted;	// writes that the policy said to mirror
 	u64 m_WritesEliminated;	// writes dropped because DRAM already held the value
+	u64 m_BytesResynced;	// background-sweep bytes re-delivered
 	u64 m_WritesSkipped;	// writes the policy discarded
 	u64 m_WritesCoalesced;	// accepted writes that hit an already-dirty address
 	u64 m_BytesFlushed;		// bytes actually sent over the bus
@@ -156,6 +168,7 @@ private:
 	// the two diverge wholesale, and an eliminated write there would leave
 	// stale DRAM on screen forever.
 	u64 m_Synced[ 0x10000 / 64 ];
+	u16 m_ResyncCursor = 0;
 	// Value accepted under the policy in force at the time of the write. Keeping
 	// it here lets an optimisation-mode change take effect immediately without
 	// synchronously flushing the old queue. A later write excluded by the new

@@ -416,4 +416,59 @@ TEST( writebuf_same_value_writes_are_eliminated_only_once_synced )
 	wb.onRamWrite( 0x2000, 7 );			// same value as shadow AND real DRAM
 	ram[ 0x2000 ] = 7;
 	CHECK_EQ( wb.pending(), 1u );
+	wb.flush();
+
+	// A policy-skipped write diverges shadow from DRAM, so it must disarm
+	// elimination for that address. 3D Pool: shapes staged at $0200-$03FF
+	// under a restrictive optimisation mode, then rewritten with the same
+	// values under a permissive one -- without the disarm those rewrites were
+	// eliminated and the balls stayed garbage in real DRAM forever.
+	wb.setOptMode( SCPU_OPT_VICBANK1 );	// $4000-$7FFF only: $2000 excluded
+	wb.onRamWrite( 0x2000, 9 );			// skipped; shadow moves on without DRAM
+	ram[ 0x2000 ] = 9;
+	CHECK_EQ( wb.pending(), 0u );
+	wb.setOptMode( SCPU_OPT_NONE );		// back to everything
+	wb.onRamWrite( 0x2000, 9 );			// same value as shadow -- MUST queue
+	CHECK_EQ( wb.pending(), 1u );
+	wb.flush();
+	CHECK_EQ( bus.m_Memory[ 0x2000 ], 9 );
+}
+
+TEST( writebuf_resync_sweep_converges_dram_to_shadow )
+{
+	// Real DRAM is write-only from the Pi, so shadow==DRAM can only be
+	// re-established, never verified. The sweep walks the mirrored range
+	// delivering clean shadow bytes; divergence from any source -- boot-era
+	// policy skips, optimisation-mode switches, a glitched burst -- heals
+	// within a bounded number of calls instead of persisting forever.
+	CHostBus bus;
+	u8 ram[ 0x10000 ];
+	for ( u32 i = 0; i < 0x10000; i++ ) ram[ i ] = (u8)( i * 7 );
+	CWriteBuffer wb;
+	wb.attach( &bus, ram );
+	wb.setOptMode( SCPU_OPT_NONE );		// full range, no exclusions
+
+	// DRAM starts divergent everywhere. Sweep in chunks until one full lap.
+	for ( u32 i = 0; i < 0x10000 / 512; i++ )
+		wb.resyncSweep( 512 );
+
+	u32 diffs = 0;
+	for ( u32 a = 0; a < 0x10000; a++ )
+	{
+		if ( ( a & 0xF000 ) == 0xD000 ) continue;	// I/O window never swept
+		if ( ram[ a ] != bus.m_Memory[ a ] ) diffs++;
+	}
+	CHECK_EQ( diffs, 0u );
+
+	// A dirty address is owned by its pending value: the sweep must not
+	// deliver the shadow byte underneath it.
+	bus.resetStats();
+	wb.onRamWrite( 0x8000, 0x11 );
+	ram[ 0x8000 ] = 0x11;
+	const u8 before = bus.m_Memory[ 0x8000 ];
+	for ( u32 i = 0; i < 0x10000 / 512; i++ )
+		wb.resyncSweep( 512 );
+	CHECK_EQ( bus.m_Memory[ 0x8000 ], before );	// untouched by the sweep
+	wb.flush();
+	CHECK_EQ( bus.m_Memory[ 0x8000 ], 0x11 );	// delivered by the queue
 }

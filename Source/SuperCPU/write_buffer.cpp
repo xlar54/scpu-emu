@@ -20,7 +20,7 @@
 #include "write_buffer.h"
 
 CWriteBuffer::CWriteBuffer()
-	: m_WritesAccepted( 0 ), m_WritesEliminated( 0 ),
+	: m_WritesAccepted( 0 ), m_WritesEliminated( 0 ), m_BytesResynced( 0 ),
 	  m_WritesSkipped( 0 ), m_WritesCoalesced( 0 ),
 	  m_BytesFlushed( 0 ), m_Flushes( 0 ),
 	  m_IOWindowSuppressed( 0 ),
@@ -77,6 +77,7 @@ void CWriteBuffer::moveDirtyToTail( u16 addr )
 void CWriteBuffer::resetStats()
 {
 	m_WritesAccepted = m_WritesEliminated = m_WritesSkipped = m_WritesCoalesced = 0;
+	m_BytesResynced = 0;
 	m_BytesFlushed = m_Flushes = 0;
 	m_IOWindowSuppressed = 0;
 }
@@ -138,6 +139,15 @@ void CWriteBuffer::onRamWrite( u16 addr, u8 value )
 	if ( !shouldMirror( addr ) )
 	{
 		m_WritesSkipped++;
+		// The shadow byte is about to change while real DRAM does not, so
+		// "delivered once" stops implying "still equal": disarm elimination
+		// for this address until something delivers it again. Without this,
+		// a program that writes data under a restrictive optimisation mode
+		// and then rewrites the SAME values under a permissive one gets
+		// eliminated into permanent DRAM staleness -- 3D Pool stages sprite
+		// shapes at $0200-$03FF during init exactly that way, and its balls
+		// stayed garbage on the real screen while the shadow was perfect.
+		m_Synced[ addr >> 6 ] &= ~( 1ULL << ( addr & 63 ) );
 		return;
 	}
 
@@ -249,6 +259,37 @@ u32 CWriteBuffer::flushUpTo( u32 maxBytes )
 	m_Flushes++;
 
 	return m_Count;
+}
+
+void CWriteBuffer::resyncSweep( u32 maxBytes )
+{
+	if ( !m_Bus || !m_RAM || maxBytes == 0 )
+		return;
+
+	u32 n = 0;
+	u32 guard = 0x10000;		// at most one full lap per call
+	while ( n < maxBytes && guard-- )
+	{
+		const u16 a = m_ResyncCursor;
+		m_ResyncCursor = ( m_ResyncCursor == m_RangeHi )
+		               ? m_RangeLo : (u16)( m_ResyncCursor + 1 );
+
+		if ( !shouldMirror( a ) )
+			continue;				// honours the I/O window and exclusions
+		if ( isDirty( a ) )
+			continue;				// pending value owns this address
+
+		m_Burst[ n ].addr  = a;
+		m_Burst[ n ].value = m_RAM[ a ];
+		m_Synced[ a >> 6 ] |= 1ULL << ( a & 63 );
+		if ( ++n == SCPU_WRITEBUF_CHUNK )
+			break;
+	}
+	if ( n )
+	{
+		m_Bus->writeBurst( m_Burst, n );
+		m_BytesResynced += n;
+	}
 }
 
 void CWriteBuffer::flush()
