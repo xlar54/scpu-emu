@@ -120,30 +120,49 @@ __attribute__( ( always_inline ) ) inline u8 flipByte( u8 x )
 	} while ( !(g2 & bPHI) );	}						
 
 
+// Ceiling on every wait for BA to come back, in C64 cycles.
+//
+// The VIC claims the bus for a badline or a sprite fetch and gives it back
+// within tens of cycles, so any legitimate wait is far under this. An
+// unbounded wait is not a stricter version of the same thing -- it is a
+// different failure. These spins run inside runFrame(), under the mirror
+// flush, so a BA that never returns takes the whole firmware down: the frame
+// hook stops running, nothing polls the buttons, and the only way out is
+// pulling the Pi's power. That is a real, observed freeze.
+//
+// On timeout we proceed with the access anyway. That is exactly what this code
+// did for most of its life -- the BA re-check in busWriteByteBurst_p1 was
+// commented out until recently -- so the worst case is the display glitch we
+// already knew how to live with, reached only after milliseconds of a stuck
+// line, instead of a machine that has to be unplugged.
+#define RAD_BA_WAIT_LIMIT 4000
+
 #define HANDLE_BUS_AVAILABLE_READ \
 	WAIT_UP_TO_CYCLE( busTiming.TIMING_BA_SIGNAL_AVAIL );			\
 	g2 = read32( ARM_GPIO_GPLEV0 );							\
 	if ( VIC_BA ) {											\
+		u32 baSpins__ = 0;									\
 		do {												\
 			WAIT_FOR_CPU_HALFCYCLE							\
 			WAIT_FOR_VIC_HALFCYCLE							\
 			RESTART_CYCLE_COUNTER							\
 			WAIT_UP_TO_CYCLE( busTiming.TIMING_BA_SIGNAL_AVAIL );	\
 			g2 = read32( ARM_GPIO_GPLEV0 );					\
-		} while ( !(g2 & bBA) );							\
-	}								
+		} while ( !(g2 & bBA) && ++baSpins__ < RAD_BA_WAIT_LIMIT );	\
+	}
 
 
 #define HANDLE_BUS_AVAILABLE \
 	WAIT_UP_TO_CYCLE( busTiming.TIMING_READ_BA_WRITING );			\
 	/* g2 came from the phase wait and may predate BA becoming valid. */	\
 	g2 = read32( ARM_GPIO_GPLEV0 );							\
-	while ( !( g2 & bBA ) )	{								\
+	{ u32 baSpins__ = 0;									\
+	while ( !( g2 & bBA ) && baSpins__++ < RAD_BA_WAIT_LIMIT ) {		\
 		WAIT_FOR_CPU_HALFCYCLE								\
 		WAIT_FOR_VIC_HALFCYCLE								\
 		RESTART_CYCLE_COUNTER								\
 		WAIT_UP_TO_CYCLE( busTiming.TIMING_READ_BA_WRITING );		\
-		g2 = read32( ARM_GPIO_GPLEV0 ); }
+		g2 = read32( ARM_GPIO_GPLEV0 ); } }
 
 
 __attribute__( ( always_inline ) ) inline 
@@ -283,17 +302,18 @@ void busWriteByteBurst_p1( register u32 &g2, u16 addr, u8 data )
 		g2 = read32( ARM_GPIO_GPLEV0 );
 	}
 	u8 resync = 0;
-	while ( !( g2 & bBA ) )	
+	u32 baSpins = 0;
+	while ( !( g2 & bBA ) && baSpins++ < RAD_BA_WAIT_LIMIT )
 	{
 		resync = 1;
 		SET_GPIO( bRW_OUT );
 		INP_GPIO( RW_OUT );
 		SET_GPIO( bLATCH_A_OE );
-		WAIT_FOR_CPU_HALFCYCLE								
-		WAIT_FOR_VIC_HALFCYCLE								
-		RESTART_CYCLE_COUNTER								
-		WAIT_UP_TO_CYCLE( busTiming.TIMING_READ_BA_WRITING );		
-		g2 = read32( ARM_GPIO_GPLEV0 ); 
+		WAIT_FOR_CPU_HALFCYCLE
+		WAIT_FOR_VIC_HALFCYCLE
+		RESTART_CYCLE_COUNTER
+		WAIT_UP_TO_CYCLE( busTiming.TIMING_READ_BA_WRITING );
+		g2 = read32( ARM_GPIO_GPLEV0 );
 	}
 
 	if ( resync )
