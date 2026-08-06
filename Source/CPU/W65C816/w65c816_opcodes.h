@@ -138,6 +138,17 @@ inline u8 w65c816Length( u8 opcode, bool m8, bool x8 )
 	return len;
 }
 
+// Packed cycle table, indexed by the 4-bit state key (m8|x8<<1|e<<2|dp<<3)
+// and the opcode. The low nibble is the base cycle count with every
+// state-dependent adjustment already folded (M1/M2/X1/W/E0 and the
+// unconditional !x8 half of P); the high bits are the penalties that depend
+// on runtime facts the state cannot know:
+#define W65CL_P  0x10	// +1 on page cross (x8 mode only; !x8 is folded)
+#define W65CL_BR 0x20	// +1 on branch taken (+1 more if emulation && cross)
+#define W65CL_PE 0x40	// +1 on page cross (emulation only; e is folded)
+extern u8 w65c816CycleLUT[ 16 ][ 256 ];
+void w65c816InitCycleLUT();
+
 // Cycle count with every adjustment applied. pageCross is meaningful only for
 // indexed and relative modes; branchTaken only for W65M_REL.
 //

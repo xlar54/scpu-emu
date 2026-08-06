@@ -279,3 +279,35 @@ const SW65Opcode w65c816Opcodes[ 256 ] =
 	{ "INC", W65M_ABX,   7, W65C_M2                   },	// $FE
 	{ "SBC", W65M_ABLX,  5, W65C_M1                   },	// $FF
 };
+
+// ---------------------------------------------------------------------------
+// Packed cycle table. Generated from w65c816Cycles itself, so the folded
+// counts CANNOT drift from the reference; the residual bits mirror the
+// reference's runtime-dependent clauses and a host test proves the pair
+// reproduces it bit-for-bit over every state before the differential suite
+// ever runs.
+// ---------------------------------------------------------------------------
+u8 w65c816CycleLUT[ 16 ][ 256 ];
+
+void w65c816InitCycleLUT()
+{
+	for ( u32 key = 0; key < 16; key++ )
+	{
+		const bool m8 = ( key & 1 ) != 0;
+		const bool x8 = ( key & 2 ) != 0;
+		const bool e  = ( key & 4 ) != 0;
+		const bool dp = ( key & 8 ) != 0;
+		for ( u32 op = 0; op < 256; op++ )
+		{
+			const u8 base = w65c816Cycles( (u8)op, m8, x8, e, dp, false, false );
+			// A folded count above 15 would collide with the residual bits.
+			// The real maximum is 9; treat anything larger as corruption.
+			u8 enc = ( base <= 15 ) ? base : 15;
+			const u8 f = w65c816Opcodes[ op ].cycleFlags;
+			if ( ( f & W65C_P ) && x8 ) enc |= W65CL_P;
+			if ( f & W65C_BR )          enc |= W65CL_BR;
+			if ( ( f & W65C_PE ) && e ) enc |= W65CL_PE;
+			w65c816CycleLUT[ key ][ op ] = enc;
+		}
+	}
+}

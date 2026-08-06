@@ -1130,3 +1130,40 @@ TEST( w65c816_no_instruction_exceeds_ten_cycles )
 							}
 	CHECK( worst <= 10 );
 }
+
+TEST( w65c816_cycle_lut_reproduces_the_reference_exactly )
+{
+	// The packed table folds every state-dependent adjustment at generation
+	// time and keeps only runtime penalties as residual bits. This proves the
+	// pair reproduces w65c816Cycles() bit-for-bit over every state, opcode
+	// and penalty combination -- 16K equalities -- so the cycle-exact
+	// differential suite never has to discover a divergence the hard way.
+	w65c816InitCycleLUT();
+	for ( u32 key = 0; key < 16; key++ )
+	{
+		const bool m8 = ( key & 1 ) != 0;
+		const bool x8 = ( key & 2 ) != 0;
+		const bool e  = ( key & 4 ) != 0;
+		const bool dp = ( key & 8 ) != 0;
+		for ( u32 op = 0; op < 256; op++ )
+			for ( int px = 0; px <= 1; px++ )
+				for ( int bt = 0; bt <= 1; bt++ )
+				{
+					const u8 enc = w65c816CycleLUT[ key ][ op ];
+					u32 used = enc & 0x0F;
+					if ( enc & 0xF0 )
+					{
+						if ( ( enc & W65CL_P ) && px ) used++;
+						if ( ( enc & W65CL_BR ) && bt )
+						{
+							used++;
+							if ( ( key & 4 ) && px ) used++;
+						}
+						if ( ( enc & W65CL_PE ) && px ) used++;
+					}
+					const u32 ref = w65c816Cycles( (u8)op, m8, x8, e, dp,
+					                               px != 0, bt != 0 );
+					CHECK_EQ( used, ref );
+				}
+	}
+}

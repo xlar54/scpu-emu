@@ -137,8 +137,12 @@ public:
 	// self-contained leaves, for +400 bytes of step(). Do NOT widen the set:
 	// adding the accumulator/index accessors as well measured +13.2KB, which
 	// blows the 32K L1I budget and reintroduces the refills -Os eliminated.
-	__attribute__((always_inline)) inline bool memory8() const { return m_E || ( m_P & W65_M ) != 0; }
-	__attribute__((always_inline)) inline bool index8()  const { return m_E || ( m_P & W65_X ) != 0; }
+	// Cached: recomputed by applyE() from E and P. Any direct write to m_P,
+	// m_E or m_D outside the audited thirteen-opcode set must be followed by
+	// applyE(), or the widths and the cycle key go stale -- the differential
+	// suite asserts the widths after every instruction and catches a miss.
+	__attribute__((always_inline)) inline bool memory8() const { return m_M8; }
+	__attribute__((always_inline)) inline bool index8()  const { return m_X8; }
 
 	// While E=1 the hardware CONTINUOUSLY forces SH=$01, m=1, x=1 and the high
 	// bytes of X and Y to $00 -- writes to them simply do not take.
@@ -180,6 +184,14 @@ public:
 			m_X &= 0x00FF;
 			m_Y &= 0x00FF;
 		}
+
+		// Refresh the cached widths and the cycle-table key. Every legitimate
+		// writer of E, M, X or (via PLD) D already calls applyE; TCD updates
+		// the key's dp bit itself.
+		m_M8 = m_E || ( m_P & W65_M ) != 0;
+		m_X8 = m_E || ( m_P & W65_X ) != 0;
+		m_CycKey = (u8)( ( m_M8 ? 1 : 0 ) | ( m_X8 ? 2 : 0 )
+		               | ( m_E ? 4 : 0 ) | ( ( ( m_D & 0xFF ) != 0 ) ? 8 : 0 ) );
 	}
 
 	// Accumulator halves. In 8-bit mode B must survive untouched.
@@ -217,6 +229,8 @@ private:
 	bool     m_RunBreak;
 	bool     m_NMIPrevLevel;
 	bool     m_NMIPending;
+	bool     m_M8, m_X8;	// cached widths; see memory8()/index8()
+	u8       m_CycKey;		// cached index into w65c816CycleLUT
 
 	// Pending-work byte: nonzero when the NEXT instruction needs the cold
 	// prologue -- interrupt sample, NMI/IRQ dispatch, WAI, STP. Zero is the

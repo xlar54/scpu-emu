@@ -37,7 +37,14 @@ CW65C816::CW65C816()
 	  m_Bus( 0 ), m_FastBus( 0 ), m_Cycles( 0 ), m_RunBreak( false ),
 	  m_NMIPrevLevel( false ), m_NMIPending( false ),
 	  m_PageCross( false ), m_BranchTaken( false ), m_EABank0( false )
+	  , m_M8( true ), m_X8( true ), m_CycKey( 0 )
 {
+
+	// One-time build of the packed cycle table; bare-metal single-threaded
+	// init, so a plain flag is sufficient.
+	static bool s_LUTReady = false;
+	if ( !s_LUTReady ) { w65c816InitCycleLUT(); s_LUTReady = true; }
+	applyE();
 }
 
 void CW65C816::reset()
@@ -69,6 +76,7 @@ void CW65C816::reset()
 
 	m_PC = read16Bank0( (u16)W65_VEC_EMU_RESET );
 
+	applyE();
 	rebuildPending();
 }
 
@@ -328,11 +336,12 @@ u32 CW65C816::stepInner()
 
 	// Captured before dispatch: REP, SEP, PLP, RTI and XCE change the register
 	// widths mid-instruction, but their own cycle counts are the ones for the
-	// state they started in.
-	const bool m8Entry = memory8();
-	const bool x8Entry = index8();
-	const bool eEntry  = m_E;
-	const bool dpUnaligned = ( m_D & 0xFF ) != 0;
+	// state they started in -- so the epilogue indexes the table with this
+	// LOCAL, never the live member.
+	const u8 cycKey = m_CycKey;
+	const bool m8Entry = ( cycKey & 1 ) != 0;
+	const bool x8Entry = ( cycKey & 2 ) != 0;
+	const bool eEntry  = ( cycKey & 4 ) != 0;
 
 	m_PageCross = false;
 	m_BranchTaken = false;
@@ -429,7 +438,11 @@ u32 CW65C816::stepInner()
 	case 0x9A: m_S = m_E ? (u16)( 0x0100 | ( m_X & 0xFF ) ) : getX(); break;		// TXS, no flags
 	case 0x9B: m_Y = index8() ? (u16)( m_X & 0xFF ) : m_X; setZNX( m_Y ); break;	// TXY
 	case 0xBB: m_X = index8() ? (u16)( m_Y & 0xFF ) : m_Y; setZNX( m_X ); break;	// TYX
-	case 0x5B: m_D = m_C; setZN16( m_D ); break;								// TCD
+	case 0x5B:																	// TCD
+		// The one m_D writer without an applyE call: refresh the key's dp bit.
+		m_D = m_C; setZN16( m_D );
+		m_CycKey = (u8)( ( m_CycKey & ~8 ) | ( ( ( m_D & 0xFF ) != 0 ) ? 8 : 0 ) );
+		break;
 	case 0x7B: m_C = m_D; setZN16( m_C ); break;								// TDC
 	case 0x1B: m_S = m_E ? (u16)( 0x0100 | ( m_C & 0xFF ) ) : m_C; break;		// TCS, no flags, low byte only in emulation
 	case 0x3B: m_C = m_S; setZN16( m_C ); break;								// TSC, returns the full $01xx in emulation
@@ -890,8 +903,21 @@ u32 CW65C816::stepInner()
 
 	#undef W65_BRANCH
 
-	const u32 used = w65c816Cycles( opcode, m8Entry, x8Entry, eEntry,
-	                                dpUnaligned, m_PageCross, m_BranchTaken );
+	// Base cycles come from the packed table; only the penalties that depend
+	// on runtime facts remain, and most opcodes have none.
+	const u8 enc = w65c816CycleLUT[ cycKey ][ opcode ];
+	u32 used = enc & 0x0F;
+	if ( enc & 0xF0 )
+	{
+		if ( ( enc & W65CL_P ) && m_PageCross ) used++;
+		if ( ( enc & W65CL_BR ) && m_BranchTaken )
+		{
+			used++;
+			// The page-cross penalty on a taken branch is emulation-mode only.
+			if ( ( cycKey & 4 ) && m_PageCross ) used++;
+		}
+		if ( ( enc & W65CL_PE ) && m_PageCross ) used++;
+	}
 	m_Cycles += used;
 	return used;
 }

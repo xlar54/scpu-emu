@@ -232,6 +232,7 @@ void CSuperCPU::benchmark65816()
 	m_Core65816.m_DBR = 0x01;
 	m_Core65816.m_PC  = 0xF000;
 	m_Core65816.m_S   = 0x01FD;
+	m_Core65816.applyE();		// the pokes above bypass the audited writers
 
 #if !defined( SCPU_HOST_BUILD ) && defined( __aarch64__ )
 	// Program four PMU event counters alongside the cycle counter the bus
