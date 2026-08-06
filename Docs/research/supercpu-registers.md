@@ -183,6 +183,12 @@ Not registers — genuine RAM inside the cartridge, which must never reach the C
 | `$D200-$D2FF` | 256 B | SuperCPU DOS / kernel scratch | **confirmed** |
 | `$D300-$D3FF` | 256 B | free for user programs | **confirmed** |
 
+Both pages are always readable, but writes normally take effect only while the
+hardware-register bank is open (`$D07E`).  `$D27E` is the sole exception: it is
+writable even while the bank is closed.  VICE implements these rules in
+`scpu64_d200_store` and `scpu64_d300_store`; closing the bank with `$D07F`
+write-protects the remaining locations without hiding their contents.
+
 The three ranges the SuperCPU steals inside I/O space are documented as
 `$D070-$D07F`, `$D0B0-$D0BF` and `$D200-$D3FF`. SCPU-EMU claims all of
 `$D0B0-$D0BF` and all of `$D200-$D3FF`; in `$D070-$D07F` it decodes the
