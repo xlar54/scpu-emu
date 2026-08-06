@@ -106,6 +106,10 @@
 // --- private RAM windows ---------------------------------------------------
 #define SCPU_SYSRAM_BASE        0xD200	// $D200-$D2FF, SuperCPU DOS scratch
 #define SCPU_SYSRAM_SIZE        0x0100
+// The one location in $D200-$D2FF that accepts a write with the register bank
+// closed. Matches VICE's scpu64_d200_store.
+#define SCPU_SYSRAM_ALWAYS_WRITABLE 0xD27E
+
 #define SCPU_USERRAM_BASE       0xD300	// $D300-$D3FF, free for user programs
 #define SCPU_USERRAM_SIZE       0x0100
 
@@ -160,6 +164,10 @@ public:
 
 	bool turboEnabled() const        { return fastMode(); }
 	bool hardwareRegsEnabled() const { return m_HWRegsEnabled; }
+
+	// Diagnostics only: peek the $D200 scratch window without going through
+	// the I/O path.
+	u8 sysRAM( u8 offset ) const { return m_SysRAM[ offset ]; }
 	bool bootmapEnabled() const      { return m_Bootmap; }
 
 	// Point this at CC64Memory::m_BootmapActive. A $D0B6 write then takes
