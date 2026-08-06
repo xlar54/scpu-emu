@@ -20,7 +20,8 @@
 #include "write_buffer.h"
 
 CWriteBuffer::CWriteBuffer()
-	: m_WritesAccepted( 0 ), m_WritesSkipped( 0 ), m_WritesCoalesced( 0 ),
+	: m_WritesAccepted( 0 ), m_WritesEliminated( 0 ),
+	  m_WritesSkipped( 0 ), m_WritesCoalesced( 0 ),
 	  m_BytesFlushed( 0 ), m_Flushes( 0 ),
 	  m_IOWindowSuppressed( 0 ),
 	  m_Bus( 0 ), m_RAM( 0 ),
@@ -36,6 +37,7 @@ void CWriteBuffer::attach( IC64Bus *bus, const u8 *ram )
 {
 	m_Bus = bus;
 	m_RAM = ram;
+	for ( u32 i = 0; i < 0x10000 / 64; i++ ) m_Synced[ i ] = 0;
 }
 
 void CWriteBuffer::clearDirty()
@@ -74,7 +76,7 @@ void CWriteBuffer::moveDirtyToTail( u16 addr )
 
 void CWriteBuffer::resetStats()
 {
-	m_WritesAccepted = m_WritesSkipped = m_WritesCoalesced = 0;
+	m_WritesAccepted = m_WritesEliminated = m_WritesSkipped = m_WritesCoalesced = 0;
 	m_BytesFlushed = m_Flushes = 0;
 	m_IOWindowSuppressed = 0;
 }
@@ -137,6 +139,24 @@ void CWriteBuffer::onRamWrite( u16 addr, u8 value )
 	{
 		m_WritesSkipped++;
 		return;
+	}
+
+	// The caller stores AFTER this sink runs, so m_RAM still holds what real
+	// DRAM holds whenever the address is clean and has been delivered before.
+	// A write that changes nothing then queues nothing. Programs re-render
+	// unconditionally every frame -- 3D Pool rewrites ~44K bytes per frame on
+	// a completely static screen -- and echoing the resulting identical bytes
+	// onto the bus mid-display was pure collision exposure for sprite DMA.
+	{
+		const u32 w  = addr >> 6;
+		const u64 bit = 1ULL << ( addr & 63 );
+		if ( m_RAM && value == m_RAM[ addr ]
+		     && !( m_Dirty[ w ] & bit )
+		     && ( m_Synced[ w ] & bit ) )
+		{
+			m_WritesEliminated++;
+			return;
+		}
 	}
 
 	m_WritesAccepted++;
@@ -215,6 +235,9 @@ u32 CWriteBuffer::flushUpTo( u32 maxBytes )
 		{
 			u16 a = m_List[ ( m_Head + i ) & ( SCPU_WRITEBUF_CAPACITY - 1 ) ];
 			m_Dirty[ a >> 6 ] &= ~( 1ULL << ( a & 63 ) );
+			// Delivered: real DRAM now provably matches the queued value, so
+			// same-value elimination becomes sound for this address.
+			m_Synced[ a >> 6 ] |= 1ULL << ( a & 63 );
 		}
 
 		m_Head  = ( m_Head + n ) & ( SCPU_WRITEBUF_CAPACITY - 1 );
@@ -240,6 +263,10 @@ void CWriteBuffer::flush()
 void CWriteBuffer::discard()
 {
 	clearDirty();
+	// Reset clears the shadow wholesale, so "shadow == real DRAM" stops
+	// being true anywhere; elimination re-arms address by address as the
+	// new program's writes get delivered.
+	for ( u32 i = 0; i < 0x10000 / 64; i++ ) m_Synced[ i ] = 0;
 	m_Head = 0;
 	m_Count = 0;
 }

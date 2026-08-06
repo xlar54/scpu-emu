@@ -75,6 +75,7 @@ void CC64Memory::reset()
 	m_LastCIA2PortARead = 0;
 	m_LastD018 = 0x14;			// the KERNAL default: screen $0400, charset $1000
 	updateSpritePtrBase();
+	for ( u32 i = 0; i < 0x40; i++ ) m_VICRegShadow[ i ] = 0;
 	m_CIA2DDRA = 0;
 	m_HaveCIA2PortALatch = false;
 	m_HaveCIA2PortARead = false;
@@ -325,9 +326,10 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 		updateBankMode();
 
 		// The C64 stores the port registers' shadow in DRAM too, and code does
-		// read $00/$01 back through the VIC's eyes in a few places.
-		m_RAM[ a ] = value;
+		// read $00/$01 back through the VIC's eyes in a few places. Sink
+		// before store -- see IMirrorSink::onRamWrite.
 		if ( m_Mirror ) m_Mirror->onRamWrite( a, value );
+		m_RAM[ a ] = value;
 		return;
 	}
 
@@ -395,6 +397,8 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 		}
 
 		m_IOWrites++;
+		if ( a < 0xD040 )
+			m_VICRegShadow[ a & 0x3F ] = value;
 		m_IOLog[ m_IOLogPos++ & 63 ] = (u32)a | ( (u32)value << 16 ) | ( 1u << 24 );
 		if ( ( a & 0xFE00 ) == 0xDC00 )
 		{
@@ -408,15 +412,19 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 	}
 
 	// Everything else falls through to DRAM, including writes "into" ROM.
-	m_RAM[ a ] = value;
-	m_RamWrites++;
-	// Active-screen sprite pointers go to the real bus immediately; see the
-	// note in writeFast, which is the path that usually takes them.
-	if ( ( (u32)a & ~7u ) == m_SpritePtrBase && m_C64 )
-		m_C64->write( a, value );
+	// Sink before store -- see IMirrorSink::onRamWrite.
+	{
+		const u8 old = m_RAM[ a ];
+		m_RamWrites++;
+		if ( m_Mirror )
+			m_Mirror->onRamWrite( a, value );
+		m_RAM[ a ] = value;
 
-	if ( m_Mirror )
-		m_Mirror->onRamWrite( a, value );
+		// Active-screen sprite pointers go to the real bus immediately; see
+		// the note in writeFast, which is the path that usually takes them.
+		if ( old != value && ( (u32)a & ~7u ) == m_SpritePtrBase && m_C64 )
+			m_C64->write( a, value );
+	}
 }
 
 bool CC64Memory::irqAsserted()

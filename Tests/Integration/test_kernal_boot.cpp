@@ -1316,3 +1316,51 @@ TEST( integration_active_screen_sprite_pointers_reach_the_bus_immediately )
 	CHECK_EQ( f.bus.m_Memory[ 0x07F0 ], 0x66 );
 	CHECK_EQ( f.bus.m_Memory[ 0x07F8 ], 0x99 );
 }
+
+TEST( integration_display_drain_avoids_sprite_fetch_lines )
+{
+	// Mid-display delivery must step around enabled sprites' fetch spans:
+	// their BA windows are narrow and abrupt -- unlike a badline's long low --
+	// and a burst write straddling one is how 3D Pool's static balls got hit
+	// by its own re-render traffic. Lines clear of sprites keep delivering.
+	struct FixedRasterBus : CHostBus
+	{
+		u16 line = 100;
+		u16 rasterLine() override { return line; }
+	} bus;
+
+	CSuperCPU scpu;
+	u8 basic[ C64_BASIC_SIZE ];
+	u8 kernal[ C64_KERNAL_SIZE ];
+	std::memset( basic, 0xEA, sizeof basic );
+	std::memset( kernal, 0xEA, sizeof kernal );
+	kernal[ 0 ] = 0x4C;              // JMP $E000
+	kernal[ 1 ] = 0x00;
+	kernal[ 2 ] = 0xE0;
+	kernal[ 0x1FFC ] = 0x00;
+	kernal[ 0x1FFD ] = 0xE0;
+	scpu.setBasicROM( basic );
+	scpu.setKernalROM( kernal );
+	CHECK( scpu.init( &bus, SCPU_CORE_6502, 0 ) );
+	scpu.writeBuffer().setOptMode( SCPU_OPT_NONE );
+	scpu.setMirrorDisplayBudget( 256 );
+
+	// Sprite 3 enabled with its span covering raster line 100.
+	scpu.memory().write8( 0xD015, 0x08 );
+	scpu.memory().write8( 0xD007, 95 );		// sprite 3 Y
+
+	for ( u32 i = 0; i < 600; i++ )
+		scpu.memory().write8( (u16)( 0x2000 + i ), (u8)( i ^ 0xA5 ) );
+	const u32 staged = scpu.writeBuffer().pending();
+	CHECK( staged >= 600 );
+	bus.resetStats();
+
+	// Beam parked inside the sprite's fetch span: nothing may burst.
+	scpu.runFrame();
+	CHECK_EQ( bus.m_BurstWrites, 0 );
+
+	// Beam on a clear line: delivery resumes.
+	bus.line = 180;
+	scpu.runFrame();
+	CHECK( bus.m_BurstWrites > 0 );
+}

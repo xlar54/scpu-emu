@@ -46,6 +46,9 @@ class IMirrorSink
 {
 public:
 	virtual ~IMirrorSink() {}
+	// Called BEFORE the shadow byte is stored, so the sink can read the OLD
+	// value through the RAM pointer it was attached with and drop writes that
+	// change nothing.
 	virtual void onRamWrite( u16 addr, u8 value ) = 0;
 	virtual void flush() = 0;
 	virtual u32  pendingBytes() { return 0; }
@@ -198,9 +201,12 @@ public:
 		// reaches the C64's own DRAM.
 		if ( a > 1 && c64MapRead( a, m_BankMode ) != REG_IO )
 		{
-			m_RAM[ a ] = v;
+			// Sink first, store second: the sink reads the old byte through
+			// its shadow pointer and drops writes that change nothing.
+			const u8 old = m_RAM[ a ];
 			m_RamWrites++;
 			if ( m_Mirror ) m_Mirror->onRamWrite( a, v );
+			m_RAM[ a ] = v;
 
 			// The active screen's sprite pointers bypass the queue and land
 			// on the real bus NOW, like a VIC register. Double-buffered
@@ -211,8 +217,9 @@ public:
 			// overwriting -- seen as sprites flickering between correct and
 			// garbage at animation rate. The queued copy still flushes
 			// later; coalescing holds the latest value, so re-sending it is
-			// harmless.
-			if ( ( (u32)a & ~7u ) == m_SpritePtrBase && m_C64 )
+			// harmless. Same-value rewrites are a no-op on real hardware and
+			// are skipped.
+			if ( old != v && ( (u32)a & ~7u ) == m_SpritePtrBase && m_C64 )
 				m_C64->write( a, v );
 			return;
 		}
@@ -443,6 +450,12 @@ private:
 	// mirrored at all. Kept fresh by writes to $D018 and $DD00.
 	u32  m_SpritePtrBase;
 	u8   m_LastD018;
+public:
+	// Last value written to each VIC register, maintained on the I/O write
+	// path. The mirror scheduler reads sprite Y positions and the enable mask
+	// from here so that avoiding sprite fetch lines costs nothing on the bus.
+	u8   m_VICRegShadow[ 0x40 ];
+private:
 	void updateSpritePtrBase()
 	{
 		const u8 bank = m_HaveCIA2PortALatch ? (u8)( ~m_CIA2PortALatch & 3 ) : 0;

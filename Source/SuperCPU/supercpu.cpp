@@ -309,8 +309,33 @@ u32 CSuperCPU::currentClockHz() const
 // display-safe" rule dates from when that BA re-check was commented out, and
 // from PAL write timings whose data window overran the VIC's half-cycle on this
 // NTSC machine. Both are fixed, so the restriction can be relaxed.
+// True when the given raster line is inside any enabled sprite's fetch span.
+// The VIC steals its s-accesses on every line a sprite is visible and fetches
+// the pointer and first data on the line BEFORE, so the span starts early.
+// Those BA windows are narrow and abrupt -- unlike a badline's long low --
+// and they are where a mid-display burst write can still collide: 3D Pool's
+// flicker was exactly its static balls being hit by bursts of its own
+// unchanging re-render traffic.
+static bool c64LineInSpriteFetchSpan( const u8 *vic, u16 line )
+{
+	const u8 enabled = vic[ 0x15 ];
+	if ( !enabled )
+		return false;
+	for ( u32 n = 0; n < 8; n++ )
+	{
+		if ( !( ( enabled >> n ) & 1 ) )
+			continue;
+		const u16 y = vic[ 1 + 2 * n ];
+		// [y-3, y+21): fetch lead-in plus the 21 visible lines.
+		if ( line + 3 >= y && line < (u16)( y + 21 ) )
+			return true;
+	}
+	return false;
+}
+
 static void flushMirrorsRasterAware( CWriteBuffer &buffer, IC64Bus &bus,
-                                     const C64Signals &sig, u32 displayBudget )
+                                     const C64Signals &sig, u32 displayBudget,
+                                     const u8 *vicShadow )
 {
 	const u32 perLine  = c64CyclesPerLine( sig.video );
 	const u32 lines    = c64RasterLines( sig.video );
@@ -332,9 +357,14 @@ static void flushMirrorsRasterAware( CWriteBuffer &buffer, IC64Bus &bus,
 			                    : c64DisplayFirstLine( sig.video ) - line;
 			budgetBytes = ( linesLeft * perLine * 3 ) / 4;
 		}
-		else if ( line < lines && displayLeft != 0 )
+		else if ( line < lines && displayLeft != 0
+		          && !c64LineInSpriteFetchSpan( vicShadow, line ) )
 		{
-			// A real line, inside the picture, with ration left.
+			// A real line, inside the picture, with ration left, and no
+			// sprite fetching nearby. Sprite fetch lines defer to the next
+			// slice rather than risk the burst/BA race; the border branch
+			// keeps delivering regardless, because parked multiplexer
+			// sprites would otherwise starve it permanently.
 			inDisplay = true;
 			budgetBytes = displayLeft;
 		}
@@ -431,7 +461,8 @@ u64 CSuperCPU::runFrame()
 		if ( !m_Memory.iecBusActive()
 		     && !m_WriteBuffer.empty() && ticksUsed < frameTicks )
 			flushMirrorsRasterAware( m_WriteBuffer, *m_Bus, sig,
-			                         m_MirrorDisplayBudget );
+			                         m_MirrorDisplayBudget,
+			                         m_Memory.m_VICRegShadow );
 	}
 
 	// --- raster-scheduled mirroring ----------------------------------------
@@ -476,7 +507,8 @@ u64 CSuperCPU::runFrame()
 		// Re-check the serial bus: the approach run may have started one.
 		if ( !m_Memory.iecBusActive() )
 			flushMirrorsRasterAware( m_WriteBuffer, *m_Bus, sig,
-			                         m_MirrorDisplayBudget );
+			                         m_MirrorDisplayBudget,
+			                         m_Memory.m_VICRegShadow );
 	}
 
 	// Pacing is no longer done here. It happens after every instruction in

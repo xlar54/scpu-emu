@@ -33,22 +33,26 @@ tests will report that no accelerator was detected.
 | Program | Type | What it checks | Passing result |
 |---|---|---|---|
 | `00-DETECT` | BASIC | `$D0BC` presence and `$D0B0/$D0B2/$D0B5/$D0B8` status | `SCPU DETECTED` and status bytes with a bit legend |
-| `01-SPEED` | BASIC | software Normal/Turbo requests and real elapsed speed | Turbo jiffies are substantially lower than Normal |
+| `01-SPEED` | BASIC | software Normal/Turbo requests, elapsed speed, and effective MHz estimate | Turbo jiffies are lower and estimated MHz is substantially above 1.0 |
 | `02-PRIVATE` | ML | write protection and private SRAM at `$D200-$D2FF` and `$D300-$D3FF` | `PASS` for the gate and both pages |
 | `03-SCREEN` | BASIC | screen RAM, colour RAM, borders, and visible mirroring | coloured 16x16 character field, then `PASS` |
 | `04-RASTER` | BASIC | stable 9-bit VIC raster reads and jiffy-clock progress | range near 0-311 PAL or 0-262 NTSC, and roughly 50/60 frames |
 | `05-ANIMATION` | BASIC | resident SuperCPU DOS 2.04 startup-animation entry | animation replays, then BASIC cold-starts |
 | `06-CUBE` | ML | caches 16 hires wireframe frames in SuperRAM banks `$02-$03`, then animates with `MVN` | white wireframe cube rotates on black; key exits |
+| `07-MANDELBROT` | ML | Q8.8 fixed-point Mandelbrot renderer with selectable 1 or 20 MHz mode | monochrome set and escape-time contours; Space exits |
+| `08-SOUNDTEST` | ML | SID voices, triangle/saw/pulse/noise waveforms, chord, and filter sweep | each labelled sound is audible; Space stops |
 | `10-CPU816` | ML | native mode, 16-bit accumulator/index, ADC, stack, and return to emulation | `CPU 65816: PASS` |
 | `11-SUPERRAM` | ML | 24-bit long reads/writes in banks `$01,$02,$7F,$F5` | one `PASS` per bank (16 MB configuration expected) |
 | `12-RASTERIRQ` | ML | VIC raster IRQ delivery while running Turbo | stable bars and increasing IRQ count; key exits |
 | `13-VICBANKS` | ML | VIC banks 0-3 and accelerator write mirroring | four stable solid-colour screens; key advances |
 | `14-SPRITEBALLS` | ML | all eight sprites, ninth X bits, frame pacing and VIC writes | eight differently coloured balls bounce smoothly; key exits |
 
-`01-SPEED` deliberately reports measurements rather than using a hard-coded
-ratio. BASIC overhead, video standard, firmware build, and attached devices all
-affect the result. Turbo should nevertheless take fewer jiffies. If it does not,
-check that the physical switch permits Turbo and that `$D0B8` bit 6 is clear.
+`01-SPEED` reports raw jiffies, the Normal/Turbo ratio, and an effective MHz
+estimate obtained by treating the forced-Normal run as the 1.0 MHz reference.
+It is a workload estimate, not a frequency-counter reading: BASIC overhead,
+video standard, firmware build, and attached devices all affect the result.
+Turbo should nevertheless take fewer jiffies. If it does not, check that the
+physical switch permits Turbo and that `$D0B8` bit 6 is clear.
 
 `02-PRIVATE` masks interrupts while testing because `$D200-$D2FF` is live
 SuperCPU DOS system RAM. It opens the hardware-register bank only for one
@@ -68,6 +72,19 @@ frames once, caches the resulting 128 KB of bitmap data in SuperRAM banks
 visible bitmap at `$2000`. It temporarily selects the mirror-everything policy
 so the VIC sees each copied frame, and restores the prior policy on exit. It
 requires at least 128 KB of SuperRAM. Press any key to return to text mode.
+
+`07-MANDELBROT` asks whether to render at forced 1 MHz or Turbo speed before
+entering hires mode. Its 65816 renderer uses Q8.8 fixed-point arithmetic and a
+runtime-generated square table to draw a 160x100 sample grid expanded to the
+320x200 bitmap. Interior points are solid and every fourth escape iteration
+forms a monochrome contour band. It scans the keyboard matrix directly while
+rendering, so holding Space restores the machine and returns to BASIC without
+waiting for the image to finish.
+
+`08-SOUNDTEST` is a short observational SID check. It plays a triangle scale on
+voice 1, a sawtooth scale on voice 2, noise on voice 3, a three-voice chord,
+and a resonant low-pass filter sweep. It finishes automatically, silences all
+SID registers, and returns to BASIC. Press Space to stop early.
 
 `11-SUPERRAM` expects a 16 MB SuperRAM configuration. Bank `$01` is internal
 SRAM and must always pass. A failure above the installed SIMM size is expected;

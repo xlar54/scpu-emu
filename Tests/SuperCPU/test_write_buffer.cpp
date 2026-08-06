@@ -370,3 +370,50 @@ TEST( writebuf_partial_flush_cannot_starve_old_entries )
 	for ( u32 a = 0x0400; a < 0x0500; a++ )
 		CHECK_EQ( f.bus.m_Memory[ a ], 0x11 );
 }
+
+TEST( writebuf_same_value_writes_are_eliminated_only_once_synced )
+{
+	// Programs re-render unconditionally: 3D Pool rewrites ~44K bytes per
+	// frame on a completely static screen, and echoing the identical bytes
+	// onto the bus mid-display was pure collision exposure for sprite DMA.
+	// A write whose value real DRAM already holds queues nothing -- but ONLY
+	// once this buffer has delivered that address, because after attach or
+	// discard the shadow and real DRAM diverge wholesale and an eliminated
+	// write would leave stale DRAM on screen forever.
+	CHostBus bus;
+	u8 ram[ 0x10000 ] = { 0 };
+	CWriteBuffer wb;
+	wb.attach( &bus, ram );
+	wb.setOptMode( SCPU_OPT_NONE );
+
+	// Not yet delivered: even a same-value write must queue.
+	CHECK_EQ( ram[ 0x2000 ], 0 );
+	wb.onRamWrite( 0x2000, 0 );			// value == shadow, but unsynced
+	ram[ 0x2000 ] = 0;
+	CHECK_EQ( wb.pending(), 1u );
+	wb.flush();
+	CHECK_EQ( wb.pending(), 0u );
+
+	// Delivered once: an identical rewrite now queues nothing...
+	wb.onRamWrite( 0x2000, 0 );
+	CHECK_EQ( wb.pending(), 0u );
+	CHECK_EQ( wb.m_WritesEliminated, 1u );
+
+	// ...while a changed value still queues normally.
+	wb.onRamWrite( 0x2000, 7 );
+	ram[ 0x2000 ] = 7;
+	CHECK_EQ( wb.pending(), 1u );
+
+	// Pending address: rewriting the OLD value must still coalesce into the
+	// queue (DRAM will not match shadow until the flush).
+	wb.onRamWrite( 0x2000, 7 );
+	CHECK_EQ( wb.pending(), 1u );
+	wb.flush();
+
+	// discard() (reset) forgets sync: elimination is off again until the
+	// address is delivered under the new program.
+	wb.discard();
+	wb.onRamWrite( 0x2000, 7 );			// same value as shadow AND real DRAM
+	ram[ 0x2000 ] = 7;
+	CHECK_EQ( wb.pending(), 1u );
+}

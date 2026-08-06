@@ -122,6 +122,7 @@ public:
 
 	// --- statistics -------------------------------------------------------
 	u64 m_WritesAccepted;	// writes that the policy said to mirror
+	u64 m_WritesEliminated;	// writes dropped because DRAM already held the value
 	u64 m_WritesSkipped;	// writes the policy discarded
 	u64 m_WritesCoalesced;	// accepted writes that hit an already-dirty address
 	u64 m_BytesFlushed;		// bytes actually sent over the bus
@@ -149,6 +150,12 @@ private:
 
 	// Dirty set: bitmap for O(1) membership, list for O(n) iteration.
 	u64 m_Dirty[ 0x10000 / 64 ];
+	// Addresses this buffer has delivered at least once since attach/discard.
+	// Only for those is "shadow == real DRAM when clean" a fact rather than a
+	// hope, which is what makes same-value elimination sound: after a reset
+	// the two diverge wholesale, and an eliminated write there would leave
+	// stale DRAM on screen forever.
+	u64 m_Synced[ 0x10000 / 64 ];
 	// Value accepted under the policy in force at the time of the write. Keeping
 	// it here lets an optimisation-mode change take effect immediately without
 	// synchronously flushing the old queue. A later write excluded by the new
