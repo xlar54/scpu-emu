@@ -68,7 +68,10 @@
 // Unsynchronised access: only valid when the caller has already resynced and
 // knows it is at a cycle boundary.
 #define RAD_POKE( a, v ) { busWriteByte_p1( g2, a, v ); busWriteByte_p2( g2, false ); }
-#define RAD_PEEK( a, v ) { busReadByte_p1( g2, a ); busReadByte_p2( g2 ); busReadByte_p3( g2, v, false ); }
+// The SID ($D400-$D7FF) drives the data bus later than every other chip, so
+// its reads sample at their own configured point. See busReadByte_p3.
+#define RAD_READ_SAMPLE_AT( a ) 	( ( ( (a) & 0xFC00 ) == 0xD400 ) ? (u32)busTiming.WAIT_CYCLE_READ_SID 	                                 : (u32)( WAIT_CYCLE_WRITEDATA + 20 ) )
+#define RAD_PEEK( a, v ) { busReadByte_p1( g2, a ); busReadByte_p2( g2 ); busReadByte_p3( g2, v, false, RAD_READ_SAMPLE_AT( a ) ); }
 
 // Burst access, valid only between busBeginBurstWrites()/busEndBurstWrites().
 #define RAD_BURST_POKE( a, v ) { busWriteByteBurst_p1( g2, a, v ); busWriteByteBurst_p2( g2, false ); }

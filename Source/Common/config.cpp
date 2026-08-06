@@ -187,5 +187,7 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	if ( mirrorDisplaySeen && timingValues[ 24 ] >= 0 )
 		cfgMirrorDisplayBytes = timingValues[ 24 ];
 
+	if ( timingValues[ 25 ] ) WAIT_CYCLE_READ_SID = timingValues[ 25 ];
+
 	return 1;
 }

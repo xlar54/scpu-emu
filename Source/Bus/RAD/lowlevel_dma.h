@@ -255,10 +255,17 @@ void busReadByte_p2( register u32 &g2 )
 	RESTART_CYCLE_COUNTER
 }
 
+// sampleAt: ARM cycles from the PHI2 edge at which the data bus is captured.
+// One point does not fit every chip: the VIC and CIAs drive data early enough
+// for WAIT_CYCLE_WRITEDATA+20, but the SID drives it near the END of the
+// half-cycle -- a 6510 samples on the falling edge -- and reading it at the
+// shared point returns open-bus $FF for every register. Callers pass the
+// SID-specific point for $D400-$D7FF and the shared one for everything else.
 __attribute__( ( always_inline ) ) inline  
-void busReadByte_p3( register u32 &g2, register u8 &x, bool releaseDMA )
+void busReadByte_p3( register u32 &g2, register u8 &x, bool releaseDMA,
+                     u32 sampleAt )
 { 
-	WAIT_UP_TO_CYCLE( WAIT_CYCLE_WRITEDATA + 20 );
+	WAIT_UP_TO_CYCLE( sampleAt );
 	g2 = read32( ARM_GPIO_GPLEV0 );
 	x = (u8)( ( g2 >> D0 ) & 255 );
 	WAIT_FOR_VIC_HALFCYCLE

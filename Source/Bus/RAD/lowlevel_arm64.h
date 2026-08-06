@@ -44,6 +44,12 @@ extern u32 WAIT_CYCLE_READ;
 extern u32 WAIT_CYCLE_READ_BADLINE;
 extern u32 WAIT_CYCLE_READ_VIC2;
 extern u32 WAIT_CYCLE_WRITEDATA;
+
+// Sample point for SID ($D400-$D7FF) register reads. The SID drives the data
+// bus near the END of the half-cycle -- a 6510 samples on the falling edge --
+// so the shared point captures open-bus $FF for every SID register. Seen on
+// hardware: OSC3 read 255 forever, holding Metal Dust in its seed loop.
+extern u32 WAIT_CYCLE_READ_SID;
 extern u32 WAIT_CYCLE_WRITEDATA_VIC2;
 extern u32 WAIT_CYCLE_MULTIPLEXER_VIC2;
 extern u32 WAIT_TRIGGER_DMA;
