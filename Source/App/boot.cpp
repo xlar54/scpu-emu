@@ -484,7 +484,15 @@ static bool scpuCheckButton( void *ctx )
 			if ( scpu->memory().iecBusActive() )
 				return false;
 			const u32 span = s_HeartbeatPCHigh - s_HeartbeatPCLow;
-			const bool stalled = ( span < 64 );
+
+			// A machine sitting at READY legitimately spins in the KERNAL's
+			// keyboard wait ($E5CD-$E5D4), which a span heuristic cannot tell
+			// from a wedge. Exempt exactly that window; a machine stuck
+			// anywhere else -- including the $FF48 BRK loop this detector was
+			// built for -- still trips.
+			const bool kernalIdle = ( s_HeartbeatPCLow  >= 0x00E5C0
+			                       && s_HeartbeatPCHigh <= 0x00E5D8 );
+			const bool stalled = ( span < 64 ) && !kernalIdle;
 
 			CScopedLoggingIRQs irqs;
 			s_Logger->Write( "SCPU", LogNotice,
