@@ -181,6 +181,15 @@ public:
 	// captured on hardware as a frozen C64 and a live Pi.
 	void onInterruptAcknowledged() override
 	{
+		// Remember whether the bank was open, then close it for the handler.
+		// RTI restores what was remembered -- see onInterruptReturned. The
+		// depth-limited bit-stack keeps nested NMI-in-IRQ straight.
+		if ( m_InterruptDepth < 32 )
+		{
+			m_RTIBankStack = ( m_RTIBankStack << 1 )
+			               | ( m_HWRegsEnabled ? 1u : 0u );
+			m_InterruptDepth++;
+		}
 		if ( m_HWRegsEnabled )
 		{
 			m_HWRegsEnabled = false;
@@ -189,9 +198,34 @@ public:
 		}
 	}
 
+	// The other half, and the half whose absence broke CMD's DOS: without it,
+	// code interrupted with the bank open resumed with the bank silently
+	// closed, its next $D2xx scratch write was discarded by the write gate,
+	// and the corrupted command state surfaced as sporadic warm resets on
+	// wedge commands. The interrupted code must get the world back exactly as
+	// it left it.
+	void onInterruptReturned()
+	{
+		if ( !m_InterruptDepth )
+			return;					// a stray RTI used as a jump, not an exit
+		m_InterruptDepth--;
+		const bool wasOpen = ( m_RTIBankStack & 1u ) != 0;
+		m_RTIBankStack >>= 1;
+		if ( wasOpen && !m_HWRegsEnabled )
+		{
+			m_HWRegsEnabled = true;
+			applyKernalShadow();
+		}
+	}
+
 	// How often an interrupt arrived with the bank open. Reported by the
 	// firmware heartbeat: a healthy machine does this routinely.
 	u64 m_InterruptBankCloses = 0;
+
+private:
+	u32 m_RTIBankStack = 0;
+	u32 m_InterruptDepth = 0;
+public:
 
 	// Diagnostics only: peek the $D200 scratch window without going through
 	// the I/O path.

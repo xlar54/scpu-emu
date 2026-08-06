@@ -68,9 +68,11 @@ public:
 	virtual bool ioRead( u16 addr, u8 &value ) = 0;
 	virtual bool ioWrite( u16 addr, u8 value ) = 0;
 
-	// The CPU is servicing an interrupt. The accelerator closes its register
-	// bank here; see CSuperCPURegisters::onInterruptAcknowledged.
+	// The CPU is servicing an interrupt / returning from one. The accelerator
+	// closes its register bank for the handler and restores it on return; see
+	// CSuperCPURegisters::onInterruptAcknowledged / onInterruptReturned.
 	virtual void onInterruptAcknowledged() {}
+	virtual void onInterruptReturned() {}
 };
 
 #define C64_RAM_SIZE      0x10000
@@ -229,10 +231,14 @@ public:
 			m_IntCredit = 0;
 		}
 	}
-	// Tell the accelerator an interrupt is being serviced.
+	// Tell the accelerator an interrupt is being serviced / returned from.
 	inline void notifyInterruptAcknowledged()
 	{
 		if ( m_IO ) m_IO->onInterruptAcknowledged();
+	}
+	inline void notifyInterruptReturned()
+	{
+		if ( m_IO ) m_IO->onInterruptReturned();
 	}
 
 	inline bool irqFast() { refreshInterruptsIfDue(); return m_CachedIRQ; }

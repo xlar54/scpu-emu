@@ -437,7 +437,27 @@ TEST( integration_hardware_interrupt_closes_the_register_bank )
 	CHECK_EQ( kernalShadowBase, 0xE000u );		// KT for the handler
 	CHECK_EQ( regs.m_InterruptBankCloses, 1u );
 
-	// Already closed: acknowledging again is a no-op, not a second count.
-	regs.onInterruptAcknowledged();
-	CHECK_EQ( regs.m_InterruptBankCloses, 1u );
+	// RTI hands the interrupted code back the world it left: bank open again.
+	// Without this, DOS code interrupted mid-command resumed with its $D2xx
+	// scratch write-protected and its state silently corrupting -- seen on
+	// hardware as sporadic warm resets on wedge commands.
+	regs.onInterruptReturned();
+	CHECK( regs.hardwareRegsEnabled() );
+	CHECK_EQ( kernalShadowBase, 0x6000u );
+
+	// Nested NMI-in-IRQ: the inner acknowledge sees the bank already closed,
+	// so the inner return must NOT reopen it -- only the outer one does.
+	regs.onInterruptAcknowledged();				// outer, bank open -> closes
+	regs.onInterruptAcknowledged();				// inner, already closed
+	CHECK_EQ( regs.m_InterruptBankCloses, 2u );
+	regs.onInterruptReturned();					// inner: stays closed
+	CHECK( !regs.hardwareRegsEnabled() );
+	regs.onInterruptReturned();					// outer: reopens
+	CHECK( regs.hardwareRegsEnabled() );
+
+	// A stray RTI with no interrupt in flight -- RTI used as a jump -- must
+	// not touch the bank.
+	regs.ioWrite( SCPU_REG_HWREGS_DISABLE, 0 );
+	regs.onInterruptReturned();
+	CHECK( !regs.hardwareRegsEnabled() );
 }

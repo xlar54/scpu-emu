@@ -734,6 +734,11 @@ u32 CW65C816::stepNoTick()
 		// RTI restores m and x from the stacked P -- and can therefore zero XH
 		// and YH -- but it never restores E.
 		applyE();
+		// The accelerator restores its register-bank state here, closing the
+		// loop opened in serviceInterrupt. A stray RTI used as a jump is safe:
+		// the restore is depth-guarded on the accelerator side.
+		if ( m_FastBus )
+			m_FastBus->notifyInterruptReturned();
 		break;
 
 	// --- branches ----------------------------------------------------------

@@ -120,6 +120,10 @@ public:
 	{
 		if ( m_Bank0 ) m_Bank0->notifyInterruptAcknowledged();
 	}
+	void notifyInterruptReturned()
+	{
+		if ( m_Bank0 ) m_Bank0->notifyInterruptReturned();
+	}
 	bool nmiAsserted() override { return m_Bank0 ? m_Bank0->nmiFast() : false; }
 	void tick( u32 nCycles ) override { if ( m_Bank0 ) m_Bank0->tickFast( nCycles ); }
 
