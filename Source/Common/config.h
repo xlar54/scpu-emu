@@ -29,7 +29,7 @@
 #define _config_h
 
 
-#define TIMING_NAMES 25
+#define TIMING_NAMES 27
 const char timingNames[TIMING_NAMES][32] = {
 	"WAIT_FOR_SIGNALS", 
 	"WAIT_CYCLE_READ", 
@@ -67,7 +67,12 @@ const char timingNames[TIMING_NAMES][32] = {
 	"JIFFYDOS",
 	// Also not a timing: mirrored bytes allowed per drain while the VIC-II is
 	// drawing the picture. 0 restores strict border-only mirroring.
-	"MIRROR_DISPLAY_BYTES"
+	"MIRROR_DISPLAY_BYTES",
+	// The SID drives the data bus later than every other chip; reads of
+	// $D400-$D7FF sample at this point instead of the shared one.
+	"WAIT_CYCLE_READ_SID",
+	// Not a timing: run 2.04's carried-but-skipped C64 startup animation.
+	"BOOT_ANIMATION"
 };
 
 // Which CPU core boot.cpp should install. Set from CPU_CORE in the config file;

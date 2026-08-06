@@ -84,6 +84,7 @@ int cfgCPUCore = SCPU_CFG_CORE_DEFAULT;
 int cfgBootmap = SCPU_CFG_BOOTMAP_DEFAULT;
 int cfgJiffyDOS = SCPU_CFG_JIFFYDOS_DEFAULT;
 int cfgMirrorDisplayBytes = SCPU_CFG_MIRROR_DISPLAY_DEFAULT;
+int cfgBootAnimation = 1;
 
 char cfg[ 65536 ];
 
@@ -100,6 +101,7 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	cfgBootmap = SCPU_CFG_BOOTMAP_DEFAULT;
 	cfgJiffyDOS = SCPU_CFG_JIFFYDOS_DEFAULT;
 	cfgMirrorDisplayBytes = SCPU_CFG_MIRROR_DISPLAY_DEFAULT;
+	cfgBootAnimation = 1;
 
 	// Leave a byte spare so cfg is always NUL-terminated for the line scanner.
 	if ( !readFile( logger, DRIVE, FILENAME, (u8*)cfg, &cfgBytes, sizeof( cfg ) - 1 ) )
