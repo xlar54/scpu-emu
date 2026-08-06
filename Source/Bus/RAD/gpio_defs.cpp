@@ -31,6 +31,13 @@
 #include "gpio_defs.h"
 #include "lowlevel_arm64.h"
 
+// Counts of bus waits that hit their ceiling instead of seeing the signal they
+// were waiting for. Both should stay at zero on a healthy machine; either one
+// climbing says the bus stopped answering, which used to hang the firmware
+// outright. Printed with the freeze diagnostics.
+volatile u32 radBAWaitTimeouts = 0;
+volatile u32 radPHIWaitTimeouts = 0;
+
 void INP_GPIO( int pin )
 {
 	unsigned nSelReg = ARM_GPIO_GPFSEL0 + ( pin / 10 ) * 4;

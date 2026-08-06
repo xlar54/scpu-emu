@@ -46,6 +46,12 @@
 // Defined in main.cpp, which owns the FAT filesystem object.
 extern "C" void radUnmountFileSystem();
 
+// Bus waits that hit their ceiling instead of seeing the signal they wanted.
+// Defined in Bus/RAD/gpio_defs.cpp; declared here rather than including
+// lowlevel_dma.h, which needs the whole GPIO header stack ahead of it.
+extern volatile u32 radBAWaitTimeouts;
+extern volatile u32 radPHIWaitTimeouts;
+
 static bool radBusButtonPressed();
 static bool radBusHardwareResetPressed();
 static void radBusSampleInterrupts( bool &irq, bool &nmi );
@@ -337,6 +343,13 @@ static void scpuEmitResetDiagnostic()
 	s_Logger->Write( "SCPU", LogNotice,
 	               "  live CIA state not sampled while physical /RESET was asserted" );
 
+	// Both should read zero. Either one non-zero means a bus wait hit its
+	// ceiling instead of seeing the signal it wanted -- which before those
+	// ceilings existed was an unrecoverable hang, not a counter.
+	s_Logger->Write( "SCPU", LogNotice,
+	               "  bus wait timeouts: BA=%u PHI=%u",
+	               (unsigned)radBAWaitTimeouts, (unsigned)radPHIWaitTimeouts );
+
 	for ( u32 row = 0; row < 4; row++ )
 	{
 		scpuLineStart( line, sizeof line, n );
@@ -360,6 +373,22 @@ static bool scpuCheckButton( void *ctx )
 {
 	CSuperCPU *scpu = (CSuperCPU *)ctx;
 	const bool hardwareResetPressed = radBusHardwareResetPressed();
+
+	// Say so the FIRST time a bus wait ever hits its ceiling. Before those
+	// ceilings existed this was the freeze that took the whole firmware down
+	// -- no frame hook, no button, power cycle only -- so it left no trace at
+	// all. One line, once, is the difference between a mystery and a lead.
+	{
+		static u32 lastBA = 0, lastPHI = 0;
+		if ( radBAWaitTimeouts != lastBA || radPHIWaitTimeouts != lastPHI )
+		{
+			lastBA = radBAWaitTimeouts;
+			lastPHI = radPHIWaitTimeouts;
+			s_Logger->Write( "SCPU", LogNotice,
+			               "BUS WAIT TIMEOUT: BA=%u PHI=%u (bus stopped answering)",
+			               (unsigned)lastBA, (unsigned)lastPHI );
+		}
+	}
 
 	// These reads go to the physical CIA. Do not insert them into an active
 	// serial transaction merely for diagnostics; take the next scheduled

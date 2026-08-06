@@ -99,25 +99,45 @@ __attribute__( ( always_inline ) ) inline u8 flipByte( u8 x )
 	CLR_GPIO( bOE_Dx | bDIR_Dx );	\
 	SET_BANK2_OUTPUT 
 
-#define WAIT_FOR_CPU_HALFCYCLE {do { g2 = read32( ARM_GPIO_GPLEV0 ); } while ( VIC_HALF_CYCLE );}
-#define WAIT_FOR_VIC_HALFCYCLE {do { g2 = read32( ARM_GPIO_GPLEV0 ); } while ( CPU_HALF_CYCLE ); }
+// Ceiling on every wait for a PHI2 phase, counted in GPLEV0 reads.
+//
+// A half-cycle is about 500ns and one MMIO read of GPLEV0 costs on the order
+// of 100 ARM cycles, so a legitimate wait here is a handful of iterations --
+// a few dozen at the very worst. Anything approaching this limit means PHI2
+// has stopped arriving, and no amount of further spinning will bring it back.
+//
+// Unbounded, that spin is fatal rather than slow: these waits sit inside the
+// BA loops and inside every bus access, all of which run under runFrame(). A
+// PHI2 that stops takes the frame loop with it, so the button hook never runs
+// again and the Pi has to be unplugged -- which is exactly the freeze where
+// pressing reset printed nothing at all. Bounding them cannot make a working
+// bus worse, and it turns a dead machine into one that can still tell us
+// where it is.
+#define RAD_PHI_WAIT_LIMIT 20000
+
+#define WAIT_FOR_CPU_HALFCYCLE { u32 phiSpins__ = 0; do { g2 = read32( ARM_GPIO_GPLEV0 ); } while ( VIC_HALF_CYCLE && ++phiSpins__ < RAD_PHI_WAIT_LIMIT ); if ( phiSpins__ >= RAD_PHI_WAIT_LIMIT ) radPHIWaitTimeouts++;}
+#define WAIT_FOR_VIC_HALFCYCLE { u32 phiSpins__ = 0; do { g2 = read32( ARM_GPIO_GPLEV0 ); } while ( CPU_HALF_CYCLE && ++phiSpins__ < RAD_PHI_WAIT_LIMIT ); if ( phiSpins__ >= RAD_PHI_WAIT_LIMIT ) radPHIWaitTimeouts++; }
 
 #define WAIT_FOR_VIC_HALFCYCLE_EDGE {				\
+	u32 phiSpins__ = 0;							\
 	do { 										\
 		g2 = read32( ARM_GPIO_GPLEV0 );			\
-	} while ( !(g2 & bPHI) );					\
+	} while ( !(g2 & bPHI) && ++phiSpins__ < RAD_PHI_WAIT_LIMIT );	\
+	phiSpins__ = 0;								\
 	do { 										\
 		g2 = read32( ARM_GPIO_GPLEV0 );			\
-	} while ( (g2 & bPHI) );	}
+	} while ( (g2 & bPHI) && ++phiSpins__ < RAD_PHI_WAIT_LIMIT );	}
 
 
 #define WAIT_FOR_CPU_HALFCYCLE_EDGE {				\
+	u32 phiSpins__ = 0;							\
 	do { 										\
 		g2 = read32( ARM_GPIO_GPLEV0 );			\
-	} while ( (g2 & bPHI) );					\
+	} while ( (g2 & bPHI) && ++phiSpins__ < RAD_PHI_WAIT_LIMIT );	\
+	phiSpins__ = 0;								\
 	do {										\
 		g2 = read32( ARM_GPIO_GPLEV0 );			\
-	} while ( !(g2 & bPHI) );	}						
+	} while ( !(g2 & bPHI) && ++phiSpins__ < RAD_PHI_WAIT_LIMIT );	}
 
 
 // Ceiling on every wait for BA to come back, in C64 cycles.
@@ -137,6 +157,9 @@ __attribute__( ( always_inline ) ) inline u8 flipByte( u8 x )
 // line, instead of a machine that has to be unplugged.
 #define RAD_BA_WAIT_LIMIT 4000
 
+extern volatile u32 radBAWaitTimeouts;
+extern volatile u32 radPHIWaitTimeouts;
+
 #define HANDLE_BUS_AVAILABLE_READ \
 	WAIT_UP_TO_CYCLE( busTiming.TIMING_BA_SIGNAL_AVAIL );			\
 	g2 = read32( ARM_GPIO_GPLEV0 );							\
@@ -149,6 +172,7 @@ __attribute__( ( always_inline ) ) inline u8 flipByte( u8 x )
 			WAIT_UP_TO_CYCLE( busTiming.TIMING_BA_SIGNAL_AVAIL );	\
 			g2 = read32( ARM_GPIO_GPLEV0 );					\
 		} while ( !(g2 & bBA) && ++baSpins__ < RAD_BA_WAIT_LIMIT );	\
+		if ( baSpins__ >= RAD_BA_WAIT_LIMIT ) radBAWaitTimeouts++;	\
 	}
 
 
@@ -162,7 +186,8 @@ __attribute__( ( always_inline ) ) inline u8 flipByte( u8 x )
 		WAIT_FOR_VIC_HALFCYCLE								\
 		RESTART_CYCLE_COUNTER								\
 		WAIT_UP_TO_CYCLE( busTiming.TIMING_READ_BA_WRITING );		\
-		g2 = read32( ARM_GPIO_GPLEV0 ); } }
+		g2 = read32( ARM_GPIO_GPLEV0 ); }						\
+	if ( baSpins__ >= RAD_BA_WAIT_LIMIT ) radBAWaitTimeouts++; }
 
 
 __attribute__( ( always_inline ) ) inline 
@@ -315,6 +340,8 @@ void busWriteByteBurst_p1( register u32 &g2, u16 addr, u8 data )
 		WAIT_UP_TO_CYCLE( busTiming.TIMING_READ_BA_WRITING );
 		g2 = read32( ARM_GPIO_GPLEV0 );
 	}
+
+	if ( baSpins > RAD_BA_WAIT_LIMIT ) radBAWaitTimeouts++;
 
 	if ( resync )
 	{
