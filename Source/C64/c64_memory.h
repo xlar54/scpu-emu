@@ -218,7 +218,17 @@ public:
 	{
 		// Under automatic IEC throttling, a nominal 20MHz cycle lasts one
 		// microsecond. Use the effective rate so the cache does not become 20us.
-		const u32 threshold = m_IECHoldCycles ? 1 : m_PacingCheckCycles;
+		// Also sample every cycle while the SuperCPU register bank is OPEN.
+		// In that state $E000-$FFFF is served from the KS image, which is not
+		// a whole KERNAL -- CMD's image has holes, and $FF40-$FF50 (the IRQ
+		// entry among them) is one of them. An interrupt taken in that window
+		// executes $00 = BRK, which vectors straight back to $FF48 and loops
+		// forever with the stack filling. Real hardware never gets there
+		// because the interrupt is taken BEFORE the bank opens; a cache that
+		// is a few instructions stale can defer it until after, which turns
+		// correct code into a hang.
+		const u32 threshold = ( m_IECHoldCycles || m_KernalShadowBase == 0x6000 )
+		                    ? 1 : m_PacingCheckCycles;
 		if ( m_IntCredit >= threshold && m_C64 )
 		{
 			m_C64->sampleInterrupts( m_CachedIRQ, m_CachedNMI );
@@ -348,7 +358,11 @@ public:
 	{
 		return m_IECHoldCycles != 0 || m_IECActivityCycles != 0
 		    || ( m_SelectedEmulatedHz != 0
-		         && m_SelectedEmulatedHz <= 1000000u );
+		         && m_SelectedEmulatedHz <= 1000000u )
+		    // Register bank open: the kernal window is the hole-ridden KS
+		    // image, so interrupt timing has to be exact. See
+		    // refreshInterruptsIfDue.
+		    || m_KernalShadowBase == 0x6000;
 	}
 
 	// True while a serial TRANSACTION is in progress, independent of what
