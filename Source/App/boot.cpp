@@ -52,6 +52,14 @@ extern "C" void radUnmountFileSystem();
 extern volatile u32 radBAWaitTimeouts;
 extern volatile u32 radPHIWaitTimeouts;
 
+// Heartbeat: proves the frame loop is still running, and reports what the
+// emulated machine is doing while it does so.
+static u32 s_HeartbeatFrames = 0;
+static u32 s_HeartbeatPCLow = 0xFFFFFFFF;
+static u32 s_HeartbeatPCHigh = 0;
+static u32 s_HeartbeatStalledRuns = 0;
+static bool s_HeartbeatDumped = false;
+
 static bool radBusButtonPressed();
 static bool radBusHardwareResetPressed();
 static void radBusSampleInterrupts( bool &irq, bool &nmi );
@@ -431,6 +439,64 @@ static bool scpuCheckButton( void *ctx )
 		s_PreResetSampleFrame = 0;
 		s_PreResetSampleValid = false;
 		return false;
+	}
+
+	// --- heartbeat and stall self-detection ---------------------------------
+	// A freeze used to leave nothing behind. The bounded bus waits keep the
+	// firmware alive through one, but "no output" is still ambiguous: a silent
+	// log looks identical whether the Pi is wedged or simply has nothing to
+	// report. So say something every second, and say what the emulated machine
+	// is doing while saying it.
+	//
+	// The PC range is the useful part. A machine that is working sweeps a wide
+	// range of addresses in a second; one parked in a KERNAL wait loop spins
+	// over a handful of bytes. When that happens for several seconds running,
+	// dump the full diagnostic unprompted -- the reset button is a poor way to
+	// collect it, because pressing it resets the physical CIAs and destroys the
+	// serial state that explains the stall.
+	if ( scpu && scpu->cpu() )
+	{
+		const u32 pc = (u32)scpu->cpu()->pc();
+		if ( pc < s_HeartbeatPCLow )  s_HeartbeatPCLow  = pc;
+		if ( pc > s_HeartbeatPCHigh ) s_HeartbeatPCHigh = pc;
+
+		if ( ++s_HeartbeatFrames >= 60 )
+		{
+			const u32 span = s_HeartbeatPCHigh - s_HeartbeatPCLow;
+			const bool stalled = ( span < 64 );
+
+			s_Logger->Write( "SCPU", LogNotice,
+			               "hb PC=$%06X..$%06X wb=%u iec=%u BA=%u PHI=%u%s",
+			               (unsigned)s_HeartbeatPCLow, (unsigned)s_HeartbeatPCHigh,
+			               (unsigned)scpu->writeBuffer().pending(),
+			               (unsigned)( scpu->memory().iecBusActive() ? 1 : 0 ),
+			               (unsigned)radBAWaitTimeouts,
+			               (unsigned)radPHIWaitTimeouts,
+			               stalled ? "  <-- STALLED" : "" );
+
+			if ( stalled )
+			{
+				// Three seconds in the same few bytes is not a busy loop doing
+				// work; dump once and then stay quiet until it moves again.
+				if ( ++s_HeartbeatStalledRuns == 3 && !s_HeartbeatDumped )
+				{
+					s_HeartbeatDumped = true;
+					s_Logger->Write( "SCPU", LogNotice,
+					               "STALL DETECTED -- dumping state (no reset pressed)" );
+					scpuSnapshotResetDiagnostic( scpu );
+					scpuEmitResetDiagnostic();
+				}
+			}
+			else
+			{
+				s_HeartbeatStalledRuns = 0;
+				s_HeartbeatDumped = false;
+			}
+
+			s_HeartbeatFrames = 0;
+			s_HeartbeatPCLow  = 0xFFFFFFFF;
+			s_HeartbeatPCHigh = 0;
+		}
 	}
 
 	// Emit the saved pre-reset state on a later hook invocation, after several
