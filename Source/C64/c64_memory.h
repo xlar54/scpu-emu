@@ -201,6 +201,19 @@ public:
 			m_RAM[ a ] = v;
 			m_RamWrites++;
 			if ( m_Mirror ) m_Mirror->onRamWrite( a, v );
+
+			// The active screen's sprite pointers bypass the queue and land
+			// on the real bus NOW, like a VIC register. Double-buffered
+			// sprite animation flips a pointer in vblank and immediately
+			// starts redrawing the block the flip retired; a pointer flip
+			// that arrives even a fraction of a frame late leaves the
+			// physical VIC displaying the very block the game is busy
+			// overwriting -- seen as sprites flickering between correct and
+			// garbage at animation rate. The queued copy still flushes
+			// later; coalescing holds the latest value, so re-sending it is
+			// harmless.
+			if ( ( (u32)a & ~7u ) == m_SpritePtrBase && m_C64 )
+				m_C64->write( a, v );
 			return;
 		}
 		write8( a, v );
@@ -424,6 +437,21 @@ private:
 	u8   m_LastCIA2PortARead;
 	u8   m_CIA2DDRA;
 	bool m_HaveCIA2PortALatch;
+
+	// Base of the ACTIVE screen's sprite-pointer row ($xxF8 masked to 8), or
+	// the sentinel when the screen sits under the I/O window and cannot be
+	// mirrored at all. Kept fresh by writes to $D018 and $DD00.
+	u32  m_SpritePtrBase;
+	u8   m_LastD018;
+	void updateSpritePtrBase()
+	{
+		const u8 bank = m_HaveCIA2PortALatch ? (u8)( ~m_CIA2PortALatch & 3 ) : 0;
+		const u32 base = ( (u32)bank << 14 )
+		               + ( (u32)( m_LastD018 >> 4 ) << 10 ) + 0x3F8;
+		// Screen under the I/O window: the pointer row is unreachable over
+		// the bus (real $01 stays $37), so the fast path must never try.
+		m_SpritePtrBase = ( ( base & 0xF000 ) == 0xD000 ) ? 0xFFFFFFFF : base;
+	}
 	bool m_HaveCIA2PortARead;
 	bool m_HaveCIA2DDRA;
 public:

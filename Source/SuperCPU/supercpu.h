@@ -51,8 +51,9 @@ enum SCPUCoreType
 };
 
 // Mirrored bytes allowed per drain call while the beam is inside the picture.
-// OFF by default: see CSuperCPU::setMirrorDisplayBudget for why.
-#define SCPU_MIRROR_DISPLAY_BYTES_DEFAULT 0
+// Effectively the mirror's write-through throughput; see
+// CSuperCPU::setMirrorDisplayBudget for the reasoning.
+#define SCPU_MIRROR_DISPLAY_BYTES_DEFAULT 1024
 
 class CSuperCPU
 {
@@ -81,23 +82,20 @@ public:
 	bool bootmapEnabled() const       { return m_BootmapEnabled; }
 
 	// How many mirrored bytes may be pushed per drain call while the beam is
-	// INSIDE the visible display. 0 -- the default -- keeps delivery entirely
-	// in the border.
+	// INSIDE the visible display -- effectively the mirror's write-through
+	// throughput. A real SuperCPU mirrors every write to DRAM immediately,
+	// mid-display, always; games rely on their OWN vblank discipline for
+	// tear-free updates, and it is delivery DELAY that breaks them: border-only
+	// mirroring caps throughput near 3KB/frame, so an animating game's objects
+	// arrive split across border windows and whole frames display half-updated
+	// data. Bus safety is not the issue -- the burst path yields to the VIC on
+	// BA, exactly as a real REU does.
 	//
-	// Such writes are not unsafe at the BUS level: the burst path yields to the
-	// VIC on BA, exactly as a real REU does. They are unsafe at the FRAME
-	// level, and that is subtler. A game writes its sprite shapes at a moment
-	// it has chosen, normally in the vertical blank, so the VIC never fetches a
-	// half-updated shape. Mirroring defers those writes and can replay them
-	// while the VIC is fetching that very sprite -- the top of the sprite comes
-	// from the old shape and the bottom from the new. The result flickers
-	// between the right picture and garbage, and it is WORSE for well-written
-	// games, because their careful timing is what gets discarded.
-	//
-	// So this stays off unless a game writes more per frame than the border can
-	// carry (roughly 3KB), where a torn object beats an object frozen several
-	// frames behind. Delivery is kept honest instead by arriving at the border
-	// deliberately once per frame -- see the end of runFrame().
+	// The default keeps latency sub-slice (~9 drains/frame at up to 1KB each,
+	// plus free border delivery). 0 restores strict border-only mirroring as
+	// the escape hatch. Sprite pointers of the active screen bypass this queue
+	// entirely -- see CC64Memory::writeFast -- because a late pointer flip
+	// makes the physical VIC display the block the game is already redrawing.
 	void setMirrorDisplayBudget( u32 bytes ) { m_MirrorDisplayBudget = bytes; }
 	u32  mirrorDisplayBudget() const         { return m_MirrorDisplayBudget; }
 

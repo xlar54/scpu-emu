@@ -73,6 +73,8 @@ void CC64Memory::reset()
 	m_MaxTickChunk = 0;
 	m_CIA2PortALatch = 0;
 	m_LastCIA2PortARead = 0;
+	m_LastD018 = 0x14;			// the KERNAL default: screen $0400, charset $1000
+	updateSpritePtrBase();
 	m_CIA2DDRA = 0;
 	m_HaveCIA2PortALatch = false;
 	m_HaveCIA2PortARead = false;
@@ -375,8 +377,14 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 		{
 			m_CIA2PortALatch = value;
 			m_HaveCIA2PortALatch = true;
+			updateSpritePtrBase();		// VIC bank lives in bits 0-1
 			if ( cia2IECChanged )
 				noteIECActivity();
+		}
+		else if ( a == 0xD018 )
+		{
+			m_LastD018 = value;
+			updateSpritePtrBase();
 		}
 		else if ( a == 0xDD02 )
 		{
@@ -402,6 +410,10 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 	// Everything else falls through to DRAM, including writes "into" ROM.
 	m_RAM[ a ] = value;
 	m_RamWrites++;
+	// Active-screen sprite pointers go to the real bus immediately; see the
+	// note in writeFast, which is the path that usually takes them.
+	if ( ( (u32)a & ~7u ) == m_SpritePtrBase && m_C64 )
+		m_C64->write( a, value );
 
 	if ( m_Mirror )
 		m_Mirror->onRamWrite( a, value );

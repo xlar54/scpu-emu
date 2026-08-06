@@ -1282,3 +1282,37 @@ TEST( integration_frame_end_runs_the_cpu_toward_the_border_instead_of_missing_it
 
 	CHECK( inDisplay > atBorder );
 }
+
+TEST( integration_active_screen_sprite_pointers_reach_the_bus_immediately )
+{
+	// Double-buffered sprite animation flips a pointer in vblank and starts
+	// redrawing the retired block at once. A pointer flip that arrives even a
+	// fraction of a frame late leaves the physical VIC displaying the block
+	// the game is now overwriting -- sprites flicker between correct and
+	// garbage at animation rate. So the ACTIVE screen's eight pointer bytes
+	// bypass the queue and land on the real bus like a VIC register write;
+	// everything else keeps queueing.
+	SystemFixture f;
+	f.start();
+	f.wb.setOptMode( SCPU_OPT_NONE );
+
+	// Default machine: bank 0, $D018=$14 -> screen $0400, pointers $07F8.
+	f.mem.write8( 0x07F8, 0x55 );
+	CHECK_EQ( f.bus.m_Memory[ 0x07F8 ], 0x55 );		// immediate, no flush
+
+	// A neighbouring screen byte still queues.
+	f.mem.write8( 0x07F0, 0x66 );
+	CHECK( f.bus.m_Memory[ 0x07F0 ] != 0x66 );
+
+	// Move the screen: $D018 top nibble selects matrix $2000, pointers $23F8.
+	f.mem.write8( 0xD018, 0x80 );
+	f.mem.write8( 0x23F8, 0x77 );
+	CHECK_EQ( f.bus.m_Memory[ 0x23F8 ], 0x77 );
+	f.mem.write8( 0x07F8, 0x99 );					// old row no longer special
+	CHECK( f.bus.m_Memory[ 0x07F8 ] != 0x99 );
+
+	// And the queued copies still flush the same values later.
+	f.wb.flush();
+	CHECK_EQ( f.bus.m_Memory[ 0x07F0 ], 0x66 );
+	CHECK_EQ( f.bus.m_Memory[ 0x07F8 ], 0x99 );
+}

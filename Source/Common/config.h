@@ -98,7 +98,7 @@ extern int cfgJiffyDOS;
 // can carry. See CSuperCPU::setMirrorDisplayBudget.
 extern int cfgMirrorDisplayBytes;
 
-#define SCPU_CFG_MIRROR_DISPLAY_DEFAULT 0
+#define SCPU_CFG_MIRROR_DISPLAY_DEFAULT 1024
 
 extern int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME );
 
