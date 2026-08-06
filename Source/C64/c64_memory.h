@@ -185,14 +185,14 @@ public:
 	// bootmap, the BASIC/KERNAL shadows, I/O and open bus. Those paths already
 	// do enough work that a call is noise, and keeping them out of the header
 	// keeps this small enough to actually inline.
-	inline u8 readFast( u16 a )
+	__attribute__((always_inline)) inline u8 readFast( u16 a )
 	{
 		if ( a > 1 && !m_BootmapActive && c64MapRead( a, m_BankMode ) == REG_RAM )
 			return m_RAM[ a ];
 		return read8( a );
 	}
 
-	inline void writeFast( u16 a, u8 v )
+	__attribute__((always_inline)) inline void writeFast( u16 a, u8 v )
 	{
 		// Note the mirror sink still has to be told: the VIC-II only sees what
 		// reaches the C64's own DRAM.

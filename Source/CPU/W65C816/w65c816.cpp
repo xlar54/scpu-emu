@@ -255,6 +255,66 @@ u32 CW65C816::step()
 	return used;
 }
 
+
+// ---------------------------------------------------------------------------
+// Emulation-mode fast path helpers. Always-inline twins of the generic
+// accessors: at -Os the generic ones stay out of line, and the entire point
+// of the fast switch below is that a hot opcode flattens into straight-line
+// code with no calls at all. Bodies are byte-identical to their generic
+// counterparts; cycle counts flow through the SAME inline w65c816Cycles, so
+// drift is structurally impossible.
+// ---------------------------------------------------------------------------
+
+__attribute__((always_inline)) inline u8 CW65C816::rd8E( u32 addr )
+{
+	addr &= SCPU_ADDR_MASK;
+	return m_FastBus ? m_FastBus->read8( addr ) : m_Bus->read8( addr );
+}
+
+__attribute__((always_inline)) inline void CW65C816::wr8E( u32 addr, u8 v )
+{
+	addr &= SCPU_ADDR_MASK;
+	if ( m_FastBus ) m_FastBus->write8( addr, v ); else m_Bus->write8( addr, v );
+}
+
+__attribute__((always_inline)) inline u8 CW65C816::f8E()
+{
+	const u8 v = rd8E( ( (u32)m_PBR << 16 ) | m_PC );
+	m_PC = (u16)( m_PC + 1 );
+	return v;
+}
+
+// E-mode "old" stack: S stays inside page 1, exactly as push8/pull8 do
+// when m_E is set.
+__attribute__((always_inline)) inline void CW65C816::pushE8( u8 v )
+{
+	wr8E( m_S, v );
+	m_S = (u16)( 0x0100 | ( ( m_S - 1 ) & 0xFF ) );
+}
+
+__attribute__((always_inline)) inline u8 CW65C816::pullE8()
+{
+	m_S = (u16)( 0x0100 | ( ( m_S + 1 ) & 0xFF ) );
+	return rd8E( m_S );
+}
+
+__attribute__((always_inline)) inline void CW65C816::znE( u8 v )
+{
+	m_P = (u8)( ( m_P & (u8)~( W65_Z | W65_N ) )
+	          | ( v == 0 ? W65_Z : 0 ) | ( v & 0x80 ) );
+}
+
+__attribute__((always_inline)) inline u32 CW65C816::emuDoneE( u8 opcode )
+{
+	// m8/x8/e are constant-true here, so the inline reference function
+	// constant-folds to the same counts the packed table holds for this key.
+	const u32 used = w65c816Cycles( opcode, true, true, true,
+	                                ( m_D & 0xFF ) != 0,
+	                                m_PageCross, m_BranchTaken );
+	m_Cycles += used;
+	return used;
+}
+
 // Single-step entry: force the full cold prologue, so behaviour is
 // byte-identical to the historical per-instruction path. The differential
 // suite runs through here.
@@ -338,18 +398,157 @@ u32 CW65C816::stepInner()
 	// widths mid-instruction, but their own cycle counts are the ones for the
 	// state they started in -- so the epilogue indexes the table with this
 	// LOCAL, never the live member.
+	m_PageCross = false;
+	m_BranchTaken = false;
+	m_EABank0 = false;
+
+	const u8 opcode = fetch8();
+
+	// --- emulation-mode fast path ---------------------------------------
+	// The statically hottest opcodes of 6502-era code, flattened: fetch,
+	// address, access and flags inline, cycle count from the same reference
+	// function the generic epilogue's table was generated from. Each body
+	// mirrors its generic case byte for byte -- the differential suite
+	// single-steps this same path with m_E set and proves it.
+	//
+	// Deliberately absent (see the judged spec): PLP/RTI/REP/SEP/XCE (width
+	// changes), new-stack ops, read-modify-writes (dummy-write order),
+	// dp,X / (dp) forms (wrap rules), ADC/SBC (decimal). A miss falls into
+	// the generic switch WITHOUT re-fetching -- I/O fetches read once.
+	//
+	// E-mode invariants relied on: S in page 1, m=x forced, XH/YH=0.
+	if ( m_E )
+	{
+		switch ( opcode )
+		{
+		case 0xA9:	// LDA #
+		{
+			const u8 n = f8E(); setA( n ); znE( n );
+			return emuDoneE( opcode );
+		}
+		case 0xA5:	// LDA dp
+		{
+			const u32 a = (u32)( (u16)( f8E() + m_D ) );
+			const u8 n = rd8E( a ); setA( n ); znE( n );
+			return emuDoneE( opcode );
+		}
+		case 0xAD:	// LDA abs
+		{
+			const u8 lo = f8E(); const u8 hi = f8E();
+			const u8 n = rd8E( ( (u32)m_DBR << 16 ) | lo | ( (u16)hi << 8 ) );
+			setA( n ); znE( n );
+			return emuDoneE( opcode );
+		}
+		case 0xBD:	// LDA abs,X   -- mirrors eaAbsoluteIndexed
+		case 0xB9:	// LDA abs,Y
+		{
+			const u8 lo = f8E(); const u8 hi = f8E();
+			const u16 base = (u16)( lo | ( (u16)hi << 8 ) );
+			const u16 idx = ( opcode == 0xBD ) ? m_X : m_Y;
+			if ( ( base ^ (u16)( base + idx ) ) & 0xFF00 ) m_PageCross = true;
+			const u8 n = rd8E( ( ( ( (u32)m_DBR << 16 ) | base ) + idx ) & SCPU_ADDR_MASK );
+			setA( n ); znE( n );
+			return emuDoneE( opcode );
+		}
+		case 0xA2:	// LDX #
+		{
+			m_X = f8E(); znE( (u8)m_X );
+			return emuDoneE( opcode );
+		}
+		case 0xA0:	// LDY #
+		{
+			m_Y = f8E(); znE( (u8)m_Y );
+			return emuDoneE( opcode );
+		}
+		case 0x85:	// STA dp
+		{
+			const u32 a = (u32)( (u16)( f8E() + m_D ) );
+			wr8E( a, getA() );
+			return emuDoneE( opcode );
+		}
+		case 0x8D:	// STA abs
+		{
+			const u8 lo = f8E(); const u8 hi = f8E();
+			wr8E( ( (u32)m_DBR << 16 ) | lo | ( (u16)hi << 8 ), getA() );
+			return emuDoneE( opcode );
+		}
+		case 0x49:	// EOR #
+		{
+			const u8 n = (u8)( getA() ^ f8E() ); setA( n ); znE( n );
+			return emuDoneE( opcode );
+		}
+		case 0x29:	// AND #
+		{
+			const u8 n = (u8)( getA() & f8E() ); setA( n ); znE( n );
+			return emuDoneE( opcode );
+		}
+		case 0x09:	// ORA #
+		{
+			const u8 n = (u8)( getA() | f8E() ); setA( n ); znE( n );
+			return emuDoneE( opcode );
+		}
+		case 0xC9:	// CMP #  -- mirrors opCMP(getAcc(), imm, true)
+		{
+			const u8 n = f8E(); const u8 a = getA();
+			m_P = (u8)( ( m_P & (u8)~W65_C ) | ( a >= n ? W65_C : 0 ) );
+			znE( (u8)( a - n ) );
+			return emuDoneE( opcode );
+		}
+		case 0xE8: m_X = (u8)( m_X + 1 ); znE( (u8)m_X ); return emuDoneE( opcode );	// INX
+		case 0xCA: m_X = (u8)( m_X - 1 ); znE( (u8)m_X ); return emuDoneE( opcode );	// DEX
+		case 0xC8: m_Y = (u8)( m_Y + 1 ); znE( (u8)m_Y ); return emuDoneE( opcode );	// INY
+		case 0x88: m_Y = (u8)( m_Y - 1 ); znE( (u8)m_Y ); return emuDoneE( opcode );	// DEY
+		case 0x10: case 0x30: case 0x90: case 0xB0: case 0xD0: case 0xF0:
+		{
+			// Mirrors W65_BRANCH exactly: the page cross is recorded before
+			// the condition is tested.
+			static const u8 flagSel[ 4 ] = { W65_N, W65_V, W65_C, W65_Z };
+			const s8 disp = (s8)f8E();
+			const u16 target = (u16)( m_PC + disp );
+			if ( ( m_PC ^ target ) & 0xFF00 ) m_PageCross = true;
+			const bool cond = ( ( m_P & flagSel[ opcode >> 6 ] ) != 0 )
+			               == ( ( opcode & 0x20 ) != 0 );
+			if ( cond ) { m_BranchTaken = true; m_PC = target; }
+			return emuDoneE( opcode );
+		}
+		case 0x4C:	// JMP abs
+		{
+			const u8 lo = f8E(); const u8 hi = f8E();
+			m_PC = (u16)( lo | ( (u16)hi << 8 ) );
+			return emuDoneE( opcode );
+		}
+		case 0x20:	// JSR abs -- "old" stack, PC-1 pushed high byte first
+		{
+			const u8 lo = f8E(); const u8 hi = f8E();
+			const u16 ret = (u16)( m_PC - 1 );
+			pushE8( (u8)( ret >> 8 ) );
+			pushE8( (u8)( ret & 0xFF ) );
+			m_PC = (u16)( lo | ( (u16)hi << 8 ) );
+			return emuDoneE( opcode );
+		}
+		case 0x60:	// RTS -- low byte pulled first
+		{
+			const u8 lo = pullE8(); const u8 hi = pullE8();
+			m_PC = (u16)( ( lo | ( (u16)hi << 8 ) ) + 1 );
+			return emuDoneE( opcode );
+		}
+		case 0x18: m_P = (u8)( m_P & ~W65_C ); return emuDoneE( opcode );	// CLC
+		case 0x38: m_P |= W65_C;               return emuDoneE( opcode );	// SEC
+		default: break;	// fall to the generic switch, opcode in hand
+		}
+	}
+
+	// Captured before dispatch: REP, SEP, PLP, RTI and XCE change the register
+	// widths mid-instruction, but their own cycle counts are the ones for the
+	// state they started in -- so the epilogue indexes the table with this
+	// LOCAL, never the live member.
 	const u8 cycKey = m_CycKey;
 	const bool m8Entry = ( cycKey & 1 ) != 0;
 	const bool x8Entry = ( cycKey & 2 ) != 0;
 	const bool eEntry  = ( cycKey & 4 ) != 0;
 
-	m_PageCross = false;
-	m_BranchTaken = false;
-	m_EABank0 = false;
-
 	if ( !m_E ) m_NativeInstructions++;
 
-	const u8 opcode = fetch8();
 	u32 ea = 0;
 	u16 v  = 0;
 	u16 t  = 0;

@@ -350,6 +350,17 @@ private:
 	void opADC( u16 v );
 	void opSBC( u16 v );
 	void opCMP( u16 reg, u16 v, bool eightBit );
+
+	// Emulation-mode fast-path helpers -- always-inline twins of the generic
+	// accessors, defined in w65c816.cpp above stepInner(). See the fast
+	// switch there for why they exist.
+	inline u8   f8E();
+	inline u8   rd8E( u32 addr );
+	inline void wr8E( u32 addr, u8 v );
+	inline void pushE8( u8 v );
+	inline u8   pullE8();
+	inline void znE( u8 v );
+	inline u32  emuDoneE( u8 opcode );
 	void opBIT( u16 v, bool immediate );
 
 	// --- interrupts -------------------------------------------------------

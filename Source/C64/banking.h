@@ -94,7 +94,7 @@ extern u8 c64RegionTable[ 32 ][ 16 ];
 
 void c64BankingInit();
 
-static inline C64Region c64MapRead( u16 addr, u8 mode )
+__attribute__((always_inline)) static inline C64Region c64MapRead( u16 addr, u8 mode )
 {
 	return (C64Region)c64RegionTable[ mode & 31 ][ addr >> 12 ];
 }
