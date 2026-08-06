@@ -66,6 +66,7 @@ extern volatile u32 radPHIWaitTimeouts;
 // Heartbeat: proves the frame loop is still running, and reports what the
 // emulated machine is doing while it does so.
 static u32 s_HeartbeatFrames = 0;
+static u32 s_MirrorHaltFrames = 0;
 static u32 s_HeartbeatPCLow = 0xFFFFFFFF;
 static u32 s_HeartbeatPCHigh = 0;
 static u32 s_HeartbeatStalledRuns = 0;
@@ -452,6 +453,23 @@ static bool scpuCheckButton( void *ctx )
 		s_PreResetSampleFrame = 0;
 		s_PreResetSampleValid = false;
 		return false;
+	}
+
+	// --- diagnostic mirror halt ---------------------------------------------
+	// MIRROR_HALT_AFTER_S: after N seconds, stop all mirror bus traffic so
+	// the display shows whatever real DRAM holds, undisturbed. If corruption
+	// SNAPS CLEAN when traffic stops, our ongoing writes were disturbing the
+	// VIC's fetches; if it PERSISTS with the bus quiet, the DRAM content
+	// itself is wrong -- our writes must be landing somewhere they should not.
+	if ( cfgMirrorHaltAfterS > 0 && scpu && !scpu->mirrorHalted() )
+	{
+		if ( ++s_MirrorHaltFrames >= (u32)cfgMirrorHaltAfterS * 60 )
+		{
+			scpu->setMirrorHalted( true );
+			CScopedLoggingIRQs irqs;
+			s_Logger->Write( "SCPU", LogNotice,
+			               "MIRROR HALTED (diagnostic): all mirror bus traffic stopped" );
+		}
 	}
 
 	// --- heartbeat and stall self-detection ---------------------------------

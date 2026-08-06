@@ -85,6 +85,7 @@ int cfgBootmap = SCPU_CFG_BOOTMAP_DEFAULT;
 int cfgJiffyDOS = SCPU_CFG_JIFFYDOS_DEFAULT;
 int cfgMirrorDisplayBytes = SCPU_CFG_MIRROR_DISPLAY_DEFAULT;
 int cfgBootAnimation = 1;
+int cfgMirrorHaltAfterS = 0;
 
 char cfg[ 65536 ];
 
@@ -102,6 +103,7 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	cfgJiffyDOS = SCPU_CFG_JIFFYDOS_DEFAULT;
 	cfgMirrorDisplayBytes = SCPU_CFG_MIRROR_DISPLAY_DEFAULT;
 	cfgBootAnimation = 1;
+	cfgMirrorHaltAfterS = 0;
 
 	// Leave a byte spare so cfg is always NUL-terminated for the line scanner.
 	if ( !readFile( logger, DRIVE, FILENAME, (u8*)cfg, &cfgBytes, sizeof( cfg ) - 1 ) )
@@ -196,6 +198,8 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	// A flag, not a timing: explicit 0 disables, anything else enables.
 	if ( bootAnimSeen )
 		cfgBootAnimation = ( timingValues[ 26 ] != 0 ) ? 1 : 0;
+
+	if ( timingValues[ 27 ] > 0 ) cfgMirrorHaltAfterS = timingValues[ 27 ];
 
 	return 1;
 }

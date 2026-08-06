@@ -97,6 +97,12 @@ public:
 	// entirely -- see CC64Memory::writeFast -- because a late pointer flip
 	// makes the physical VIC display the block the game is already redrawing.
 	void setMirrorDisplayBudget( u32 bytes ) { m_MirrorDisplayBudget = bytes; }
+
+	// Diagnostic kill switch: when set, runFrame stops ALL mirror bus traffic
+	// -- flushes and the resync sweep -- leaving real DRAM untouched so the
+	// screen shows exactly what it holds. See MIRROR_HALT_AFTER_S.
+	void setMirrorHalted( bool halted ) { m_MirrorHalted = halted; }
+	bool mirrorHalted() const           { return m_MirrorHalted; }
 	u32  mirrorDisplayBudget() const         { return m_MirrorDisplayBudget; }
 
 	void reset();
@@ -163,6 +169,7 @@ private:
 	bool     m_Running;
 	bool     m_BootmapEnabled;
 	u32      m_MirrorDisplayBudget;
+	bool     m_MirrorHalted = false;
 	u32      m_BenchArmPerEmuCycle = 0;
 
 	void benchmark65816();

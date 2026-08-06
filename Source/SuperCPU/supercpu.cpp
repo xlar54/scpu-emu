@@ -458,7 +458,7 @@ u64 CSuperCPU::runFrame()
 		// CLK for an acknowledgment phase the host never entered, which is
 		// precisely the $DD00=$87 deadlock captured on hardware. Mirroring can
 		// always wait 100ms; the serial bus cannot.
-		if ( !m_Memory.iecBusActive()
+		if ( !m_MirrorHalted && !m_Memory.iecBusActive()
 		     && !m_WriteBuffer.empty() && ticksUsed < frameTicks )
 			flushMirrorsRasterAware( m_WriteBuffer, *m_Bus, sig,
 			                         m_MirrorDisplayBudget,
@@ -485,7 +485,7 @@ u64 CSuperCPU::runFrame()
 	// The cycles spent here belong to the next frame, which is precisely the
 	// point: it re-phases the emulated frame against the real raster instead of
 	// letting the two drift.
-	if ( !m_WriteBuffer.empty() && !m_Memory.iecBusActive() )
+	if ( !m_MirrorHalted && !m_WriteBuffer.empty() && !m_Memory.iecBusActive() )
 	{
 		const u16 line = m_Bus->rasterLine();
 		const u32 lines = c64RasterLines( sig.video );
@@ -505,7 +505,7 @@ u64 CSuperCPU::runFrame()
 		}
 
 		// Re-check the serial bus: the approach run may have started one.
-		if ( !m_Memory.iecBusActive() )
+		if ( !m_MirrorHalted && !m_Memory.iecBusActive() )
 		{
 			flushMirrorsRasterAware( m_WriteBuffer, *m_Bus, sig,
 			                         m_MirrorDisplayBudget,

@@ -29,7 +29,7 @@
 #define _config_h
 
 
-#define TIMING_NAMES 27
+#define TIMING_NAMES 28
 const char timingNames[TIMING_NAMES][32] = {
 	"WAIT_FOR_SIGNALS", 
 	"WAIT_CYCLE_READ", 
@@ -72,7 +72,12 @@ const char timingNames[TIMING_NAMES][32] = {
 	// $D400-$D7FF sample at this point instead of the shared one.
 	"WAIT_CYCLE_READ_SID",
 	// Not a timing: run 2.04's carried-but-skipped C64 startup animation.
-	"BOOT_ANIMATION"
+	"BOOT_ANIMATION",
+	// Diagnostic: after this many seconds of uptime, STOP all mirror bus
+	// traffic (flushes and the resync sweep) so the display shows whatever
+	// real DRAM holds, undisturbed. Separates "our traffic corrupts fetches"
+	// from "our writes corrupt DRAM". 0 = never halt (normal operation).
+	"MIRROR_HALT_AFTER_S"
 };
 
 // Which CPU core boot.cpp should install. Set from CPU_CORE in the config file;
@@ -107,6 +112,9 @@ extern int cfgMirrorDisplayBytes;
 // skips on the faithful path. One-byte read deviation; see
 // CSuperCPURegisters::ioRead.
 extern int cfgBootAnimation;
+
+// Diagnostic; see MIRROR_HALT_AFTER_S in the names table.
+extern int cfgMirrorHaltAfterS;
 
 #define SCPU_CFG_MIRROR_DISPLAY_DEFAULT 1024
 
