@@ -133,6 +133,10 @@ public:
 	void setSpeedSwitchAllowsTurbo( bool allow );	// false = switch selects 1MHz
 	void setJiffyDOSSwitch( bool on ) { m_SwitchJiffy = on; }
 
+	// BOOT_ANIMATION: run the C64 startup animation that SuperCPU DOS 2.04
+	// carries but skips. See ioRead for the mechanism and the fidelity note.
+	void setBootAnimationHack( bool on ) { m_BootAnimHack = on; }
+
 	bool speedSwitchAllowsTurbo() const { return !m_SwitchSlow; }
 
 	// Emulation vs native mode, reported at $D0B6. The 6502 core is always in
@@ -270,6 +274,7 @@ private:
 	bool m_Soft1MHz;		// $D07A / $D07B / $D0B8
 	bool m_SwitchSlow;		// physical speed switch in the 1MHz position
 	bool m_SwitchJiffy;		// virtual JiffyDOS switch; persists across reset
+	bool m_BootAnimHack = false;	// see setBootAnimationHack
 
 	bool m_HWRegsEnabled;
 	bool  m_Bootmap;

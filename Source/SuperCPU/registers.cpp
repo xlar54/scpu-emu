@@ -131,6 +131,21 @@ bool CSuperCPURegisters::ioRead( u16 addr, u8 &value )
 	// ioWrite, and VICE's scpu64_d200_read, which has no such condition.
 	if ( addr >= SCPU_SYSRAM_BASE && addr < SCPU_SYSRAM_BASE + SCPU_SYSRAM_SIZE )
 	{
+		// BOOT_ANIMATION, a deliberate one-byte deviation. 2.04's startup
+		// writes $FF to $D20C with the bank open, closes the bank one
+		// instruction before reading it back, and runs its C64 startup
+		// animation only when the read returns zero -- so on the faithful
+		// path (reads always answered from this RAM, as VICE does) the
+		// animation is dead code. Answering that ONE closed-bank read with
+		// what sits underneath the accelerator -- $D20C is the VIC mirror's
+		// sprite 6 X position, freshly zeroed by the ROM's own JSR $E5A0 --
+		// takes the animation branch instead. Scoped to exactly this byte
+		// and bank state; DOS's own open-bank scratch traffic is untouched.
+		if ( m_BootAnimHack && addr == 0xD20C && !m_HWRegsEnabled )
+		{
+			value = 0x00;
+			return true;
+		}
 		value = m_SysRAM[ addr - SCPU_SYSRAM_BASE ];
 		return true;
 	}

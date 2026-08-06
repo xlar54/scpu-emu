@@ -111,6 +111,7 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	bool bootmapSeen = false;
 	bool jiffyDOSSeen = false;
 	bool mirrorDisplaySeen = false;
+	bool bootAnimSeen = false;
 
 	while ( *cfgPos != 0 )
 	{
@@ -134,6 +135,7 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 						if ( i == 22 ) bootmapSeen = true;
 						if ( i == 23 ) jiffyDOSSeen = true;
 						if ( i == 24 ) mirrorDisplaySeen = true;
+						if ( i == 26 ) bootAnimSeen = true;
 						while ( *ptr == '\t' || *ptr == ' ' ) ptr++;
 					#ifdef DEBUG_OUT
 						logger->Write( "RaspiMenu", LogNotice, "  %s >%d< (%s)", timingNames[ i ], timingValues[ i ], ptr );
@@ -188,6 +190,10 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 		cfgMirrorDisplayBytes = timingValues[ 24 ];
 
 	if ( timingValues[ 25 ] ) WAIT_CYCLE_READ_SID = timingValues[ 25 ];
+
+	// A flag, not a timing: explicit 0 disables, anything else enables.
+	if ( bootAnimSeen )
+		cfgBootAnimation = ( timingValues[ 26 ] != 0 ) ? 1 : 0;
 
 	return 1;
 }

@@ -461,3 +461,35 @@ TEST( integration_hardware_interrupt_closes_the_register_bank )
 	regs.onInterruptReturned();
 	CHECK( !regs.hardwareRegsEnabled() );
 }
+
+TEST( scpu_boot_animation_deviation_is_one_byte_wide )
+{
+	// BOOT_ANIMATION answers exactly one read -- $D20C with the register bank
+	// CLOSED -- with the zeroed VIC register underneath, which is the single
+	// branch input 2.04 uses to decide whether to run its C64 startup
+	// animation. Everything else must be untouched: the open-bank read still
+	// sees the accelerator's RAM, neighbours are unaffected, and with the
+	// flag off behaviour is the faithful path.
+	CSuperCPURegisters regs;
+	regs.reset();
+	u8 v = 0xAA;
+
+	// Park $FF in $D20C the way the ROM does: bank open, write, close.
+	regs.ioWrite( SCPU_REG_HWREGS_ENABLE, 0 );
+	regs.ioWrite( 0xD20C, 0xFF );
+	regs.ioWrite( 0xD20D, 0x55 );
+	regs.ioWrite( SCPU_REG_HWREGS_DISABLE, 0 );
+
+	// Faithful path: reads answer from the accelerator's RAM regardless.
+	CHECK( regs.ioRead( 0xD20C, v ) ); CHECK_EQ( v, 0xFF );
+
+	regs.setBootAnimationHack( true );
+
+	// Closed bank: the one deviating byte reads zero...
+	CHECK( regs.ioRead( 0xD20C, v ) ); CHECK_EQ( v, 0x00 );
+	// ...its neighbour does not...
+	CHECK( regs.ioRead( 0xD20D, v ) ); CHECK_EQ( v, 0x55 );
+	// ...and with the bank OPEN the accelerator's RAM answers as ever.
+	regs.ioWrite( SCPU_REG_HWREGS_ENABLE, 0 );
+	CHECK( regs.ioRead( 0xD20C, v ) ); CHECK_EQ( v, 0xFF );
+}

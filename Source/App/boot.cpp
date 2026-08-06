@@ -901,6 +901,10 @@ void scpuBootRun( CLogger *logger )
 	// Pi, well before any emulation starts -- so BOOTMAP 0 on the SD card is
 	// always effective, however badly the emulated machine behaves with it on.
 	superCPU.setBootmapEnabled( cfgBootmap != 0 );
+	superCPU.registers().setBootAnimationHack( cfgBootAnimation != 0 );
+	if ( cfgBootAnimation )
+		logger->Write( "SCPU", LogNotice,
+		               "boot animation: enabled (one-byte $D20C deviation)" );
 
 	// Mirroring inside the visible picture. Border-only delivery (0) cannot
 	// keep up with a game that redraws moving objects every frame, which shows
