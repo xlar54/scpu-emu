@@ -126,32 +126,17 @@ void CSuperCPURegisters::applyOptimisation()
 
 bool CSuperCPURegisters::ioRead( u16 addr, u8 &value )
 {
-	// $D200-$D3FF is the accelerator's own RAM, and the accelerator only
-	// DECODES it while the register bank is open. With the bank closed the
-	// address belongs to the C64 again, where $D000-$D3FF is the VIC-II
-	// mirrored every $40 bytes -- so $D20C is VIC register $0C, sprite 6's X
-	// position.
-	//
-	// CMD's 2.04 startup depends on exactly that. It writes $FF to $D20C with
-	// the bank open, then initialises the VIC (JSR $E5A0, zeroing the sprite
-	// coordinates), then closes the bank one instruction before reading $D20C
-	// back. Closing the registers immediately before reading one of them is
-	// only sensible if the read is meant to see the machine underneath: it
-	// reads the zeroed sprite register, takes the branch, and runs the C64
-	// startup animation. Answering from our own scratch returns the $FF it
-	// wrote and sends the boot down the path that skips the animation.
+	// $D200-$D3FF READS are always answered from the accelerator's RAM,
+	// whether or not the register bank is open. Only writes are gated -- see
+	// ioWrite, and VICE's scpu64_d200_read, which has no such condition.
 	if ( addr >= SCPU_SYSRAM_BASE && addr < SCPU_SYSRAM_BASE + SCPU_SYSRAM_SIZE )
 	{
-		if ( !m_HWRegsEnabled )
-			return false;			// not ours: fall through to the VIC mirror
 		value = m_SysRAM[ addr - SCPU_SYSRAM_BASE ];
 		return true;
 	}
 
 	if ( addr >= SCPU_USERRAM_BASE && addr < SCPU_USERRAM_BASE + SCPU_USERRAM_SIZE )
 	{
-		if ( !m_HWRegsEnabled )
-			return false;
 		value = m_UserRAM[ addr - SCPU_USERRAM_BASE ];
 		return true;
 	}

@@ -361,3 +361,49 @@ TEST( kernal_window_follows_a_d0b2_bank_close )
 	CHECK( regs.hardwareRegsEnabled() );
 	CHECK_EQ( mem.read8( 0xEE82 ), 0x55 );
 }
+
+TEST( scpu_private_ram_writes_need_the_register_bank_open )
+{
+	// The SuperCPU's private RAM at $D200-$D3FF is READABLE at all times but
+	// only WRITABLE while the hardware register bank is open. $D27E is the one
+	// exception in the $D2xx page; $D3xx has none. Matches VICE's
+	// scpu64_d200_store / scpu64_d300_store.
+	//
+	// Writing both pages unconditionally is a fidelity bug a private-RAM test
+	// catches: it passes against hardware that gates the writes and fails
+	// against an emulator that does not, without the test ever opening the
+	// bank.
+	CSuperCPURegisters regs;
+	regs.reset();
+
+	// Bank closed after reset: writes are discarded, reads still answer.
+	u8 v = 0xAA;
+	CHECK( regs.ioWrite( 0xD20C, 0x5A ) );
+	CHECK( regs.ioRead( 0xD20C, v ) );
+	CHECK_EQ( v, 0x00 );
+
+	CHECK( regs.ioWrite( 0xD34F, 0x5A ) );
+	CHECK( regs.ioRead( 0xD34F, v ) );
+	CHECK_EQ( v, 0x00 );
+
+	// $D27E takes a write even with the bank closed.
+	CHECK( regs.ioWrite( 0xD27E, 0x5A ) );
+	CHECK( regs.ioRead( 0xD27E, v ) );
+	CHECK_EQ( v, 0x5A );
+
+	// Open the bank: both pages become writable.
+	regs.ioWrite( SCPU_REG_HWREGS_ENABLE, 0x00 );
+	CHECK( regs.ioWrite( 0xD20C, 0x5A ) );
+	CHECK( regs.ioRead( 0xD20C, v ) );
+	CHECK_EQ( v, 0x5A );
+
+	CHECK( regs.ioWrite( 0xD34F, 0x5A ) );
+	CHECK( regs.ioRead( 0xD34F, v ) );
+	CHECK_EQ( v, 0x5A );
+
+	// Close it again: the stored values stay readable, new writes do not land.
+	regs.ioWrite( SCPU_REG_HWREGS_DISABLE, 0x00 );
+	CHECK( regs.ioWrite( 0xD20C, 0x11 ) );
+	CHECK( regs.ioRead( 0xD20C, v ) );
+	CHECK_EQ( v, 0x5A );
+}
