@@ -397,6 +397,7 @@ static bool scpuCheckButton( void *ctx )
 	// ceilings existed this was the freeze that took the whole firmware down
 	// -- no frame hook, no button, power cycle only -- so it left no trace at
 	// all. One line, once, is the difference between a mystery and a lead.
+	if ( !scpu || !scpu->memory().iecBusActive() )
 	{
 		static u32 lastBA = 0, lastPHI = 0;
 		if ( radBAWaitTimeouts != lastBA || radPHIWaitTimeouts != lastPHI )
@@ -474,6 +475,14 @@ static bool scpuCheckButton( void *ctx )
 
 		if ( ++s_HeartbeatFrames >= 60 )
 		{
+			// Never log mid-transaction: the serial protocol reads a pause as
+			// EOI, and one heartbeat write costs milliseconds. Hold the window
+			// open until a quiet second comes around; the accumulated PC range
+			// still tells the story. This is the rule the reset dump has
+			// always followed (three quiet frames) -- the first heartbeat cut
+			// ignored it and broke JiffyDOS loads once per second.
+			if ( scpu->memory().iecBusActive() )
+				return false;
 			const u32 span = s_HeartbeatPCHigh - s_HeartbeatPCLow;
 			const bool stalled = ( span < 64 );
 
@@ -922,9 +931,12 @@ void scpuBootRun( CLogger *logger )
 
 	actLED.Blink( 3 );		// milestone: bus acquired
 
-	// Interrupts are masked from here to the end of the run loop, so every
-	// remaining startup message needs the same brief unmask the frame-hook
-	// diagnostics use. These all sit between bus operations, never inside one.
+	// Interrupts stay masked from init() to the end of the run loop. Each
+	// message BLOCK below unmasks just for its writes -- never across a bus
+	// operation. The first cut of this used one scope over all of startup,
+	// which quietly included the bus self-test's timed reads and writes:
+	// exactly the exposure the bisect proved fatal.
+	{
 	CScopedLoggingIRQs startupIRQs;
 
 	// The pure-interpreter figure, no bus and no scheduler: 70 means 20MHz.
@@ -944,12 +956,15 @@ void scpuBootRun( CLogger *logger )
 	               sig.video == VIDEO_PAL ? "PAL" : "NTSC" );
 
 	logger->Write( "SCPU", LogNotice, "running bus self-test..." );
+	}	// remask: the self-test is real, timed bus traffic
+
 	if ( !radBus.selfTest() )
 	{
 		// Do not start the core over a bus we know is unreliable. It produces a
 		// dramatic display and no information, and it leaves the machine
 		// unusable. Hand the C64 back instead: it returns to its own CPU and
 		// the log above stays on screen to be read.
+		CScopedLoggingIRQs failIRQs;
 		logger->Write( "SCPU", LogError,
 		               "BUS SELF-TEST FAILED -- not starting the CPU core." );
 		logger->Write( "SCPU", LogError,
@@ -963,12 +978,13 @@ void scpuBootRun( CLogger *logger )
 	}
 
 	actLED.Blink( 4 );		// milestone: handing over to the CPU core
+	{
+	CScopedLoggingIRQs handoverIRQs;
 	logger->Write( "SCPU", LogNotice, "starting the CPU core" );
 	logger->Write( "SCPU", LogNotice,
 	               "buttons: LEFT = reboot the Pi, RIGHT = reset the emulated C64" );
 
-	// Startup reporting is done; interrupts go back to masked for the run.
-	DisableIRQs();
+	}	// startup reporting done; masked again for the run
 
 	// Run about two seconds of emulated time, then report what the emulator
 	// thinks it has drawn only after a bounded wait for an IEC-quiet window.
