@@ -7,7 +7,7 @@
    expectation, because it exercises paths nobody thought to write a test for.
 
    The agreement is not total, and the differences are real hardware behaviour
-   rather than tolerance. Docs/research/65816-reference.md section 10 lists them;
+   rather than tolerance. Docs/SuperCPU64/65816-reference.md section 10 lists them;
    this file encodes that list as explicit exemptions. Anything not exempted
    that differs is a bug in one of the cores.
 

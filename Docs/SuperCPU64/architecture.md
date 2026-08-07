@@ -100,9 +100,9 @@ triggered and IRQ level triggered, as on real silicon.
   testable on hardware in minutes: whether the direct-page pointer of `(d)`,
   `(d,X)` and `(d),Y` wraps in-page in emulation mode, and whether the
   SuperCPU's gate array forwards the emulation-mode read-modify-write dummy
-  write. See [research/65816-reference.md](research/65816-reference.md)
+  write. See [65816-reference.md](65816-reference.md)
   section 1.3.
 - The character ROM cannot be snapshotted off the machine — see
-  [research/supercpu-memory-map.md](research/supercpu-memory-map.md).
+  [supercpu-memory-map.md](supercpu-memory-map.md).
 - None of the hardware paths have been run on real hardware yet. See
   [roadmap.md](roadmap.md).

@@ -64,7 +64,8 @@ Source/
   Common/
 Tests/          host test suite
 Docs/
-  research/     what was learned about the SuperCPU and RAD, with sources
+  SuperCPU64/   SCPU64 architecture and hardware research
+  SuperCPU128/  SCPU128 hardware findings
 ```
 
 ## Why this is tractable
@@ -79,7 +80,7 @@ The hard part is not the CPU emulation. A 65816 interpreter on a 1GHz A53 clears
 to be pushed back over the expansion port at roughly 1µs each, against ~50ns per
 emulated cycle. Managing that traffic is what the SuperCPU's optimization modes
 were for, and it is what most of the code here is about. See
-[Docs/architecture.md](Docs/architecture.md).
+[Docs/SuperCPU64/architecture.md](Docs/SuperCPU64/architecture.md).
 
 ## Credits
 

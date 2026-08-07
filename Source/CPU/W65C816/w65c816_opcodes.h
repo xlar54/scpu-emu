@@ -21,7 +21,7 @@
    Evaluated at e=1, m=1, x=1, w=0 the table reproduces m6502Opcodes[] exactly for
    all 151 documented opcodes -- lengths, base cycles, page-cross and branch
    penalties -- which is what makes the differential test against CM6502 fair.
-   See Docs/research/65816-reference.md, sections 9 and 10.
+   See Docs/SuperCPU64/65816-reference.md, sections 9 and 10.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by

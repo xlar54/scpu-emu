@@ -14,7 +14,7 @@
    Verified against VICE's 65816core.c, the WDC datasheet, Bruce Clark's
    "65C816 Opcodes" and SingleStepTests/65816. The full derivation, including
    what is measured and what is still open, is in
-   Docs/research/65816-reference.md section 2.
+   Docs/SuperCPU64/65816-reference.md section 2.
 
    THE MASTER RULE -- three address classes, and every mode belongs to one:
 
@@ -141,7 +141,7 @@ inline void CW65C816::busTick( u32 n )
 	if ( m_FastBus ) m_FastBus->tick( n ); else m_Bus->tick( n );
 }
 
-// UNRESOLVED (U1 in Docs/research/65816-reference.md). With E=1 and DL=$00,
+// UNRESOLVED (U1 in Docs/SuperCPU64/65816-reference.md). With E=1 and DL=$00,
 // does the pointer high byte of (dp), (dp,X) and (dp),Y wrap inside the direct
 // page? LDA ($FF),Y -- is the high byte at $0000 or $0100?
 //

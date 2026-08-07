@@ -23,7 +23,7 @@ GPLv3. The parts SCPU-EMU uses have been promoted into `Source/Bus/RAD/` with
 attribution intact, rather than pulled in as a dependency, because they needed
 renaming and decoupling from RAD's REU-specific state. What was taken and what
 was changed is recorded in
-[../Docs/research/rad-notes.md](../Docs/research/rad-notes.md).
+[../Docs/SuperCPU64/rad-notes.md](../Docs/SuperCPU64/rad-notes.md).
 
 ## Toolchain
 

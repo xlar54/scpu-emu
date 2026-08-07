@@ -50,7 +50,7 @@ KERNAL with the Pi as the CPU.
 ## Milestone 2 — the 65816 *(code complete, untested on hardware)*
 
 - [x] **Reference data derived and cross-checked before writing any code.**
-      `Docs/research/65816-reference.md` — the WDC datasheet, Bruce Clark's
+      `Docs/SuperCPU64/65816-reference.md` — the WDC datasheet, Bruce Clark's
       *65C816 Opcodes*, VICE's `65816core.c` and SingleStepTests, reconciled,
       with the disagreements recorded as open questions rather than papered
       over. Three of its findings contradicted what was already in the repo.

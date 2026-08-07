@@ -3,7 +3,7 @@
    reach, which is everything that makes a 65816 not a 6502.
 
    Where a case below cites a specific address or register value, it is a worked
-   example from Docs/research/65816-reference.md, most of which were measured
+   example from Docs/SuperCPU64/65816-reference.md, most of which were measured
    against SingleStepTests, VICE and the WDC datasheet rather than reasoned out.
    Keeping the numbers is the point: they are evidence, not illustration.
 

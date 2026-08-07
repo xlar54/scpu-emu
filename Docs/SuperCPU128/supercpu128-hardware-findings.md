@@ -406,7 +406,7 @@ mapping earlier than a disk-loaded program can. Repeat cold reset, warm reset,
 
 ## Reference material
 
-- `Docs/research/supercpu-registers.md` documents the existing SCPU64-derived
+- `Docs/SuperCPU64/supercpu-registers.md` documents the existing SCPU64-derived
   register model.
 - `C64Tests/README.md` documents the probe and the rest of the hardware disk.
 - CMD SuperCPU programming information gives the published register meanings:

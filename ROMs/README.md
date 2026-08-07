@@ -92,7 +92,7 @@ This only affects programs that read the character set *through the CPU*. The
 VIC-II fetches it directly on the C64 side and is unaffected, so the display is
 correct either way. A future option is injecting a short 6502 stub over Ultimax
 to copy it into RAM before takeover — see
-[../Docs/research/supercpu-memory-map.md](../Docs/research/supercpu-memory-map.md).
+[../Docs/SuperCPU64/supercpu-memory-map.md](../Docs/SuperCPU64/supercpu-memory-map.md).
 
 ## Legal
 
