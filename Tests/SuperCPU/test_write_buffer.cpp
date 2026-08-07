@@ -480,7 +480,8 @@ TEST( writebuf_hot_shape_blocks_wait_for_the_border )
 	// transient would sit in DRAM for milliseconds -- the VIC fetches shapes
 	// on the sprite's own display lines and shows it as a torn, flickering
 	// sprite. So bytes in ACTIVE shape blocks are delivered only by border
-	// drains (deferHot=false); a display drain stops when it reaches one.
+	// drains (deferHot=false). It must skip the shape and continue with cold
+	// traffic, or a hot byte at the head would starve the entire mirror queue.
 	CHostBus bus;
 	u8 ram[ 0x10000 ] = { 0 };
 	u64 hot[ 1024 / 64 ] = { 0 };
@@ -499,22 +500,69 @@ TEST( writebuf_hot_shape_blocks_wait_for_the_border )
 	wb.onRamWrite( 0x3000, 0x44 ); ram[ 0x3000 ] = 0x44;
 	CHECK_EQ( wb.pending(), 4u );
 
-	// Display drain: delivers up to the hot byte, then stops.
+	// Display drain: skips the hot byte but still delivers both cold regions.
 	wb.flushUpToPolicy( 64, true );
 	CHECK_EQ( bus.m_Memory[ 0x2000 ], 0x11 );
 	CHECK_EQ( bus.m_Memory[ 0x2001 ], 0x22 );
 	CHECK( bus.m_Memory[ 0x1010 ] != 0x33 );
-	CHECK_EQ( wb.pending(), 2u );
+	CHECK_EQ( bus.m_Memory[ 0x3000 ], 0x44 );
+	CHECK_EQ( wb.pending(), 1u );
 
-	// Another display drain makes no progress: hot byte is at the head.
-	wb.flushUpToPolicy( 64, true );
-	CHECK_EQ( wb.pending(), 2u );
-
-	// Border drain delivers the rest, hot block included.
+	// Border drain delivers the deferred hot block.
 	wb.flushUpToPolicy( 64, false );
 	CHECK_EQ( bus.m_Memory[ 0x1010 ], 0x33 );
-	CHECK_EQ( bus.m_Memory[ 0x3000 ], 0x44 );
 	CHECK_EQ( wb.pending(), 0u );
+}
+
+TEST( writebuf_visible_drain_skips_screen_and_keeps_making_progress )
+{
+	WBFixture f;
+	f.wb.setOptMode( SCPU_OPT_NONE );
+
+	// The whole active matrix can remain dirty in a scroller. A matrix byte at
+	// the FIFO head must not prevent later character/sprite/general RAM traffic
+	// from using the display-time ration.
+	for ( u32 i = 0; i < 1000; i++ )
+		f.poke( (u16)( 0x7400 + i ), (u8)( i ^ 0x5A ) );
+	f.poke( 0x2000, 0x11 );
+	f.poke( 0x2001, 0x22 );
+
+	f.wb.flushUpToPolicy( 64, false, 0x7400 );
+	CHECK_EQ( f.bus.m_Memory[ 0x2000 ], 0x11 );
+	CHECK_EQ( f.bus.m_Memory[ 0x2001 ], 0x22 );
+	CHECK( f.bus.m_Memory[ 0x7400 ] != (u8)( 0 ^ 0x5A ) );
+	CHECK_EQ( f.wb.pending(), 1000u );
+	CHECK( f.wb.hasPendingInRange( 0x7400, 1000 ) );
+}
+
+TEST( writebuf_hidden_drain_prioritizes_screen_and_keeps_latest_values )
+{
+	WBFixture f;
+	f.wb.setOptMode( SCPU_OPT_NONE );
+
+	// General traffic is older and therefore ahead in the FIFO. The hidden
+	// screen path must select the matrix anyway, in stable address order, and a
+	// coalesced rewrite must still deliver its newest value.
+	f.poke( 0x2000, 0x11 );
+	f.poke( 0x2001, 0x22 );
+	for ( u32 i = 0; i < 80; i++ )
+		f.poke( (u16)( 0x7400 + i ), (u8)i );
+	f.poke( 0x7400, 0xA5 );
+
+	f.wb.flushRangeUpTo( 0x7400, 1000, 64 );
+	CHECK_EQ( f.bus.m_Memory[ 0x7400 ], 0xA5 );
+	for ( u32 i = 1; i < 64; i++ )
+		CHECK_EQ( f.bus.m_Memory[ 0x7400 + i ], (u8)i );
+	CHECK( f.bus.m_Memory[ 0x2000 ] != 0x11 );
+	CHECK_EQ( f.wb.pending(), 18u );
+
+	// Finish the matrix, then ordinary FIFO order resumes for the cold bytes.
+	f.wb.flushRangeUpTo( 0x7400, 1000, 64 );
+	CHECK( !f.wb.hasPendingInRange( 0x7400, 1000 ) );
+	CHECK_EQ( f.wb.pending(), 2u );
+	f.wb.flush();
+	CHECK_EQ( f.bus.m_Memory[ 0x2000 ], 0x11 );
+	CHECK_EQ( f.bus.m_Memory[ 0x2001 ], 0x22 );
 }
 
 TEST( relocation_shape_tail_is_not_mistaken_for_a_pointer_row )

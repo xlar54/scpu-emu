@@ -55,6 +55,12 @@ enum SCPUCoreType
 // CSuperCPU::setMirrorDisplayBudget for the reasoning.
 #define SCPU_MIRROR_DISPLAY_BYTES_DEFAULT 1024
 
+// Active-screen bytes per scheduler opportunity while the beam is outside the
+// picture. This is deliberately separate from the general display ration: a
+// 1000-byte character matrix then converges in four opportunities without
+// turning every ordinary mirror drain into a 256-byte CPU pause.
+#define SCPU_MIRROR_SCREEN_BYTES_PER_OPPORTUNITY 256
+
 class CSuperCPU
 {
 public:
@@ -137,6 +143,14 @@ public:
 	// so build-to-build comparisons stay honest even when those change.
 	// 0 when the 65816 core is not in use.
 	u32 benchArmPerEmuCycle() const { return m_BenchArmPerEmuCycle; }
+	// Representative paths the pure bank-1 loop cannot see. These use the same
+	// ARM-cycles / base-65816-cycle unit, so regressions in bank-0 dispatch,
+	// mirror bookkeeping, physical I/O, and SuperRAM batching are comparable.
+	u32 m_BenchBank0ArmPerCycle = 0;
+	u32 m_BenchScreenArmPerCycle = 0;
+	u32 m_BenchIOArmPerCycle = 0;
+	u32 m_BenchSuperRAMArmPerCycle = 0;
+	u32 m_BenchSuperRAMStretchPer1k = 0;
 
 	// PMU event rates measured over the same benchmark, each scaled to
 	// per-1000-emulated-cycles so they read as densities. Zero on the host

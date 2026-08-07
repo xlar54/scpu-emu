@@ -784,11 +784,11 @@ TEST( integration_cia2_held_receive_line_refreshes_activity )
 	f.bus.m_Memory[ 0xDD00 ] = 0x7F;
 	f.mem.read8( 0xDD00 );
 
-	// Let the original 50ms activity window expire almost completely, then a
+	// Let the original 2ms activity window expire almost completely, then a
 	// repeated poll of the still-low line must extend the live transaction.
-	for ( u32 i = 0; i < 90000; i++ ) f.mem.tickFast( 1 );
+	for ( u32 i = 0; i < 1500; i++ ) f.mem.tickFast( 1 );
 	f.mem.read8( 0xDD00 );
-	for ( u32 i = 0; i < 20000; i++ ) f.mem.tickFast( 1 );
+	for ( u32 i = 0; i < 1500; i++ ) f.mem.tickFast( 1 );
 	CHECK( f.mem.iecBusActive() );
 }
 
@@ -1006,10 +1006,20 @@ TEST( integration_iec_activity_window_expires )
 	f.mem.write8( 0xDD00, (u8)( v ^ 0x08 ) );
 	CHECK( f.mem.iecBusActive() );
 
-	// The same transition also arms the 100000-cycle speed hold, and
-	// iecBusActive() covers both -- so run past the LONGER window.
-	for ( u32 i = 0; i < 110000; i++ ) f.mem.tickFast( 1 );
+	// The transaction gate spans IEC's EOI pause and remains active until the
+	// full 2000-cycle quiet tail has elapsed.
+	for ( u32 i = 0; i < 1999; i++ ) f.mem.tickFast( 1 );
+	CHECK( f.mem.iecBusActive() );
+	f.mem.tickFast( 1 );
 	CHECK( !f.mem.iecBusActive() );
+
+	// Mirror suppression and speed selection are intentionally independent:
+	// the automatic 100000-cycle 1MHz fallback remains armed after the serial
+	// transaction itself is quiet, so shortening the display blackout cannot
+	// make the remainder of disk handling sprint at turbo speed.
+	CHECK( f.mem.iecThrottleActive() );
+	for ( u32 i = 2000; i < 100000; i++ ) f.mem.tickFast( 1 );
+	CHECK( !f.mem.iecThrottleActive() );
 }
 
 TEST( integration_bulk_display_flip_never_waits_or_flushes_synchronously )
@@ -1356,6 +1366,86 @@ TEST( integration_active_screen_sprite_pointers_reach_the_bus_immediately )
 	f.wb.flush();
 	CHECK_EQ( f.bus.m_Memory[ 0x07F0 ], 0x66 );
 	CHECK_EQ( f.bus.m_Memory[ 0x07F8 ], 0x99 );
+}
+
+TEST( integration_active_screen_base_tracks_d018_and_vic_bank )
+{
+	SystemFixture f;
+	f.start();
+
+	CHECK_EQ( f.mem.activeScreenBase(), 0x0400u );
+	f.mem.write8( 0xD018, 0xDF );			// matrix offset $3400
+	CHECK_EQ( f.mem.activeScreenBase(), 0x3400u );
+	f.mem.write8( 0xDD00, 0xC6 );			// VIC bank 1 ($4000)
+	CHECK_EQ( f.mem.activeScreenBase(), 0x7400u );	// Metal Dust snapshot
+	f.mem.write8( 0xDD02, 0x00 );			// PA0/PA1 inputs float high
+	CHECK_EQ( f.mem.activeScreenBase(), 0x3400u );	// back to VIC bank 0
+	f.mem.write8( 0xDD02, 0x03 );			// drive both bank-select pins
+	CHECK_EQ( f.mem.activeScreenBase(), 0x7400u );
+
+	// A bank-3 matrix at $D000 is behind the real machine's I/O window and
+	// therefore cannot participate in queued DRAM mirroring.
+	f.mem.write8( 0xDD00, 0xC4 );			// VIC bank 3 ($C000)
+	f.mem.write8( 0xD018, 0x40 );			// matrix offset $1000
+	CHECK_EQ( f.mem.activeScreenBase(), 0xFFFFFFFFu );
+}
+
+TEST( integration_visible_drain_defers_screen_but_not_cold_traffic )
+{
+	struct FixedRasterBus : CHostBus
+	{
+		u16 line = 100;
+		u32 maxBurst = 0;
+		u16 rasterLine() override { return line; }
+		void writeBurst( const C64BusWrite *writes, u32 count ) override
+		{
+			if ( count > maxBurst ) maxBurst = count;
+			CHostBus::writeBurst( writes, count );
+		}
+	} bus;
+
+	CSuperCPU scpu;
+	u8 basic[ C64_BASIC_SIZE ];
+	u8 kernal[ C64_KERNAL_SIZE ];
+	std::memset( basic, 0xEA, sizeof basic );
+	std::memset( kernal, 0xEA, sizeof kernal );
+	kernal[ 0 ] = 0x4C;              // JMP $E000
+	kernal[ 1 ] = 0x00;
+	kernal[ 2 ] = 0xE0;
+	kernal[ 0x1FFC ] = 0x00;
+	kernal[ 0x1FFD ] = 0xE0;
+	scpu.setBasicROM( basic );
+	scpu.setKernalROM( kernal );
+	CHECK( scpu.init( &bus, SCPU_CORE_6502, 0 ) );
+	scpu.writeBuffer().setOptMode( SCPU_OPT_NONE );
+	scpu.setMirrorDisplayBudget( 256 );
+
+	// Put the active matrix at the FIFO head, as a scrolling screen does, then
+	// queue unrelated VIC-visible RAM behind it.
+	for ( u32 i = 0; i < 1000; i++ )
+		scpu.memory().write8( (u16)( 0x0400 + i ), (u8)( i ^ 0xA5 ) );
+	scpu.memory().write8( 0x2000, 0x5A );
+
+	// With the beam held in the picture, cold traffic progresses past all 1000
+	// deferred matrix entries but no matrix byte reaches physical DRAM.
+	scpu.runFrame();
+	CHECK_EQ( bus.m_Memory[ 0x2000 ], 0x5A );
+	CHECK( bus.m_Memory[ 0x0400 ] != (u8)0xA5 );
+	CHECK_EQ( scpu.writeBuffer().pending(), 1000u );
+
+	// Once outside the picture, the same small installments prioritize and
+	// finish the screen before ordinary border work. The dedicated allowance is
+	// 256 bytes per opportunity, but the physical writes remain raster-checked
+	// 64-byte bursts.
+	bus.line = 251;						// first PAL line outside the picture
+	bus.resetStats();
+	bus.maxBurst = 0;
+	scpu.runFrame();
+	CHECK_EQ( bus.m_BurstWrites, 1000u );
+	CHECK_EQ( bus.maxBurst, 64u );
+	CHECK_EQ( bus.m_Memory[ 0x0400 ], (u8)0xA5 );
+	CHECK_EQ( bus.m_Memory[ 0x07E7 ], (u8)( 999 ^ 0xA5 ) );
+	CHECK( !scpu.writeBuffer().hasPendingInRange( 0x0400, 1000 ) );
 }
 
 TEST( integration_display_drain_avoids_sprite_fetch_lines )

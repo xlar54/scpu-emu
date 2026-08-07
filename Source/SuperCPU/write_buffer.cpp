@@ -239,10 +239,96 @@ void CWriteBuffer::invalidateRange( u16 addr, u32 length )
 
 u32 CWriteBuffer::flushUpTo( u32 maxBytes )
 {
-	return flushUpToPolicy( maxBytes, false );
+	return flushUpToPolicy( maxBytes, false, 0xFFFFFFFF );
 }
 
-u32 CWriteBuffer::flushUpToPolicy( u32 maxBytes, bool deferHot )
+static inline bool addressInRange( u16 addr, u32 base, u32 len )
+{
+	return base < 0x10000 && len != 0
+	    && (u32)addr >= base && (u32)addr - base < len;
+}
+
+bool CWriteBuffer::hasPendingInRange( u32 base, u32 len ) const
+{
+	if ( base >= 0x10000 || len == 0 )
+		return false;
+	u32 end = base + len;
+	if ( end > 0x10000 ) end = 0x10000;
+
+	const u32 first = base >> 6;
+	const u32 last = ( end - 1 ) >> 6;
+	for ( u32 w = first; w <= last; w++ )
+	{
+		u64 bits = m_Dirty[ w ];
+		if ( w == first ) bits &= ~0ULL << ( base & 63 );
+		if ( w == last && ( end & 63 ) )
+			bits &= ( 1ULL << ( end & 63 ) ) - 1;
+		if ( bits ) return true;
+	}
+	return false;
+}
+
+u32 CWriteBuffer::flushSelectedChunk( u32 maxBytes, bool deferHot,
+	                                  u32 screenBase, u32 screenLen,
+	                                  bool screenOnly )
+{
+	if ( m_Count == 0 || maxBytes == 0 || !m_Bus )
+		return 0;
+	if ( maxBytes > SCPU_WRITEBUF_CHUNK ) maxBytes = SCPU_WRITEBUF_CHUNK;
+
+	// Examine each entry that existed on entry at most once. A deferred entry
+	// rotates from the head to the tail; selected entries are consumed. This is
+	// stable filtering without an O(queue-size) compaction after every 64-byte
+	// installment: deferred entries retain their order, as do delivered ones.
+	const u32 original = m_Count;
+	const u32 mask = SCPU_WRITEBUF_CAPACITY - 1;
+	u32 examined = 0;
+	u32 selected = 0;
+	while ( examined < original && selected < maxBytes && m_Count != 0 )
+	{
+		const u16 a = m_List[ m_Head ];
+		const bool inScreen = addressInRange( a, screenBase, screenLen );
+		bool hot = false;
+		if ( deferHot && m_HotBlocks )
+		{
+			const u32 blk = (u32)a >> 6;
+			hot = ( ( m_HotBlocks[ blk >> 6 ] >> ( blk & 63 ) ) & 1 ) != 0;
+		}
+		const bool take = screenOnly ? inScreen : ( !inScreen && !hot );
+		examined++;
+
+		if ( !take )
+		{
+			// The slot one past the logical tail is free (or is the head when
+			// the ring is full). Copy before advancing so a full ring rotates
+			// correctly too.
+			m_List[ ( m_Head + m_Count ) & mask ] = a;
+			m_Head = ( m_Head + 1 ) & mask;
+			continue;
+		}
+
+		m_Burst[ selected ].addr = a;
+		m_Burst[ selected ].value = deliverValue( a, m_PendingValue[ a ] );
+		selected++;
+		m_Head = ( m_Head + 1 ) & mask;
+		m_Count--;
+	}
+
+	if ( selected == 0 )
+		return 0;
+
+	m_Bus->writeBurst( m_Burst, selected );
+	for ( u32 i = 0; i < selected; i++ )
+	{
+		const u16 a = m_Burst[ i ].addr;
+		m_Dirty[ a >> 6 ] &= ~( 1ULL << ( a & 63 ) );
+		m_Synced[ a >> 6 ] |= 1ULL << ( a & 63 );
+	}
+	return selected;
+}
+
+u32 CWriteBuffer::flushUpToPolicy( u32 maxBytes, bool deferHot,
+	                               u32 screenBase )
 {
 	if ( m_Count == 0 || maxBytes == 0 )
 		return m_Count;
@@ -257,63 +343,35 @@ u32 CWriteBuffer::flushUpToPolicy( u32 maxBytes, bool deferHot )
 	}
 
 	u32 sent = 0;
-
 	while ( m_Count > 0 && sent < maxBytes )
 	{
-		u32 n = m_Count;
-		if ( n > SCPU_WRITEBUF_CHUNK )     n = SCPU_WRITEBUF_CHUNK;
-		if ( n > ( maxBytes - sent ) )     n = maxBytes - sent;
-
-		// Consume from the HEAD: oldest dirty address first. See the note on
-		// m_List -- flushing newest-first starves the head under continuous
-		// re-dirtying, which shows up as regions of the real screen frozen at
-		// stale contents while the rest updates.
-		bool stoppedAtHot = false;
-		for ( u32 i = 0; i < n; i++ )
-		{
-			u16 a = m_List[ ( m_Head + i ) & ( SCPU_WRITEBUF_CAPACITY - 1 ) ];
-			if ( deferHot && m_HotBlocks )
-			{
-				const u32 blk = (u32)a >> 6;
-				if ( ( m_HotBlocks[ blk >> 6 ] >> ( blk & 63 ) ) & 1 )
-				{
-					// An active sprite-shape byte: the rest of this drain
-					// waits for the border, keeping the block's delivery
-					// atomic from the VIC's point of view.
-					n = i;
-					stoppedAtHot = true;
-					break;
-				}
-			}
-			m_Burst[ i ].addr  = a;
-			// Active-row pointer bytes translate at delivery; everything else
-			// goes out as queued.
-			m_Burst[ i ].value = deliverValue( a, m_PendingValue[ a ] );
-		}
-		if ( n == 0 )
-			return m_Count;		// hot byte at the head; nothing to send
-
-		m_Bus->writeBurst( m_Burst, n );
-
-		for ( u32 i = 0; i < n; i++ )
-		{
-			u16 a = m_List[ ( m_Head + i ) & ( SCPU_WRITEBUF_CAPACITY - 1 ) ];
-			m_Dirty[ a >> 6 ] &= ~( 1ULL << ( a & 63 ) );
-			// Delivered: real DRAM now provably matches the queued value, so
-			// same-value elimination becomes sound for this address.
-			m_Synced[ a >> 6 ] |= 1ULL << ( a & 63 );
-		}
-
-		m_Head  = ( m_Head + n ) & ( SCPU_WRITEBUF_CAPACITY - 1 );
-		m_Count -= n;
-		sent    += n;
-
-		if ( stoppedAtHot )
-			break;
+		const u32 n = flushSelectedChunk( maxBytes - sent, deferHot,
+		                                  screenBase, 1000, false );
+		if ( n == 0 ) break;
+		sent += n;
 	}
 
 	m_BytesFlushed += sent;
-	m_Flushes++;
+	if ( sent ) m_Flushes++;
+
+	return m_Count;
+}
+
+u32 CWriteBuffer::flushRangeUpTo( u32 base, u32 len, u32 maxBytes )
+{
+	if ( m_Count == 0 || maxBytes == 0 || !hasPendingInRange( base, len ) )
+		return m_Count;
+
+	u32 sent = 0;
+	while ( m_Count > 0 && sent < maxBytes && hasPendingInRange( base, len ) )
+	{
+		const u32 n = flushSelectedChunk( maxBytes - sent, false,
+		                                  base, len, true );
+		if ( n == 0 ) break;
+		sent += n;
+	}
+	m_BytesFlushed += sent;
+	if ( sent ) m_Flushes++;
 
 	return m_Count;
 }

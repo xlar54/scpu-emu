@@ -313,8 +313,8 @@ TEST( integration_run_ticks_per_instruction_while_iec_active )
 	m.cpu.m_P  |= W65_I;
 
 	// Quiet bus: chunks must span several instructions (8 NOPs = 16 cycles).
-	// I/O, active IEC traffic and an armed CIA2 timer still break the batch at
-	// the current instruction; pure code keeps the throughput needed for 20MHz.
+	// Active IEC traffic and an armed CIA2 timer still break the batch at the
+	// current instruction; pure code keeps the throughput needed for 20MHz.
 	m.mem.m_MaxTickChunk = 0;
 	m.cpu.run( 400 );
 	CHECK( m.mem.m_MaxTickChunk > 8 );
@@ -335,6 +335,44 @@ TEST( integration_run_ticks_per_instruction_while_iec_active )
 	CHECK_EQ( m.mem.m_MirrorStretchCycles, 0u );
 	CHECK( m.mem.m_MaxTickChunk > 8 );
 	m.cpu.m_PC = 0x1000;
+
+	// Ordinary VIC I/O is synchronous physical traffic, but its deferred
+	// accounting can settle with the rest of an eight-instruction batch. The
+	// bus access itself already preserves ordering; breaking after every access
+	// multiplied GPIO/cycle-counter overhead in I/O-heavy code.
+	m.mem.m_RAM[ 0x1040 ] = 0x8D; // STA $D020
+	m.mem.m_RAM[ 0x1041 ] = 0x20;
+	m.mem.m_RAM[ 0x1042 ] = 0xD0;
+	m.mem.m_RAM[ 0x1043 ] = 0x4C; // JMP $1040
+	m.mem.m_RAM[ 0x1044 ] = 0x40;
+	m.mem.m_RAM[ 0x1045 ] = 0x10;
+	m.cpu.m_PC = 0x1040;
+	m.mem.m_MaxTickChunk = 0;
+	m.cpu.run( 400 );
+	CHECK( m.mem.m_MaxTickChunk > 8 );
+
+	// SuperRAM page-mode penalties likewise accumulate numerically and settle
+	// after the batch. Merely fetching code there must not force a host clock
+	// read and interrupt sample after every instruction.
+	for ( u32 i = 0; i < 16; i++ ) m.simm.write( 0x020000 + i, 0xEA );
+	m.simm.write( 0x020010, 0x4C );
+	m.simm.write( 0x020011, 0x00 );
+	m.simm.write( 0x020012, 0x00 );
+	m.cpu.m_E = false;
+	m.cpu.m_PBR = 0x02;
+	m.cpu.m_DBR = 0x02;
+	m.cpu.m_PC = 0x0000;
+	m.cpu.applyE();
+	m.mem.m_MaxTickChunk = 0;
+	m.cpu.run( 400 );
+	CHECK( m.mem.m_MaxTickChunk > 8 );
+
+	// Return to the bank-0 loop before arming the IEC edge below.
+	m.cpu.m_E = true;
+	m.cpu.m_PBR = 0x00;
+	m.cpu.m_DBR = 0x00;
+	m.cpu.m_PC = 0x1000;
+	m.cpu.applyE();
 
 	// A serial-line edge arms the activity window (and the speed hold).
 	m.mem.read8( 0xDD00 );

@@ -1085,6 +1085,15 @@ void scpuBootRun( CLogger *logger )
 		               (unsigned)superCPU.m_BenchL1IRefillPer1k,
 		               (unsigned)superCPU.m_BenchL1DRefillPer1k,
 		               (unsigned)superCPU.m_BenchBranchMissPer1k );
+		logger->Write( "SCPU", LogNotice,
+		               "workloads arm/emucycle: b0=%u screen=%u io=%u super=%u",
+		               (unsigned)superCPU.m_BenchBank0ArmPerCycle,
+		               (unsigned)superCPU.m_BenchScreenArmPerCycle,
+		               (unsigned)superCPU.m_BenchIOArmPerCycle,
+		               (unsigned)superCPU.m_BenchSuperRAMArmPerCycle );
+		logger->Write( "SCPU", LogNotice,
+		               "superram added emucycles/1k base: %u",
+		               (unsigned)superCPU.m_BenchSuperRAMStretchPer1k );
 	}
 
 	const C64Signals &sig = radBus.signals();

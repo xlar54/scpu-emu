@@ -284,6 +284,82 @@ void CSuperCPU::benchmark65816()
 		m_BenchBranchMissPer1k = (u32)( ev[ 3 ] * 1000 / dc );
 	}
 #endif
+
+	// The pure loop above intentionally isolates the interpreter, which also
+	// made it blind to the two paths that dominate real accelerated software:
+	// bank-0 dispatch and SuperRAM. Measure representative loops before reset
+	// discards their scratch state. Keeping these separate tells us whether a
+	// change improved decoding, mirroring, physical I/O, or private-memory
+	// execution instead of hiding all four behind one flattering number.
+	static const u8 bank0Loop[] = {
+		0xA9, 0x55,             // LDA #$55
+		0x49, 0xFF,             // EOR #$FF
+		0x8D, 0x00, 0x70,       // STA $7000
+		0xAD, 0x00, 0x70,       // LDA $7000
+		0x4C, 0x02, 0x20        // JMP $2002
+	};
+	static const u8 screenLoop[] = {
+		0xA9, 0x00,             // LDA #$00
+		0x49, 0x01,             // EOR #$01
+		0x8D, 0x00, 0x04,       // STA $0400
+		0x4C, 0x02, 0xF2        // JMP $F202
+	};
+	static const u8 ioLoop[] = {
+		0xA9, 0x00,             // LDA #$00
+		0x49, 0x01,             // EOR #$01
+		0x8D, 0x20, 0xD0,       // STA $D020
+		0x4C, 0x02, 0xF3        // JMP $F302
+	};
+	static const u8 superLoop[] = {
+		0xA9, 0x55,             // LDA #$55
+		0x49, 0xFF,             // EOR #$FF
+		0x8D, 0x00, 0x10,       // STA $1000 in DBR $02
+		0xAD, 0x00, 0x10,       // LDA $1000 in DBR $02
+		0x4C, 0x02, 0x00        // JMP $0002 in PBR $02
+	};
+	for ( u32 i = 0; i < sizeof( bank0Loop ); i++ ) m_Memory.m_RAM[ 0x2000 + i ] = bank0Loop[ i ];
+	for ( u32 i = 0; i < sizeof( screenLoop ); i++ ) m_MemoryMap.m_Bank1[ 0xF200 + i ] = screenLoop[ i ];
+	for ( u32 i = 0; i < sizeof( ioLoop ); i++ ) m_MemoryMap.m_Bank1[ 0xF300 + i ] = ioLoop[ i ];
+	for ( u32 i = 0; i < sizeof( superLoop ); i++ ) m_FastRAM.write( 0x020000 + i, superLoop[ i ] );
+
+	auto prepare = [this]( u8 pbr, u8 dbr, u16 pc, bool emulation )
+	{
+		m_Core65816.m_E   = emulation;
+		m_Core65816.m_P   = (u8)( W65_M | W65_X | W65_I );
+		m_Core65816.m_PBR = pbr;
+		m_Core65816.m_DBR = dbr;
+		m_Core65816.m_PC  = pc;
+		m_Core65816.m_S   = 0x01FD;
+		m_Core65816.applyE();
+		m_Memory.m_BusEventCount = 0;
+		m_Memory.m_PendingFastHalfCycles = 0;
+		m_Memory.m_FastHalfCarry = 0;
+		m_Memory.resyncPacing();
+	};
+	auto measure = [this]() -> u32
+	{
+		const u64 c0 = m_Core65816.cycles();
+		const u64 h0 = m_Bus->hostCycles();
+		m_Core65816.run( 500000 );
+		const u64 dc = m_Core65816.cycles() - c0;
+		return dc ? (u32)( ( m_Bus->hostCycles() - h0 ) / dc ) : 0;
+	};
+
+	prepare( 0x00, 0x00, 0x2000, true );
+	m_BenchBank0ArmPerCycle = measure();
+	prepare( 0x01, 0x00, 0xF200, true );
+	m_BenchScreenArmPerCycle = measure();
+	prepare( 0x01, 0x00, 0xF300, true );
+	m_BenchIOArmPerCycle = measure();
+	prepare( 0x02, 0x02, 0x0000, false );
+	{
+		const u64 stretch0 = m_Memory.m_RegionStretchCycles;
+		const u64 cycle0 = m_Core65816.cycles();
+		m_BenchSuperRAMArmPerCycle = measure();
+		const u64 dc = m_Core65816.cycles() - cycle0;
+		m_BenchSuperRAMStretchPer1k = dc
+			? (u32)( ( m_Memory.m_RegionStretchCycles - stretch0 ) * 1000 / dc ) : 0;
+	}
 }
 
 u32 CSuperCPU::currentClockHz() const
@@ -308,13 +384,13 @@ u32 CSuperCPU::currentClockHz() const
 // ago -- stays perfect. That is precisely the observed artifact, moving pool
 // balls rendered as blocks of mixed-frame garbage on a clean table.
 //
-// Writing inside the picture is what a real REU does, and is safe for the same
-// reason: busWriteByteBurst_p1 re-samples BA at the configured in-cycle point
-// and hands the bus back whenever the VIC claims it, so a VIC fetch is never
-// disturbed -- only our own write is delayed. The historical "bursts are never
-// display-safe" rule dates from when that BA re-check was commented out, and
-// from PAL write timings whose data window overran the VIC's half-cycle on this
-// NTSC machine. Both are fixed, so the restriction can be relaxed.
+// Writing non-screen data inside the picture is what a real REU does, and is
+// safe for the same reason: busWriteByteBurst_p1 re-samples BA at the configured
+// in-cycle point and hands the bus back whenever the VIC claims it, so a VIC
+// fetch is never disturbed -- only our own write is delayed. The active screen
+// matrix is the exception: even individually safe writes expose a mixture of
+// the old and one-character-shifted matrices. It is skipped here and completed
+// in short installments outside the picture.
 // True when the given raster line is inside any enabled sprite's fetch span.
 // The VIC steals its s-accesses on every line a sprite is visible and fetches
 // the pointer and first data on the line BEFORE, so the span starts early.
@@ -341,19 +417,22 @@ static bool c64LineInSpriteFetchSpan( const u8 *vic, u16 line )
 
 static void flushMirrorsRasterAware( CWriteBuffer &buffer, IC64Bus &bus,
                                      const C64Signals &sig, u32 displayBudget,
-                                     u32 transferBudget, const u8 *vicShadow )
+                                     u32 transferBudget, u32 screenBudget,
+                                     const u8 *vicShadow, u32 screenBase )
 {
 	const u32 perLine  = c64CyclesPerLine( sig.video );
 	const u32 lines    = c64RasterLines( sig.video );
 	const u32 maxChunk = 64;
 	u32 displayLeft = displayBudget;
 	u32 transferLeft = transferBudget;
+	u32 screenLeft = screenBudget;
 
-	while ( !buffer.empty() && transferLeft != 0 )
+	while ( !buffer.empty() && ( transferLeft != 0 || screenLeft != 0 ) )
 	{
 		const u16 line = bus.rasterLine();
 		u32 budgetBytes;
 		bool inDisplay = false;
+		bool screenPriority = false;
 
 		if ( c64RasterIsSafeForBulkTransfer( sig.video, line ) )
 		{
@@ -363,9 +442,25 @@ static void flushMirrorsRasterAware( CWriteBuffer &buffer, IC64Bus &bus,
 			                    ? ( lines - line ) + c64DisplayFirstLine( sig.video )
 			                    : c64DisplayFirstLine( sig.video ) - line;
 			budgetBytes = ( linesLeft * perLine * 3 ) / 4;
-			if ( budgetBytes > transferLeft ) budgetBytes = transferLeft;
+			const bool screenPending = screenBase < 0x10000
+			                        && buffer.hasPendingInRange( screenBase, 1000 );
+			if ( screenPending )
+			{
+				// Do not spend this opportunity on general FIFO traffic while a
+				// matrix transaction is still incomplete. Its dedicated allowance
+				// is larger, but every physical burst below remains 64 bytes and
+				// the raster is sampled again before the next one.
+				if ( screenLeft == 0 ) break;
+				screenPriority = true;
+				if ( budgetBytes > screenLeft ) budgetBytes = screenLeft;
+			}
+			else
+			{
+				if ( transferLeft == 0 ) break;
+				if ( budgetBytes > transferLeft ) budgetBytes = transferLeft;
+			}
 		}
-		else if ( line < lines && displayLeft != 0
+		else if ( line < lines && displayLeft != 0 && transferLeft != 0
 		          && !c64LineInSpriteFetchSpan( vicShadow, line ) )
 		{
 			// A real line, inside the picture, with ration left, and no
@@ -388,20 +483,39 @@ static void flushMirrorsRasterAware( CWriteBuffer &buffer, IC64Bus &bus,
 			break;
 
 		const u32 before = buffer.pending();
-		buffer.flushUpToPolicy( chunk, inDisplay );
+		if ( screenPriority )
+		{
+			// A smooth character scroller rewrites the matrix at every
+			// eight-pixel boundary. Deliver those bytes first, but still in
+			// the same short installments: while the beam is outside the
+			// picture a partially updated matrix is invisible, and completing
+			// it before general traffic prevents an old/new one-character
+			// composite from appearing on the next frame.
+			buffer.flushRangeUpTo( screenBase, 1000, chunk );
+		}
+		else
+		{
+			// Inside the picture, skip both active sprite shapes and the active
+			// screen matrix while continuing past them to cold traffic. Outside
+			// it, any leftover installment is ordinary FIFO delivery.
+			buffer.flushUpToPolicy( chunk, inDisplay,
+			                        inDisplay ? screenBase : 0xFFFFFFFF );
+		}
 		const u32 after = buffer.pending();
 
 		// A detached or failing sink must not turn this loop into a spin.
 		if ( after >= before )
 			break;
 
-		if ( inDisplay )
-		{
-			const u32 sent = before - after;
-			displayLeft = ( displayLeft > sent ) ? ( displayLeft - sent ) : 0;
-		}
 		const u32 sent = before - after;
-		transferLeft = ( transferLeft > sent ) ? ( transferLeft - sent ) : 0;
+		if ( screenPriority )
+			screenLeft = ( screenLeft > sent ) ? ( screenLeft - sent ) : 0;
+		else
+		{
+			transferLeft = ( transferLeft > sent ) ? ( transferLeft - sent ) : 0;
+			if ( inDisplay )
+				displayLeft = ( displayLeft > sent ) ? ( displayLeft - sent ) : 0;
+		}
 	}
 }
 
@@ -475,8 +589,9 @@ u64 CSuperCPU::runFrame()
 		executed += ran;
 		ticksUsed += ran * ticksPerCycle;
 
-		// Opportunistic flush: one raster read, and only drain what fits in
-		// the border time remaining. Never during the visible display.
+		// Opportunistic flush: one raster read. Cold traffic may use its small
+		// display ration; the active screen matrix and hot sprite shapes wait
+		// for the hidden window.
 		//
 		// And NEVER while the serial bus is active. A flush stalls the
 		// emulated CPU for up to several hundred microseconds, and the slow
@@ -492,7 +607,9 @@ u64 CSuperCPU::runFrame()
 			flushMirrorsRasterAware( m_WriteBuffer, *m_Bus, sig,
 			                         displayPerOpportunity,
 			                         transferPerOpportunity,
-			                         m_Memory.m_VICRegShadow );
+			                         SCPU_MIRROR_SCREEN_BYTES_PER_OPPORTUNITY,
+			                         m_Memory.m_VICRegShadow,
+			                         m_Memory.activeScreenBase() );
 	}
 
 	// --- raster-scheduled mirroring ----------------------------------------
@@ -541,7 +658,9 @@ u64 CSuperCPU::runFrame()
 			flushMirrorsRasterAware( m_WriteBuffer, *m_Bus, sig,
 			                         displayPerOpportunity,
 			                         transferPerOpportunity,
-			                         m_Memory.m_VICRegShadow );
+			                         SCPU_MIRROR_SCREEN_BYTES_PER_OPPORTUNITY,
+			                         m_Memory.m_VICRegShadow,
+			                         m_Memory.activeScreenBase() );
 
 			// Spare border time goes to convergence: re-deliver a slice of
 			// clean shadow so real DRAM provably approaches shadow no matter

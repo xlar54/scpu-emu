@@ -81,6 +81,7 @@ public:
 	virtual bool ioAccessUsesWriteBuffer( u16 addr, bool write ) const
 		{ (void)addr; (void)write; return false; }
 	virtual bool dosExtensionEnabled() const { return false; }
+	virtual const bool *dosExtensionStatePtr() const { return 0; }
 	virtual bool simmWindowWritesEnabled() const { return true; }
 
 	// True when accelerator state wants interrupt vectors fetched from the
@@ -104,7 +105,11 @@ public:
 
 	void attachBus( IC64Bus *bus ) { m_C64 = bus; }
 	void setMirrorSink( IMirrorSink *sink ) { m_Mirror = sink; }
-	void setIOInterceptor( IIOInterceptor *io ) { m_IO = io; }
+	void setIOInterceptor( IIOInterceptor *io )
+	{
+		m_IO = io;
+		m_DOSExtState = io ? io->dosExtensionStatePtr() : 0;
+	}
 
 	// Reset the emulated 6510 port to its power-on state ($00 = $2F, $01 = $37)
 	// and clear shadow DRAM. Does not touch the ROM images.
@@ -330,12 +335,13 @@ public:
 	}
 	inline bool dosExtensionMapsBank1( u16 addr ) const
 	{
-		// Reject the common address case before making the virtual register-bank
-		// query. This helper is on every bank-0 read/write fast path.
+		// This helper is on every bank-0 read/write fast path. The register state
+		// is cached when it changes; a virtual interceptor query here made code in
+		// these common ranges 50% slower even when DOS extension was off.
 		return ( ( addr >= 0x1000 && addr <= 0x5FFF )
 		      || ( addr >= 0x8000 && addr <= 0x9FFF ) )
-		    && !m_BootmapActive && m_ROMShadow && m_IO
-		    && m_IO->dosExtensionEnabled();
+		    && !m_BootmapActive && m_ROMShadow
+		    && m_DOSExtState && *m_DOSExtState;
 	}
 	bool simmWindowWritesEnabled() const
 		{ return !m_IO || m_IO->simmWindowWritesEnabled(); }
@@ -675,7 +681,6 @@ public:
 		return m_IECHoldCycles != 0 || m_IECActivityCycles != 0
 		    || m_IECPollHoldCycles != 0
 		    || m_CIA2NMIDeadline != 0 || m_CIA2ArmPending != 0
-		    || m_BusEventCount != 0 || m_PendingFastHalfCycles != 0
 		    || ( m_SelectedEmulatedHz != 0
 		         && m_SelectedEmulatedHz <= 1000000u );
 	}
@@ -683,7 +688,7 @@ public:
 	// speed is selected. This is the flag that suppresses mirror flushing and
 	// raster polling: the slow protocol assigns meaning to pauses, so the CPU
 	// must not be stalled mid-transaction whatever the pacing mode.
-	bool iecBusActive() const { return m_IECHoldCycles != 0 || m_IECActivityCycles != 0; }
+	bool iecBusActive() const { return m_IECActivityCycles != 0; }
 	typedef void (*TimingHook)( void *ctx );
 	void setTimingHook( TimingHook hook, void *ctx ) { m_TimingHook = hook; m_TimingHookCtx = ctx; }
 	u64  m_IECThrottleEvents;
@@ -801,6 +806,7 @@ private:
 	IC64Bus        *m_C64;
 	IMirrorSink    *m_Mirror;
 	IIOInterceptor *m_IO;
+	const bool *m_DOSExtState = 0;
 	const u8       *m_BootmapROM;
 	u8             *m_ROMShadow;
 	bool            m_HasBasic, m_HasKernal, m_HasChar;
@@ -815,7 +821,7 @@ private:
 
 	bool m_IECThrottleEnabled;
 	u32  m_IECHoldCycles;		// emulated cycles left at forced 1MHz
-	u32  m_IECActivityCycles = 0;	// emulated cycles since last serial edge (countdown)
+	u32  m_IECActivityCycles = 0;	// edge-rearmed transaction window (countdown)
 	// SPEED-only hold sustained by serial-port READS (mere polls included):
 	// the real SuperCPU's auto-slow re-arms on every access. Kept apart from
 	// m_IECHoldCycles because iecBusActive() -- the MIRROR gate -- must never
@@ -845,6 +851,17 @@ private:
 	u32  m_PreviousSpritePtrBase;
 	u8   m_LastD018;
 public:
+	// First byte of the active VIC screen matrix, or 0xFFFFFFFF when that
+	// matrix lies under the real machine's I/O window and cannot be mirrored.
+	// The sprite-pointer tracker already follows both $D018 and CIA2's VIC-bank
+	// select, so deriving the matrix here keeps the mirror scheduler on exactly
+	// the same live state without another copy to go stale.
+	u32 activeScreenBase() const
+	{
+		return m_SpritePtrBase == 0xFFFFFFFF
+		     ? 0xFFFFFFFF : m_SpritePtrBase - 0x3F8;
+	}
+
 	// Writes aimed at the active sprite-pointer row, same-value or not. A
 	// multiplexer rewrites this row several times per FRAME; the rate is the
 	// diagnostic that distinguishes pointer-flip animation from multiplexing.
@@ -942,7 +959,13 @@ public:
 private:
 	void updateSpritePtrBase()
 	{
-		const u8 bank = m_HaveCIA2PortALatch ? (u8)( ~m_CIA2PortALatch & 3 ) : 0;
+		// CIA2 PA0/PA1 select the VIC bank through inverters. Output pins use
+		// the latch; input pins float high and therefore select bank bit zero.
+		// Before DDRA has been observed, retain the historical/output assumption
+		// so a lone $DD00 write takes effect immediately.
+		const u8 outputs = m_HaveCIA2DDRA ? m_CIA2DDRA : 0x03;
+		const u8 bank = m_HaveCIA2PortALatch
+		              ? (u8)( ~m_CIA2PortALatch & outputs & 3 ) : 0;
 		const u32 base = ( (u32)bank << 14 )
 		               + ( (u32)( m_LastD018 >> 4 ) << 10 ) + 0x3F8;
 		// Screen under the I/O window: the pointer row is unreachable over

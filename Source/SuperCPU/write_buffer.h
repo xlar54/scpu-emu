@@ -133,9 +133,20 @@ public:
 	// sprite's own display lines.
 	void attachHotShapeBlocks( const u64 *bits ) { m_HotBlocks = bits; }
 
-	// flushUpTo with a policy: deferHot stops at the first hot-shape byte.
-	// The IMirrorSink flushUpTo() delegates here with deferHot=false.
-	u32 flushUpToPolicy( u32 maxBytes, bool deferHot );
+	// flushUpTo with display-time policy. Hot sprite-shape bytes and bytes in
+	// the active 1000-byte screen matrix are skipped, not allowed to block cold
+	// traffic behind them. Skipped entries remain queued in stable order for a
+	// hidden-window drain. screenBase=0xFFFFFFFF disables screen deferral.
+	// The IMirrorSink flushUpTo() delegates here with both policies disabled.
+	u32 flushUpToPolicy( u32 maxBytes, bool deferHot,
+	                     u32 screenBase = 0xFFFFFFFF );
+
+	// Hidden-window priority path: deliver only dirty bytes in [base,base+len),
+	// retaining every other FIFO entry. This lets a screen matrix converge in
+	// short raster-safe installments before general border traffic consumes the
+	// opportunity.
+	u32 flushRangeUpTo( u32 base, u32 len, u32 maxBytes );
+	bool hasPendingInRange( u32 base, u32 len ) const;
 
 	// Under-I/O shape relocation wiring; the tables are owned by CC64Memory
 	// (see its relocation section for the why). ptrReloc maps an under-I/O
@@ -213,6 +224,9 @@ public:
 	bool shouldMirror( u16 addr ) const;
 
 private:
+	u32 flushSelectedChunk( u32 maxBytes, bool deferHot, u32 screenBase,
+	                        u32 screenLen, bool screenOnly );
+
 	IC64Bus  *m_Bus;
 	const u8 *m_RAM;
 

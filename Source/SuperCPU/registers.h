@@ -197,6 +197,7 @@ public:
 		return m_HWRegsEnabled || m_Sys1MHz || m_DOSExt || m_RAMLink;
 	}
 	bool dosExtensionEnabled() const override { return m_DOSExt; }
+	const bool *dosExtensionStatePtr() const override { return &m_DOSExt; }
 	bool simmWindowWritesEnabled() const override { return m_HWRegsEnabled; }
 
 	// Diagnostics only: peek the $D200 scratch window without going through

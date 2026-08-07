@@ -419,7 +419,12 @@ void CC64Memory::reset()
 void CC64Memory::noteIECActivity()
 {
 	const bool wasQuiet = ( m_IECActivityCycles == 0 );
-	m_IECActivityCycles = 50000;		// 50ms while the serial path runs at 1MHz
+	// Serial edges continually re-arm this transaction window.  Keep it long
+	// enough to span IEC's >200us EOI pause, but short enough that screen
+	// mirroring resumes promptly after the final edge.  The separate 100ms
+	// m_IECHoldCycles timer remains responsible for automatic 1MHz pacing; it
+	// is deliberately not evidence that the bus is still active.
+	m_IECActivityCycles = 2000;		// 2ms at the serial path's 1MHz rate
 	if ( wasQuiet && m_TimingHook )
 		m_TimingHook( m_TimingHookCtx );
 
@@ -652,6 +657,8 @@ u8 CC64Memory::read8( scpu_addr_t addr )
 				// itself represent a direction change on the pins.
 				m_CIA2DDRA = v;
 				m_HaveCIA2DDRA = true;
+				updateSpritePtrBase();
+				updateHotShapeBlocks();
 			}
 			return v;
 		}
@@ -766,6 +773,8 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 		{
 			m_CIA2DDRA = value;
 			m_HaveCIA2DDRA = true;
+			updateSpritePtrBase();		// input pins float high; direction can move the VIC bank
+			updateHotShapeBlocks();
 			if ( cia2IECChanged )
 				noteIECActivity();
 		}
