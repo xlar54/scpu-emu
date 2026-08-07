@@ -313,9 +313,28 @@ TEST( integration_run_ticks_per_instruction_while_iec_active )
 	m.cpu.m_P  |= W65_I;
 
 	// Quiet bus: chunks must span several instructions (8 NOPs = 16 cycles).
+	// I/O, active IEC traffic and an armed CIA2 timer still break the batch at
+	// the current instruction; pure code keeps the throughput needed for 20MHz.
 	m.mem.m_MaxTickChunk = 0;
 	m.cpu.run( 400 );
 	CHECK( m.mem.m_MaxTickChunk > 8 );
+
+	// Queued RAM writes are equally quiet when RAD mirror stretching is off.
+	// A 095 regression still recorded a discarded timing event for every STA;
+	// fineTicksRequired() therefore broke the batch on every screen update and
+	// made write-heavy animation such as Metal Dust visibly stutter.
+	m.mem.m_RAM[ 0x1020 ] = 0x8D; // STA $0400
+	m.mem.m_RAM[ 0x1021 ] = 0x00;
+	m.mem.m_RAM[ 0x1022 ] = 0x04;
+	m.mem.m_RAM[ 0x1023 ] = 0x4C; // JMP $1020
+	m.mem.m_RAM[ 0x1024 ] = 0x20;
+	m.mem.m_RAM[ 0x1025 ] = 0x10;
+	m.cpu.m_PC = 0x1020;
+	m.mem.m_MaxTickChunk = 0;
+	m.cpu.run( 400 );
+	CHECK_EQ( m.mem.m_MirrorStretchCycles, 0u );
+	CHECK( m.mem.m_MaxTickChunk > 8 );
+	m.cpu.m_PC = 0x1000;
 
 	// A serial-line edge arms the activity window (and the speed hold).
 	m.mem.read8( 0xDD00 );
@@ -358,4 +377,3 @@ TEST( integration_run_ticks_per_instruction_while_speed_is_explicitly_1mhz )
 	m.cpu.run( 400 );
 	CHECK( m.mem.m_MaxTickChunk > 8 );
 }
-

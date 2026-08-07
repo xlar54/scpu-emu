@@ -41,6 +41,16 @@ void CSuperCPUMemoryMap::reset()
 		m_Bank1[ i ] = 0;
 }
 
+u8 CSuperCPUMemoryMap::readBank1Port( u16 offset )
+{
+	return m_Bank0 ? m_Bank0->read8( offset ) : 0xFF;
+}
+
+void CSuperCPUMemoryMap::writeBank1Port( u16 offset, u8 value )
+{
+	if ( m_Bank0 ) m_Bank0->write8( offset, value );
+}
+
 // ---------------------------------------------------------------------------
 
 // Everything ABOVE bank 0. Bank 0 itself is inlined in the header -- see the
@@ -54,6 +64,7 @@ u8 CSuperCPUMemoryMap::readAbove( scpu_addr_t addr )
 
 	if ( addr >= SCPU_ROM_BASE )
 	{
+		if ( m_Bank0 ) m_Bank0->noteFastHalfCycles( 6 );
 		if ( !m_ROMLength )
 			return (u8)( addr >> 16 );			// no image fitted: open bus
 		return m_ROM[ ( addr - SCPU_ROM_BASE ) % m_ROMLength ];
@@ -63,14 +74,21 @@ u8 CSuperCPUMemoryMap::readAbove( scpu_addr_t addr )
 	{
 		if ( !m_SIMM || !m_SIMM->present() )
 			return (u8)( addr >> 16 );
-		return m_SIMM->read( addr - SCPU_SIMM_WINDOW );
+		const u32 offset = addr - SCPU_SIMM_WINDOW;
+		if ( m_Bank0 ) m_Bank0->noteFastHalfCycles(
+			m_SIMM->accessPenaltyHalfCycles( offset, false ) );
+		return m_SIMM->read( offset );
 	}
 
 	// SuperRAM proper. Banks $02 upward map linearly onto the SIMM, and an
 	// address beyond the fitted size aliases down -- which is how software
 	// discovers how much is installed.
 	if ( m_SIMM && m_SIMM->present() && addr < m_SIMM->sizeBytes() )
+	{
+		if ( m_Bank0 ) m_Bank0->noteFastHalfCycles(
+			m_SIMM->accessPenaltyHalfCycles( addr, false ) );
 		return m_SIMM->read( addr );
+	}
 
 	// Nothing decodes here. A 65816 leaves the bank byte on the bus.
 	return (u8)( addr >> 16 );
@@ -88,15 +106,29 @@ void CSuperCPUMemoryMap::writeAbove( scpu_addr_t addr, u8 value )
 	}
 
 	if ( addr >= SCPU_ROM_BASE )
+	{
+		if ( m_Bank0 ) m_Bank0->noteFastHalfCycles( 6 );
 		return;									// ROM: writes are discarded
+	}
 
 	if ( addr >= SCPU_SIMM_WINDOW && addr < SCPU_SIMM_WINDOW + SCPU_SIMM_WINDOW_SZ )
 	{
-		if ( m_SIMM ) m_SIMM->write( addr - SCPU_SIMM_WINDOW, value );
+		if ( m_Bank0 && !m_Bank0->simmWindowWritesEnabled() )
+			return;
+		if ( m_SIMM )
+		{
+			const u32 offset = addr - SCPU_SIMM_WINDOW;
+			if ( m_Bank0 ) m_Bank0->noteFastHalfCycles(
+				m_SIMM->accessPenaltyHalfCycles( offset, true ) );
+			m_SIMM->write( offset, value );
+		}
 		return;
 	}
 
 	if ( m_SIMM && m_SIMM->present() && addr < m_SIMM->sizeBytes() )
+	{
+		if ( m_Bank0 ) m_Bank0->noteFastHalfCycles(
+			m_SIMM->accessPenaltyHalfCycles( addr, true ) );
 		m_SIMM->write( addr, value );
+	}
 }
-

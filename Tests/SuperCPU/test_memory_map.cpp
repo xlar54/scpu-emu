@@ -7,6 +7,7 @@
 #include "../../Source/SuperCPU/memory_map.h"
 #include "../../Source/Bus/Host/host_bus.h"
 #include "../../Source/SuperCPU/registers.h"
+#include "../../Source/SuperCPU/write_buffer.h"
 
 struct MapFixture
 {
@@ -51,6 +52,17 @@ TEST( map_bank1_is_private_sram )
 	// Bank 1 is the accelerator's own memory: nothing reaches the C64.
 	CHECK_EQ( f.bus.m_Cycles, 0 );
 	CHECK_EQ( f.map.m_Bank0Accesses, 0 );
+}
+
+TEST( map_bank1_port_bytes_alias_bank0 )
+{
+	MapFixture f;
+	f.map.write8( 0x010000, 0x2F );
+	f.map.write8( 0x010001, 0x35 );
+	CHECK_EQ( f.bank0.m_Port00, 0x2F );
+	CHECK_EQ( f.bank0.m_Port01, 0x35 );
+	CHECK_EQ( f.map.read8( 0x010000 ), f.map.read8( 0x000000 ) );
+	CHECK_EQ( f.map.read8( 0x010001 ), f.map.read8( 0x000001 ) );
 }
 
 TEST( map_superram_is_addressable_across_16mb )
@@ -144,6 +156,50 @@ TEST( map_128k_rom_mirrors_across_the_whole_region )
 		CHECK_EQ( f.map.read8( base + 0x1234 ), rom[ 0x1234 ] );
 		CHECK_EQ( f.map.read8( base + 0x1FFFF), rom[ 0x1FFFF ] );
 	}
+}
+
+TEST( map_eprom_accesses_charge_three_extra_turbo_cycles )
+{
+	MapFixture f;
+	static u8 rom[ 0x10000 ] = { 0 };
+	f.map.setROM( rom, sizeof rom );
+	f.bank0.setPacing( 0, 20000000 );
+	const u64 start = f.bank0.m_EmuCycles;
+	f.map.read8( SCPU_ROM_BASE );
+	f.bank0.tickFast( 1 );
+	CHECK_EQ( f.bank0.m_EmuCycles - start, 4u );
+	CHECK_EQ( f.bank0.m_RegionStretchCycles, 3u );
+}
+
+TEST( map_simm_configuration_changes_decode_and_page_timing )
+{
+	MapFixture f( SCPU_SIMM_16MB );
+	CSuperCPURegisters regs;
+	regs.attachFastRAM( &f.simm );
+	regs.reset();
+	regs.ioWrite( SCPU_REG_HWREGS_ENABLE, 0 );
+	regs.ioWrite( SCPU_REG_SIMM_CONFIG, 0 );	// 1MB, 2KB rows
+	CHECK_EQ( f.simm.config() & 7, 0 );
+
+	f.simm.write( 0x000123, 0x5A );
+	CHECK_EQ( f.simm.read( 0x100123 ), 0x5A );	// configured decode aliases
+	CHECK_EQ( f.simm.accessPenaltyHalfCycles( 0x002000, false ), 5u );
+	CHECK_EQ( f.simm.accessPenaltyHalfCycles( 0x002004, false ), 0u );
+	CHECK_EQ( f.simm.accessPenaltyHalfCycles( 0x002100, false ), 2u );
+	CHECK_EQ( f.simm.accessPenaltyHalfCycles( 0x004000, true ), 4u );
+}
+
+TEST( map_simm_window_writes_require_the_hardware_register_gate )
+{
+	MapFixture f( SCPU_SIMM_16MB );
+	CSuperCPURegisters regs;
+	f.bank0.setIOInterceptor( &regs );
+	regs.reset();
+	f.map.write8( SCPU_SIMM_WINDOW + 0x123, 0x11 );
+	CHECK_EQ( f.simm.read( 0x123 ), 0x00 );
+	regs.ioWrite( SCPU_REG_HWREGS_ENABLE, 0 );
+	f.map.write8( SCPU_SIMM_WINDOW + 0x123, 0x22 );
+	CHECK_EQ( f.simm.read( 0x123 ), 0x22 );
 }
 
 TEST( map_rom_region_is_open_bus_without_an_image )
@@ -408,21 +464,106 @@ TEST( scpu_private_ram_writes_need_the_register_bank_open )
 	CHECK_EQ( v, 0x5A );
 }
 
-TEST( integration_hardware_interrupt_closes_the_register_bank )
+TEST( scpu_v2_private_ram_aliases_bank1_sram )
 {
-	// The "@$" freeze, pinned. With the register bank OPEN, $E000-$FFFF is the
-	// KS image -- and CMD's KS image is not a whole KERNAL. ROM $9F2D-$9F74,
-	// which is $FF2D-$FF74 through that window, is zeros in BOTH the 1.4 and
-	// 2.04 images, and $FF48 (the KERNAL IRQ entry) sits inside it.
-	//
-	// Yet the KS vector table's own IRQ vector reads $FF48. A vector pointing
-	// into a hole in the image that supplied it is only coherent if the handler
-	// runs from the OTHER image, where $FF48 is the real KERNAL entry. So a
-	// hardware interrupt must close the bank as it is taken. Without that the
-	// machine executes $00 = BRK at $FF48, which vectors back to $FF48: an
-	// infinite loop with the stack filling, seen on hardware as a frozen C64.
-	//
-	// BRK and COP are instructions, not interrupts, and must NOT close it.
+	CSuperCPUMemoryMap map;
+	CSuperCPURegisters regs;
+	regs.attachBank1( map.m_Bank1 );
+	regs.reset();
+
+	regs.ioWrite( SCPU_REG_HWREGS_ENABLE, 0 );
+	CHECK( regs.ioWrite( 0xD234, 0x5A ) );
+	CHECK_EQ( map.read8( 0x01D234 ), 0x5A );
+
+	map.write8( 0x01D345, 0xA5 );
+	u8 v = 0;
+	CHECK( regs.ioRead( 0xD345, v ) );
+	CHECK_EQ( v, 0xA5 );
+}
+
+TEST( scpu_v2_colour_ram_is_a_full_byte_bank1_cache )
+{
+	CHostBus bus;
+	CC64Memory mem;
+	CSuperCPUMemoryMap map;
+	CSuperCPURegisters regs;
+	mem.attachBus( &bus );
+	mem.setIOInterceptor( &regs );
+	map.attachBank0( &mem );
+	regs.attachBank1( map.m_Bank1 );
+	regs.setHardwareVersion( SCPU_V2 );
+	regs.reset();
+	mem.reset();
+	mem.setPacing( 0, 20000000 );
+
+	mem.write8( 0xD800, 0xFA );
+	CHECK_EQ( bus.m_Memory[ 0xD800 ], 0xFA );	// physical chip still written
+	CHECK_EQ( mem.read8( 0xD800 ), 0xFA );		// full cached byte, no open bus
+	CHECK_EQ( map.read8( 0x01D800 ), 0xFA );	// same byte through bank 1
+
+	// The colour write uses the posted buffer class and the cached read is
+	// internal SRAM, so neither queues an ordinary I/O stretch.
+	mem.tickFast( 4 );
+	CHECK_EQ( mem.m_IOStretchCycles, 0u );
+}
+
+TEST( scpu_ramlink_strobes_update_status_without_swallowing_the_bus_write )
+{
+	CSuperCPURegisters regs;
+	regs.reset();
+	u8 v = 0;
+	CHECK( !regs.ioWrite( 0xDF7E, 0 ) );
+	CHECK( regs.interruptRerouteRequested() );
+	CHECK( regs.ioRead( SCPU_REG_DOSEXT, v ) );
+	CHECK( ( v & SCPU_DOS_RAMLINK ) != 0 );
+	CHECK( !regs.ioWrite( 0xDF7F, 0 ) );
+	CHECK( regs.ioRead( SCPU_REG_DOSEXT, v ) );
+	CHECK( ( v & SCPU_DOS_RAMLINK ) == 0 );
+}
+
+TEST( scpu_dos_extension_maps_its_bank1_work_areas )
+{
+	CHostBus bus;
+	CC64Memory bank0;
+	CSuperCPUMemoryMap map;
+	CSuperCPURegisters regs;
+	bank0.attachBus( &bus );
+	bank0.setIOInterceptor( &regs );
+	map.attachBank0( &bank0 );
+	bank0.setROMShadow( map.m_Bank1 );
+	regs.attachBank1( map.m_Bank1 );
+	regs.reset();
+	bank0.reset();
+
+	regs.ioWrite( SCPU_REG_HWREGS_ENABLE, 0 );
+	regs.ioWrite( SCPU_REG_DOSEXT_ON, 0 );
+	CHECK( regs.dosExtensionEnabled() );
+
+	bank0.m_RAM[ 0x1234 ] = 0x11;
+	bank0.m_RAM[ 0x8123 ] = 0x22;
+	map.m_Bank1[ 0x1234 ] = 0xA1;
+	map.m_Bank1[ 0x8123 ] = 0xB2;
+	CHECK_EQ( bank0.readFast( 0x1234 ), 0xA1 );
+	CHECK_EQ( bank0.readFast( 0x8123 ), 0xB2 );
+
+	bank0.writeFast( 0x1234, 0xC3 );
+	bank0.writeFast( 0x8123, 0xD4 );
+	CHECK_EQ( map.m_Bank1[ 0x1234 ], 0xC3 );
+	CHECK_EQ( map.m_Bank1[ 0x8123 ], 0xD4 );
+	CHECK_EQ( bank0.m_RAM[ 0x1234 ], 0x11 );
+	CHECK_EQ( bank0.m_RAM[ 0x8123 ], 0x22 );
+
+	regs.ioWrite( SCPU_REG_DOSEXT_OFF, 0 );
+	CHECK_EQ( bank0.readFast( 0x1234 ), 0x11 );
+	CHECK_EQ( bank0.readFast( 0x8123 ), 0x22 );
+}
+
+TEST( integration_hardware_interrupt_does_not_change_the_register_bank )
+{
+	// VICE's only SuperCPU-specific interrupt hook is the EPROM vector reroute.
+	// Interrupt entry and RTI do not mutate the hardware-register gate. Doing
+	// so before choosing the vector could disable the reroute for the very
+	// interrupt being dispatched.
 	CSuperCPURegisters regs;
 	u32 kernalShadowBase = 0xE000;
 	regs.reset();
@@ -432,34 +573,8 @@ TEST( integration_hardware_interrupt_closes_the_register_bank )
 	CHECK( regs.hardwareRegsEnabled() );
 	CHECK_EQ( kernalShadowBase, 0x6000u );		// KS while open
 
-	regs.onInterruptAcknowledged();
-	CHECK( !regs.hardwareRegsEnabled() );
-	CHECK_EQ( kernalShadowBase, 0xE000u );		// KT for the handler
-	CHECK_EQ( regs.m_InterruptBankCloses, 1u );
-
-	// RTI hands the interrupted code back the world it left: bank open again.
-	// Without this, DOS code interrupted mid-command resumed with its $D2xx
-	// scratch write-protected and its state silently corrupting -- seen on
-	// hardware as sporadic warm resets on wedge commands.
-	regs.onInterruptReturned();
 	CHECK( regs.hardwareRegsEnabled() );
 	CHECK_EQ( kernalShadowBase, 0x6000u );
-
-	// Nested NMI-in-IRQ: the inner acknowledge sees the bank already closed,
-	// so the inner return must NOT reopen it -- only the outer one does.
-	regs.onInterruptAcknowledged();				// outer, bank open -> closes
-	regs.onInterruptAcknowledged();				// inner, already closed
-	CHECK_EQ( regs.m_InterruptBankCloses, 2u );
-	regs.onInterruptReturned();					// inner: stays closed
-	CHECK( !regs.hardwareRegsEnabled() );
-	regs.onInterruptReturned();					// outer: reopens
-	CHECK( regs.hardwareRegsEnabled() );
-
-	// A stray RTI with no interrupt in flight -- RTI used as a jump -- must
-	// not touch the bank.
-	regs.ioWrite( SCPU_REG_HWREGS_DISABLE, 0 );
-	regs.onInterruptReturned();
-	CHECK( !regs.hardwareRegsEnabled() );
 }
 
 TEST( scpu_boot_animation_deviation_is_one_byte_wide )
@@ -549,6 +664,35 @@ TEST( nmi_retime_delivers_at_the_emulated_deadline_not_the_sampled_line )
 	CHECK( !f.nmiAfter( 10 ) );
 	// Twenty-one cycles total: the timer underflows on the emulated clock.
 	CHECK( f.nmiAfter( 11 ) );
+}
+
+TEST( nmi_retime_uses_emulated_cycles_even_with_a_hardware_clock )
+{
+	// RAD's ARM clock measures how quickly the interpreter happens to run,
+	// not the 20MHz clock being emulated. C64Tests/16-NMITIMING caught the old
+	// host deadline expiring after about half VICE's instruction count whenever
+	// an armed NMI forced the core onto its slower fine-tick path.
+	CHostBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	mem.setPacing( 1400000000ULL, 20000000 );
+	mem.m_IOStretchEnable = false;
+
+	mem.write8( 0xDD04, 0x20 );
+	mem.write8( 0xDD05, 0x00 );
+	mem.write8( 0xDD0E, 0x09 );
+	// Advance/finish directly: CHostBus's test clock advances only on bus
+	// traffic, so enabling its pacer and calling tickFast would wait forever.
+	mem.m_EmuCycles += 4;
+	mem.cia2FinishArm();		// anchor after the STA completes
+	mem.write8( 0xDD0D, 0x81 );
+
+	CHECK_EQ( mem.m_CIA2TADeadline - mem.m_EmuCycles, 33u * 20u );
+	mem.m_EmuCycles += 659;
+	CHECK( !mem.nmiFast() );
+	mem.m_EmuCycles += 1;
+	CHECK( mem.nmiFast() );
 }
 
 TEST( nmi_retime_ack_ends_the_assertion_and_the_next_shot_is_a_new_edge )
@@ -843,6 +987,7 @@ TEST( nmi_retime_explicit_speed_select_clears_the_poll_hold )
 	regs.reset();
 	mem.reset();
 	mem.setPacing( 0, 20000000 );
+	mem.m_IOStretchEnable = false;		// isolate deadline rescaling from bus cost
 	bus.m_Memory[ 0xDD00 ] = 0xFF;		// idle lines: polls, not receives
 
 	mem.read8( 0xDD00 );				// the KERNAL's poll loop
@@ -942,61 +1087,11 @@ TEST( nmi_retime_delivery_is_punctual_through_the_run_loop )
 	CHECK( !c->m_Stopped );
 }
 
-TEST( nmi_native_defer_holds_until_emulation_mode )
+TEST( nmi_in_native_mode_dispatches_natively )
 {
-	// A native-mode NMI vectors through $00FFEA. On a SuperCPU nothing valid
-	// is there, so the deferral holds the dispatch until the processor is
-	// back in emulation mode, where the vector is the machine's real one.
-	CHostBus bus;
-	CC64Memory mem;
-	mem.attachBus( &bus );
-	mem.reset();
-	mem.write8( 0x0001, 0x35 );			// all-RAM: vectors come from RAM
-
-	u16 a = 0x1000;
-	auto emit = [&]( int b ) { mem.write8( a++, (u8)b ); };
-	emit( 0x18 ); emit( 0xFB );			// CLC XCE -> native
-	for ( u32 i = 0; i < 20; i++ ) emit( 0xEA );
-	const u16 backToEmu = a;
-	emit( 0x38 ); emit( 0xFB );			// SEC XCE -> emulation
-	for ( u32 i = 0; i < 10; i++ ) emit( 0xEA );
-
-	// Distinguishable handlers: emulation counts $0FFD, native counts $0FFE.
-	mem.write8( 0x2000, 0xEE ); mem.write8( 0x2001, 0xFD ); mem.write8( 0x2002, 0x0F );
-	mem.write8( 0x2003, 0x40 );
-	mem.write8( 0x2100, 0xEE ); mem.write8( 0x2101, 0xFE ); mem.write8( 0x2102, 0x0F );
-	mem.write8( 0x2103, 0x40 );
-	mem.write8( 0xFFFA, 0x00 ); mem.write8( 0xFFFB, 0x20 );
-	mem.write8( 0xFFEA, 0x00 ); mem.write8( 0xFFEB, 0x21 );
-
-	CW65C816 cpu;
-	cpu.attachBus( &mem );
-	cpu.m_DeferNativeNMI = true;
-	cpu.m_PC = 0x1000; cpu.m_PBR = 0; cpu.m_E = true; cpu.m_S = 0x01F0;
-
-	cpu.step();							// CLC
-	cpu.step();							// XCE -> native
-	CHECK( !cpu.m_E );
-
-	bus.m_NMI = true;					// the line asserts INSIDE native mode
-	for ( u32 i = 0; i < 12 && cpu.m_PC < backToEmu; i++ )
-		cpu.step();
-	CHECK_EQ( cpu.m_NMIsTaken, 0u );	// held
-	CHECK( cpu.m_NMIsDeferred > 0u );
-	CHECK_EQ( mem.m_RAM[ 0x0FFE ], 0 );	// never dispatched natively
-
-	// Back to emulation mode: the held NMI is delivered at once.
-	for ( u32 i = 0; i < 40 && cpu.m_NMIsTaken == 0; i++ )
-		cpu.step();
-	for ( u32 i = 0; i < 4; i++ ) cpu.step();		// let the handler run
-	CHECK_EQ( cpu.m_NMIsTaken, 1u );
-	CHECK_EQ( mem.m_RAM[ 0x0FFD ], 1 );	// through the emulation vector
-	CHECK_EQ( mem.m_RAM[ 0x0FFE ], 0 );
-}
-
-TEST( nmi_native_defer_off_dispatches_natively )
-{
-	// With the escape hatch clear, the processor behaves as itself.
+	// Native NMIs are never delayed. On a SuperCPU the memory map reroutes the
+	// vector fetch into EPROM; this plain-bus test checks the underlying 65816
+	// contract directly through $00FFEA.
 	CHostBus bus;
 	CC64Memory mem;
 	mem.attachBus( &bus );
@@ -1014,7 +1109,6 @@ TEST( nmi_native_defer_off_dispatches_natively )
 
 	CW65C816 cpu;
 	cpu.attachBus( &mem );
-	cpu.m_DeferNativeNMI = false;
 	cpu.m_PC = 0x1000; cpu.m_PBR = 0; cpu.m_E = true; cpu.m_S = 0x01F0;
 
 	cpu.step(); cpu.step();				// into native mode
@@ -1024,6 +1118,34 @@ TEST( nmi_native_defer_off_dispatches_natively )
 	for ( u32 i = 0; i < 4; i++ ) cpu.step();		// let the handler run
 	CHECK_EQ( cpu.m_NMIsTaken, 1u );
 	CHECK_EQ( mem.m_RAM[ 0x0FFE ], 1 );	// dispatched through the native vector
+}
+
+TEST( nmi_native_compatibility_hold_releases_in_emulation_mode )
+{
+	CHostBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	mem.write8( 0x0001, 0x35 );
+	mem.write8( 0x1000, 0x18 ); mem.write8( 0x1001, 0xFB ); // CLC/XCE native
+	mem.write8( 0x1002, 0xEA );
+	mem.write8( 0x1003, 0x38 ); mem.write8( 0x1004, 0xFB ); // SEC/XCE emu
+	mem.write8( 0x2000, 0x40 );
+	mem.write8( 0xFFFA, 0x00 ); mem.write8( 0xFFFB, 0x20 );
+
+	CW65C816 cpu;
+	cpu.attachBus( &mem );
+	cpu.m_DeferNativeNMI = true;
+	cpu.m_PC = 0x1000; cpu.m_PBR = 0; cpu.m_E = true; cpu.m_S = 0x01F0;
+	cpu.step(); cpu.step();
+	bus.m_NMI = true;
+	cpu.step();
+	CHECK_EQ( cpu.m_NMIsTaken, 0u );
+	CHECK( cpu.m_NMIsDeferred > 0 );
+	cpu.step(); cpu.step();
+	CHECK( cpu.m_E );
+	for ( u32 i = 0; i < 4 && cpu.m_NMIsTaken == 0; i++ ) cpu.step();
+	CHECK_EQ( cpu.m_NMIsTaken, 1u );
 }
 
 // ---------------------------------------------------------------------------
@@ -1212,4 +1334,108 @@ TEST( io_stretch_does_not_apply_at_1mhz )
 	cpu.step();
 	CHECK_EQ( mem.m_EmuCycles - start, 4u );	// LDA abs, and nothing added
 	CHECK_EQ( mem.m_IOStretchCycles, 0u );
+}
+
+TEST( io_stretch_preserves_every_rmw_bus_access )
+{
+	// INC abs performs one read and, in emulation mode, the NMOS-compatible
+	// dummy write plus the final write. None of those three bus events may be
+	// collapsed into another.
+	CHostBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	mem.setPacing( 0, 20000000 );
+	mem.write8( 0x1000, 0xEE ); mem.write8( 0x1001, 0x20 ); mem.write8( 0x1002, 0xD0 );
+
+	CW65C816 cpu;
+	cpu.attachBus( &mem );
+	cpu.m_PC = 0x1000; cpu.m_PBR = 0; cpu.m_E = true; cpu.m_S = 0x01F0;
+	const u64 start = mem.m_EmuCycles;
+	cpu.step();
+	CHECK_EQ( mem.m_EmuCycles - start, 60u );
+}
+
+TEST( io_stretch_extra_cycle_applies_only_to_cia_writes )
+{
+	CHostBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	mem.setPacing( 0, 20000000 );
+	mem.write8( 0x1000, 0xAD ); mem.write8( 0x1001, 0x00 ); mem.write8( 0x1002, 0xDC );
+	mem.write8( 0x1003, 0x8D ); mem.write8( 0x1004, 0x00 ); mem.write8( 0x1005, 0xDC );
+
+	CW65C816 cpu;
+	cpu.attachBus( &mem );
+	cpu.m_PC = 0x1000; cpu.m_PBR = 0; cpu.m_E = true; cpu.m_S = 0x01F0;
+	u64 start = mem.m_EmuCycles;
+	cpu.step();
+	CHECK_EQ( mem.m_EmuCycles - start, 20u );	// CIA read: ordinary stretch
+	start = mem.m_EmuCycles;
+	cpu.step();
+	CHECK_EQ( mem.m_EmuCycles - start, 40u );	// CIA write: two C64 cycles
+}
+
+TEST( mirrored_writes_use_a_one_deep_posted_buffer )
+{
+	CHostBus bus;
+	CC64Memory mem;
+	CWriteBuffer wb;
+	mem.attachBus( &bus );
+	mem.reset();
+	mem.setPacing( 0, 20000000 );
+	mem.m_MirrorStretchEnable = true;
+	mem.write8( 0x1000, 0x8D ); mem.write8( 0x1001, 0x00 ); mem.write8( 0x1002, 0x04 );
+	mem.write8( 0x1003, 0x8D ); mem.write8( 0x1004, 0x01 ); mem.write8( 0x1005, 0x04 );
+	mem.write8( 0x1006, 0xAD ); mem.write8( 0x1007, 0x12 ); mem.write8( 0x1008, 0xD0 );
+	wb.attach( &bus, mem.m_RAM );
+	wb.setOptMode( SCPU_OPT_NONE );
+	mem.setMirrorSink( &wb );
+
+	// Two consecutive STA abs instructions. The first posts without waiting;
+	// the second must wait for its predecessor's next-PHI2 retirement.
+	CW65C816 cpu;
+	cpu.attachBus( &mem );
+	cpu.m_PC = 0x1000; cpu.m_PBR = 0; cpu.m_E = true; cpu.m_S = 0x01F0;
+
+	u64 start = mem.m_EmuCycles;
+	cpu.step();
+	CHECK_EQ( mem.m_EmuCycles - start, 4u );
+	start = mem.m_EmuCycles;
+	cpu.step();
+	CHECK_EQ( mem.m_EmuCycles - start, 16u );
+	CHECK_EQ( mem.m_MirrorStretchCycles, 12u );
+
+	// An I/O read must drain the second posted write before touching the bus.
+	start = mem.m_EmuCycles;
+	cpu.step();
+	CHECK_EQ( mem.m_EmuCycles - start, 40u );
+}
+
+TEST( mirrored_write_stretch_is_disabled_by_default_on_rad )
+{
+	CHostBus bus;
+	CC64Memory mem;
+	CWriteBuffer wb;
+	mem.attachBus( &bus );
+	mem.reset();
+	mem.setPacing( 0, 20000000 );
+	mem.write8( 0x1000, 0x8D ); mem.write8( 0x1001, 0x00 ); mem.write8( 0x1002, 0x04 );
+	mem.write8( 0x1003, 0x8D ); mem.write8( 0x1004, 0x01 ); mem.write8( 0x1005, 0x04 );
+	wb.attach( &bus, mem.m_RAM );
+	wb.setOptMode( SCPU_OPT_NONE );
+	mem.setMirrorSink( &wb );
+
+	CW65C816 cpu;
+	cpu.attachBus( &mem );
+	cpu.m_PC = 0x1000; cpu.m_PBR = 0; cpu.m_E = true; cpu.m_S = 0x01F0;
+
+	u64 start = mem.m_EmuCycles;
+	cpu.step();
+	CHECK_EQ( mem.m_EmuCycles - start, 4u );
+	start = mem.m_EmuCycles;
+	cpu.step();
+	CHECK_EQ( mem.m_EmuCycles - start, 4u );
+	CHECK_EQ( mem.m_MirrorStretchCycles, 0u );
 }

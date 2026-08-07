@@ -50,7 +50,7 @@
 #include "../C64/c64_bus.h"
 
 // Mirroring policy. Names follow the CMD documentation; see
-// Docs/research/supercpu-registers.md for how each maps to a register write.
+// Docs/SuperCPU64/supercpu-registers.md for how each maps to a register write.
 enum SCPUOptMode
 {
 	SCPU_OPT_NONE = 0,	// $D077 - mirror everything. Maximum compatibility.
@@ -93,7 +93,7 @@ public:
 	void setExcludeZeroPageStack( bool exclude ) { m_ExcludeZPStack = exclude; }
 
 	// --- IMirrorSink ------------------------------------------------------
-	void onRamWrite( u16 addr, u8 value ) override;
+	bool onRamWrite( u16 addr, u8 value ) override;
 
 	// Flush everything, regardless of where the raster is. Correct but not
 	// polite: a large flush here will disturb the display.
@@ -167,6 +167,13 @@ public:
 	// a pointer row, in which case translating it was correct.
 	inline u8 deliverValue( u16 a, u8 v ) const
 	{
+		// A relocated 64-byte block is shape data even when its final eight
+		// addresses happen to look like a bank-3 sprite-pointer row. Translating
+		// those data bytes corrupts blocks 15, 31 and 47 deterministically.
+		if ( m_RelocCount && *m_RelocCount
+		     && a >= 0xC000 && a < 0xCC00
+		     && m_RelocInUse[ ( a - 0xC000 ) >> 6 ] != 0xFF )
+			return v;
 		if ( m_RelocCount && *m_RelocCount
 		     && a >= 0xC000 && ( a & 0x3FF ) >= 0x3F8
 		     && v >= 0x40 && v < 0x80 )

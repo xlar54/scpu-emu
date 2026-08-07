@@ -517,6 +517,22 @@ TEST( writebuf_hot_shape_blocks_wait_for_the_border )
 	CHECK_EQ( wb.pending(), 0u );
 }
 
+TEST( relocation_shape_tail_is_not_mistaken_for_a_pointer_row )
+{
+	CWriteBuffer wb;
+	u8 ptrReloc[ 64 ];
+	u8 inUse[ 48 ];
+	for ( u32 i = 0; i < 64; i++ ) ptrReloc[ i ] = 0xFF;
+	for ( u32 i = 0; i < 48; i++ ) inUse[ i ] = 0xFF;
+	u8 count = 1;
+	ptrReloc[ 1 ] = 7;
+	inUse[ 15 ] = 0x40;	// block 15 is $C3C0-$C3FF
+	wb.attachRelocation( ptrReloc, inUse, &count );
+
+	CHECK_EQ( wb.deliverValue( 0xC3F8, 0x41 ), 0x41 );	// shape byte: identity
+	CHECK_EQ( wb.deliverValue( 0xC7F8, 0x41 ), 0x07 );	// real pointer row
+}
+
 // ---------------------------------------------------------------------------
 // Under-I/O sprite-shape relocation
 //

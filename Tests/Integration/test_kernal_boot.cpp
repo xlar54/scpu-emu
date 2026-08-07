@@ -1161,8 +1161,9 @@ TEST( integration_mirror_drains_inside_the_display_within_its_ration )
 
 	scpu.runFrame();
 
-	// Nine drain calls per frame at 128 bytes each: real progress inside the
-	// picture, and far short of the whole queue.
+	// The legacy 128-byte allowance is divided across 128 opportunities. That
+	// preserves roughly the former per-frame ceiling while turning each long
+	// pause into a small installment.
 	const u32 sent = staged - scpu.writeBuffer().pending();
 	CHECK( sent >= 128 );
 	CHECK( sent <= 9 * 128 );
@@ -1281,6 +1282,46 @@ TEST( integration_frame_end_runs_the_cpu_toward_the_border_instead_of_missing_it
 	const u64 inDisplay = runOne( 100 );
 
 	CHECK( inDisplay > atBorder );
+}
+
+TEST( integration_frame_end_border_approach_is_repaid_next_frame )
+{
+	// Advancing to the physical border is useful work, but it must not be free
+	// work. A fixed mid-display sample makes the first call borrow a known
+	// amount; the next call must execute less ordinary frame work while repaying
+	// it. Otherwise the sampled raster phase becomes a variable CPU overclock.
+	struct FixedRasterBus : CHostBus
+	{
+		u16 rasterLine() override { return 100; }
+	} bus;
+
+	CSuperCPU scpu;
+	u8 basic[ C64_BASIC_SIZE ];
+	u8 kernal[ C64_KERNAL_SIZE ];
+	std::memset( basic, 0xEA, sizeof basic );
+	std::memset( kernal, 0xEA, sizeof kernal );
+	kernal[ 0 ] = 0x4C;
+	kernal[ 1 ] = 0x00;
+	kernal[ 2 ] = 0xE0;
+	kernal[ 0x1FFC ] = 0x00;
+	kernal[ 0x1FFD ] = 0xE0;
+	scpu.setBasicROM( basic );
+	scpu.setKernalROM( kernal );
+	CHECK( scpu.init( &bus, SCPU_CORE_6502, 0 ) );
+	scpu.writeBuffer().setOptMode( SCPU_OPT_NONE );
+	scpu.setMirrorDisplayBudget( 0 );
+
+	for ( u32 i = 0; i < 100; i++ )
+		scpu.memory().write8( (u16)( 0x2000 + i ), (u8)i );
+	const u64 borrowingFrame = scpu.runFrame();
+
+	// Keep a mirror outstanding so this call takes the same border-approach
+	// path. Its total must nevertheless be one normal frame, not frame+approach.
+	for ( u32 i = 0; i < 100; i++ )
+		scpu.memory().write8( (u16)( 0x2100 + i ), (u8)i );
+	const u64 repayingFrame = scpu.runFrame();
+
+	CHECK( repayingFrame < borrowingFrame );
 }
 
 TEST( integration_active_screen_sprite_pointers_reach_the_bus_immediately )

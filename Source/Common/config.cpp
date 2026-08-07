@@ -89,9 +89,10 @@ int cfgMirrorHaltAfterS = 0;
 int cfgMirrorD000Relocate = 1;
 int cfgHeartbeat = 0;
 int cfgNMIRetime = 1;
-int cfgNMINativeDefer = 1;
 int cfgVectorReroute = 1;
 int cfgIOStretch = 1;
+int cfgNMINativeDefer = 1;
+int cfgMirrorStretch = 0;
 
 char cfg[ 65536 ];
 
@@ -113,9 +114,10 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	cfgMirrorD000Relocate = 1;
 	cfgHeartbeat = 0;
 	cfgNMIRetime = 1;
-	cfgNMINativeDefer = 1;
 	cfgVectorReroute = 1;
 	cfgIOStretch = 1;
+	cfgNMINativeDefer = 1;
+	cfgMirrorStretch = 0;
 
 	// Leave a byte spare so cfg is always NUL-terminated for the line scanner.
 	if ( !readFile( logger, DRIVE, FILENAME, (u8*)cfg, &cfgBytes, sizeof( cfg ) - 1 ) )
@@ -131,9 +133,10 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	bool relocSeen = false;
 	bool heartbeatSeen = false;
 	bool nmiRetimeSeen = false;
-	bool nmiDeferSeen = false;
 	bool rerouteSeen = false;
 	bool ioStretchSeen = false;
+	bool nmiDeferSeen = false;
+	bool mirrorStretchSeen = false;
 
 	while ( *cfgPos != 0 )
 	{
@@ -161,9 +164,10 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 						if ( i == 28 ) relocSeen = true;
 						if ( i == 29 ) heartbeatSeen = true;
 						if ( i == 30 ) nmiRetimeSeen = true;
-						if ( i == 31 ) nmiDeferSeen = true;
-						if ( i == 32 ) rerouteSeen = true;
-						if ( i == 33 ) ioStretchSeen = true;
+						if ( i == 31 ) rerouteSeen = true;
+						if ( i == 32 ) ioStretchSeen = true;
+						if ( i == 33 ) nmiDeferSeen = true;
+						if ( i == 34 ) mirrorStretchSeen = true;
 						while ( *ptr == '\t' || *ptr == ' ' ) ptr++;
 					#ifdef DEBUG_OUT
 						logger->Write( "RaspiMenu", LogNotice, "  %s >%d< (%s)", timingNames[ i ], timingValues[ i ], ptr );
@@ -237,19 +241,20 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	if ( nmiRetimeSeen )
 		cfgNMIRetime = ( timingValues[ 30 ] != 0 ) ? 1 : 0;
 
-	// A flag, default on: NMI_NATIVE_DEFER 0 dispatches natively as the
-	// processor would.
-	if ( nmiDeferSeen )
-		cfgNMINativeDefer = ( timingValues[ 31 ] != 0 ) ? 1 : 0;
-
 	// A flag, default on: VECTOR_REROUTE 0 fetches vectors from the C64 map.
 	if ( rerouteSeen )
-		cfgVectorReroute = ( timingValues[ 32 ] != 0 ) ? 1 : 0;
+		cfgVectorReroute = ( timingValues[ 31 ] != 0 ) ? 1 : 0;
 
 	// A flag, default on: IO_STRETCH 0 charges bus accesses nothing, as
 	// before the access-cost model existed.
 	if ( ioStretchSeen )
-		cfgIOStretch = ( timingValues[ 33 ] != 0 ) ? 1 : 0;
+		cfgIOStretch = ( timingValues[ 32 ] != 0 ) ? 1 : 0;
+
+	if ( nmiDeferSeen )
+		cfgNMINativeDefer = ( timingValues[ 33 ] != 0 ) ? 1 : 0;
+
+	if ( mirrorStretchSeen )
+		cfgMirrorStretch = ( timingValues[ 34 ] != 0 ) ? 1 : 0;
 
 	return 1;
 }

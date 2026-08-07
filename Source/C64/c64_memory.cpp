@@ -101,10 +101,6 @@ void CC64Memory::notePollHold()
 
 void CC64Memory::cia2OnRateChange()
 {
-	// Host-cycle deadlines are speed-independent by construction: nothing to
-	// re-denominate, ever.
-	if ( m_CIAUseHostClock )
-		return;
 	const u64 f = effectiveCIAFactor();
 	if ( f == m_CIA2FactorInUse )
 		return;
@@ -310,8 +306,11 @@ void CC64Memory::ciaTimerNMIDue()
 // unless displayed, and allocation just ruled displaying out.
 u8 CC64Memory::allocRelocBlock( u8 v )
 {
-	// Forbidden span 1: the active screen matrix, as blocks.
+	// Forbidden span 1: the active and most-recent screen matrices, as blocks.
+	// Double-buffered programs can queue pointer-row bytes for one while the
+	// other is active; stealing either matrix makes the next flip destructive.
 	const u32 screenBase = ( m_SpritePtrBase - 0x3F8 ) & 0xFFFF;
+	const u32 previousScreenBase = ( m_PreviousSpritePtrBase - 0x3F8 ) & 0xFFFF;
 	// Forbidden span 2: a bitmap in the low half of bank 3. $D011 bit 5 turns
 	// bitmap mode on; $D018 bit 3 picks the half. 8K starting at $C000 covers
 	// the whole window -- in that configuration there is nothing to allocate.
@@ -324,6 +323,9 @@ u8 CC64Memory::allocRelocBlock( u8 v )
 			continue;
 		const u32 addr = 0xC000 + ( (u32)r << 6 );
 		if ( addr >= screenBase && addr < screenBase + 0x400 )
+			continue;
+		if ( m_PreviousSpritePtrBase != 0xFFFFFFFF
+		     && addr >= previousScreenBase && addr < previousScreenBase + 0x400 )
 			continue;
 		if ( lowBitmap )
 			continue;
@@ -365,6 +367,7 @@ void CC64Memory::reset()
 	m_CIA2PortALatch = 0;
 	m_LastCIA2PortARead = 0;
 	m_LastD018 = 0x14;			// the KERNAL default: screen $0400, charset $1000
+	m_SpritePtrBase = m_PreviousSpritePtrBase = 0xFFFFFFFF;
 	// Relocation tables before updateHotShapeBlocks, which consults them.
 	// Cleared on reset: the game that allocated them is gone, and stale
 	// mappings would translate a NEW program's pointers to blocks holding the
@@ -399,8 +402,10 @@ void CC64Memory::reset()
 	m_CIA2TALatch = m_CIA2TBLatch = 0xFFFF;
 	m_CIA2ICRPending = 0;
 	m_CIA2ArmPending = 0;
-	m_PendingIOAccess = 0;
-	m_PendingIOExtra = 0;
+	m_BusEventCount = 0;
+	m_MirrorBufferFreeAt = 0;
+	m_PendingFastHalfCycles = 0;
+	m_FastHalfCarry = 0;
 	m_CIA2TADeadline = m_CIA2TBDeadline = m_CIA2NMIDeadline = 0;
 	m_CIA2FactorInUse = effectiveCIAFactor();
 	resyncPacing();
@@ -520,6 +525,8 @@ u8 CC64Memory::read8( scpu_addr_t addr )
 	// software reads the cassette sense and motor lines through here too.
 	if ( a <= 1 )
 		return ( a == 0 ) ? m_Port00 : c64PortRead( m_Port00, m_Port01 );
+	if ( dosExtensionMapsBank1( a ) )
+		return m_ROMShadow[ a ];
 
 	// Bootmap sits ABOVE the PLA: while it is active the $01 banking bits do
 	// not matter for these ranges. I/O is deliberately left alone -- the boot
@@ -527,7 +534,10 @@ u8 CC64Memory::read8( scpu_addr_t addr )
 	// table at every configuration this emulator can reach.
 	if ( m_BootmapActive
 	     && ( ( a >= 0x8000 && a <= 0xCFFF ) || a >= 0xE000 ) )
+	{
+		noteFastHalfCycles( 6 );
 		return m_BootmapROM[ a ];
+	}
 
 	switch ( c64MapRead( a, m_BankMode ) )
 	{
@@ -544,6 +554,7 @@ u8 CC64Memory::read8( scpu_addr_t addr )
 		                   : m_Kernal[ a - 0xE000 ];
 
 	case REG_CHARROM:
+		noteBusAccess( a, false );
 		return m_CharROM[ a - 0xD000 ];
 
 	case REG_IO:
@@ -551,7 +562,11 @@ u8 CC64Memory::read8( scpu_addr_t addr )
 			// Registers that live inside the cartridge never reach the C64.
 			u8 v;
 			if ( m_IO && m_IO->ioRead( a, v ) )
+			{
+				if ( m_IO->ioAccessNeedsStretch( a, false ) )
+					noteBusAccess( a, false );
 				return v;
+			}
 
 			// Deliberately no flush here. Flushing before every I/O access
 			// meant a booting KERNAL -- which touches I/O constantly -- drove
@@ -563,7 +578,7 @@ u8 CC64Memory::read8( scpu_addr_t addr )
 			// points the VIC at it may show stale data for one frame. The real
 			// SuperCPU mirrors asynchronously and has the same property.
 			m_IOReads++;
-			noteBusAccess( a );
+			noteBusAccess( a, false );
 			v = m_C64 ? m_C64->read( a ) : 0xFF;
 			m_IOLog[ m_IOLogPos++ & 63 ] = (u32)a | ( (u32)v << 16 );
 			if ( ( a & 0xFE00 ) == 0xDC00 )
@@ -661,8 +676,15 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 		// The C64 stores the port registers' shadow in DRAM too, and code does
 		// read $00/$01 back through the VIC's eyes in a few places. Sink
 		// before store -- see IMirrorSink::onRamWrite.
-		if ( m_Mirror ) m_Mirror->onRamWrite( a, value );
+		if ( m_Mirror && m_Mirror->onRamWrite( a, value ) )
+			noteMirrorWrite();
 		m_RAM[ a ] = value;
+		return;
+	}
+
+	if ( dosExtensionMapsBank1( a ) )
+	{
+		m_ROMShadow[ a ] = value;
 		return;
 	}
 
@@ -670,6 +692,10 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 	{
 		if ( m_IO && m_IO->ioWrite( a, value ) )
 		{
+			if ( m_IO->ioAccessUsesWriteBuffer( a, true ) )
+				noteMirrorWrite();
+			else if ( m_IO->ioAccessNeedsStretch( a, true ) )
+				noteBusAccess( a, true );
 			// An explicit software speed selection ends the ADVISORY
 			// poll-slow immediately, even when the selection does not change
 			// the nominal speed (then no speed hook fires, so it must happen
@@ -761,7 +787,10 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 				m_C64 ? (u32)m_C64->hostCycles() : (u32)m_EmuCycles;
 			m_CIALog[ m_CIALogPos++ & 63 ] = (u32)a | ( (u32)value << 16 ) | ( 1u << 24 );
 		}
-		noteBusAccess( a );
+		if ( m_IO && m_IO->ioAccessUsesWriteBuffer( a, true ) )
+			noteMirrorWrite();
+		else
+			noteBusAccess( a, true );
 		if ( m_C64 ) m_C64->write( a, value );
 		return;
 	}
@@ -771,8 +800,8 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 	{
 		const u8 old = m_RAM[ a ];
 		m_RamWrites++;
-		if ( m_Mirror )
-			m_Mirror->onRamWrite( a, value );
+		if ( m_Mirror && m_Mirror->onRamWrite( a, value ) )
+			noteMirrorWrite();
 		m_RAM[ a ] = value;
 
 		// Active-screen sprite pointers go to the real bus immediately; see
@@ -801,20 +830,6 @@ void CC64Memory::setPacing( u64 hostCyclesPerSecond, u32 emulatedHz )
 	m_SelectedEmulatedHz = emulatedHz;
 	m_PacingCheckCycles = emulatedHz / 1000000u;
 	if ( m_PacingCheckCycles < 1 ) m_PacingCheckCycles = 1;
-
-	// Prefer the real clock for CIA deadlines when the bus has one; see
-	// m_CIAUseHostClock. A clock appearing or vanishing would change the
-	// units under an armed deadline, so re-arm those from scratch.
-	const u64 hostPerC64 = hostCyclesPerSecond / 1000000ULL;
-	const bool useHost = ( hostPerC64 != 0 );
-	if ( useHost != m_CIAUseHostClock )
-	{
-		m_CIAUseHostClock = useHost;
-		if ( m_CIA2TADeadline ) m_CIA2ArmPending |= 0x01;
-		if ( m_CIA2TBDeadline ) m_CIA2ArmPending |= 0x02;
-		m_CIA2TADeadline = m_CIA2TBDeadline = m_CIA2NMIDeadline = 0;
-	}
-	m_CIAHostPerC64 = hostPerC64;
 
 	// An explicit slow request supersedes any heuristic hold, so a later $D07B
 	// can restore turbo immediately rather than inheriting a 100ms tail.

@@ -52,9 +52,11 @@ void CSuperCPURegisters::reset()
 	// B/Z flags selecting $0200-$FFFF (zero page and stack excluded).
 	m_Optim         = 0xC7;
 	m_SIMMConfig    = 4;
+	if ( m_FastRAM ) m_FastRAM->setConfig( m_SIMMConfig );
 
 	for ( u32 i = 0; i < SCPU_SYSRAM_SIZE; i++ )  m_SysRAM[ i ]  = 0;
 	for ( u32 i = 0; i < SCPU_USERRAM_SIZE; i++ ) m_UserRAM[ i ] = 0;
+	for ( u32 i = 0; i < 0x400; i++ ) m_ColorRAM[ i ] = 0;
 
 	applyOptimisation();
 	applyBootmap();
@@ -126,6 +128,15 @@ void CSuperCPURegisters::applyOptimisation()
 
 bool CSuperCPURegisters::ioRead( u16 addr, u8 &value )
 {
+	// SuperCPU v2 caches colour RAM in its second 64K SRAM bank. Reads return
+	// the full byte written, not the physical colour chip's low nibble plus an
+	// open-bus high nibble, and do not incur a C64 I/O stretch.
+	if ( m_Version == SCPU_V2 && addr >= 0xD800 && addr <= 0xDBFF )
+	{
+		value = bank1Read( addr );
+		return true;
+	}
+
 	// $D200-$D3FF READS are always answered from the accelerator's RAM,
 	// whether or not the register bank is open. Only writes are gated -- see
 	// ioWrite, and VICE's scpu64_d200_read, which has no such condition.
@@ -146,13 +157,13 @@ bool CSuperCPURegisters::ioRead( u16 addr, u8 &value )
 			value = 0x00;
 			return true;
 		}
-		value = m_SysRAM[ addr - SCPU_SYSRAM_BASE ];
+		value = bank1Read( addr );
 		return true;
 	}
 
 	if ( addr >= SCPU_USERRAM_BASE && addr < SCPU_USERRAM_BASE + SCPU_USERRAM_SIZE )
 	{
-		value = m_UserRAM[ addr - SCPU_USERRAM_BASE ];
+		value = bank1Read( addr );
 		return true;
 	}
 
@@ -227,6 +238,22 @@ bool CSuperCPURegisters::ioRead( u16 addr, u8 &value )
 
 bool CSuperCPURegisters::ioWrite( u16 addr, u8 value )
 {
+	// RAMLink's two control strobes are observed by the SuperCPU glue while the
+	// write still continues to the cartridge I/O bus. They participate in the
+	// interrupt-vector reroute predicate and are used repeatedly by DOS 2.04.
+	if ( addr == 0xDF7E ) { m_RAMLink = true;  return false; }
+	if ( addr == 0xDF7F ) { m_RAMLink = false; return false; }
+
+	// On v2, writes to the ordinary on-board I/O devices are also captured in
+	// bank-1 SRAM. Colour RAM is the program-visible use: reads are served from
+	// this full-byte cache. The write still returns false below so the physical
+	// chip receives its low nibble. $D200/$D3xx have their own gated path.
+	if ( m_Version == SCPU_V2
+	     && ( ( addr >= 0xD000 && addr <= 0xD1FF )
+	       || ( addr >= 0xD400 && addr <= 0xD5FF )
+	       || ( addr >= 0xD800 && addr <= 0xDDFF ) ) )
+		bank1Write( addr, value );
+
 	// $D200-$D3FF is WRITE-PROTECTED while the register bank is closed, though
 	// it always reads back. VICE's scpu64_d200_store/scpu64_d300_store gate on
 	// mem_reg_hwenable, with $D27E the single exception.
@@ -240,14 +267,14 @@ bool CSuperCPURegisters::ioWrite( u16 addr, u8 value )
 	if ( addr >= SCPU_SYSRAM_BASE && addr < SCPU_SYSRAM_BASE + SCPU_SYSRAM_SIZE )
 	{
 		if ( m_HWRegsEnabled || addr == SCPU_SYSRAM_ALWAYS_WRITABLE )
-			m_SysRAM[ addr - SCPU_SYSRAM_BASE ] = value;
+			bank1Write( addr, value );
 		return true;
 	}
 
 	if ( addr >= SCPU_USERRAM_BASE && addr < SCPU_USERRAM_BASE + SCPU_USERRAM_SIZE )
 	{
 		if ( m_HWRegsEnabled )
-			m_UserRAM[ addr - SCPU_USERRAM_BASE ] = value;
+			bank1Write( addr, value );
 		return true;
 	}
 
@@ -292,7 +319,10 @@ bool CSuperCPURegisters::ioWrite( u16 addr, u8 value )
 
 	case SCPU_REG_SIMM_CONFIG:
 		if ( m_HWRegsEnabled )
+		{
 			m_SIMMConfig = value;
+			if ( m_FastRAM ) m_FastRAM->setConfig( value );
+		}
 		break;
 
 	case SCPU_REG_D071:

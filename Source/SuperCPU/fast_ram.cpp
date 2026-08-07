@@ -28,7 +28,8 @@
 #endif
 
 CFastRAM::CFastRAM()
-	: m_RAM( 0 ), m_Size( 0 ), m_Mask( 0 )
+	: m_RAM( 0 ), m_Size( 0 ), m_Mask( 0 ), m_DecodeMask( 0 ),
+	  m_RowMask( ~( 8192u - 1 ) ), m_LastCell( 0 ), m_Config( 4 )
 {
 }
 
@@ -47,6 +48,7 @@ bool CFastRAM::init( u32 megabytes )
 	}
 	m_Size = 0;
 	m_Mask = 0;
+	m_DecodeMask = 0;
 
 	// Round down to a size the hardware would actually accept.
 	u32 mb;
@@ -68,5 +70,51 @@ bool CFastRAM::init( u32 megabytes )
 
 	m_Size = bytes;
 	m_Mask = bytes - 1;		// every accepted size is a power of two
+	setConfig( 4 );
 	return true;
+}
+
+void CFastRAM::setConfig( u8 value )
+{
+	m_Config = value;
+	u32 configuredBytes;
+	u32 rowBytes;
+	switch ( value & 7 )
+	{
+	case 0: configuredBytes =  1u << 20; rowBytes = 2048; break;
+	case 1: configuredBytes =  4u << 20; rowBytes = 4096; break;
+	case 2: configuredBytes =  8u << 20; rowBytes = 4096; break;
+	case 3: configuredBytes = 16u << 20; rowBytes = 4096; break;
+	default: configuredBytes = 16u << 20; rowBytes = 8192; break;
+	}
+	const u32 decoded = ( m_Size && m_Size < configuredBytes ) ? m_Size : configuredBytes;
+	m_DecodeMask = decoded ? decoded - 1 : 0;
+	m_RowMask = ~( rowBytes - 1 );
+	m_LastCell = 0;
+}
+
+u32 CFastRAM::accessPenaltyHalfCycles( u32 offset, bool write )
+{
+	if ( !m_Size ) return 0;
+	const u32 addr = offset & m_DecodeMask;
+	if ( write )
+	{
+		const u32 cost = ( ( m_LastCell ^ addr ) & m_RowMask ) ? 4 : 2;
+		m_LastCell = addr;
+		return cost;
+	}
+	if ( !( ( m_LastCell ^ addr ) & ~3u ) )
+		return 0;
+	if ( ( m_LastCell ^ addr ) & m_RowMask )
+	{
+		m_LastCell = addr;
+		return 5;
+	}
+	if ( !( ( ( m_LastCell + 4 ) ^ addr ) & ~3u ) )
+	{
+		m_LastCell = addr;
+		return 0;
+	}
+	m_LastCell = addr;
+	return 2;
 }

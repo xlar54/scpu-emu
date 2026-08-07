@@ -9,7 +9,7 @@
    cycle count and the opcode table cannot drift apart.
 
    The full derivation of everything here, including what is measured and what
-   is still open, is in Docs/research/65816-reference.md.
+   is still open, is in Docs/SuperCPU64/65816-reference.md.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -198,14 +198,6 @@ void CW65C816::opBIT( u16 v, bool immediate )
 
 void CW65C816::serviceInterrupt( u32 vectorNative, u32 vectorEmu, bool isBRKorCOP )
 {
-	// A HARDWARE interrupt closes the accelerator's register bank before the
-	// handler runs. BRK and COP are instructions, not interrupts, and leave it
-	// alone. See CSuperCPURegisters::onInterruptAcknowledged for why the
-	// hardware must behave this way -- the short version is that the KS image's
-	// own IRQ vector points into a hole in the KS image.
-	if ( !isBRKorCOP && m_FastBus )
-		m_FastBus->notifyInterruptAcknowledged();
-
 	// Interrupts and COP use the "old" stack class, so they stay inside page 1
 	// in emulation mode.
 	if ( m_E )
@@ -312,13 +304,8 @@ __attribute__((always_inline)) inline void CW65C816::znE( u8 v )
 	          | ( v == 0 ? W65_Z : 0 ) | ( v & 0x80 ) );
 }
 
-__attribute__((always_inline)) inline u32 CW65C816::emuDoneE( u8 opcode )
+__attribute__((always_inline)) inline u32 CW65C816::emuDoneE( u32 used )
 {
-	// m8/x8/e are constant-true here, so the inline reference function
-	// constant-folds to the same counts the packed table holds for this key.
-	const u32 used = w65c816Cycles( opcode, true, true, true,
-	                                ( m_D & 0xFF ) != 0,
-	                                m_PageCross, m_BranchTaken );
 	m_Cycles += used;
 	return used;
 }
@@ -378,9 +365,8 @@ u32 CW65C816::stepInner()
 		m_Cycles += c;
 		return c;
 	}
-
 	if ( m_NMIPending && m_DeferNativeNMI && !m_E )
-		m_NMIsDeferred++;		// held for the next emulation-mode boundary
+		m_NMIsDeferred++;
 
 	// WAI parks the processor until an interrupt appears. It resumes even when
 	// the interrupt is masked -- and that second exit is the whole point of the
@@ -411,10 +397,6 @@ u32 CW65C816::stepInner()
 	// widths mid-instruction, but their own cycle counts are the ones for the
 	// state they started in -- so the epilogue indexes the table with this
 	// LOCAL, never the live member.
-	m_PageCross = false;
-	m_BranchTaken = false;
-	m_EABank0 = false;
-
 	const u8 opcode = fetch8();
 
 	// --- emulation-mode fast path ---------------------------------------
@@ -437,20 +419,20 @@ u32 CW65C816::stepInner()
 		case 0xA9:	// LDA #
 		{
 			const u8 n = f8E(); setA( n ); znE( n );
-			return emuDoneE( opcode );
+			return emuDoneE( 2 );
 		}
 		case 0xA5:	// LDA dp
 		{
 			const u32 a = (u32)( (u16)( f8E() + m_D ) );
 			const u8 n = rd8E( a ); setA( n ); znE( n );
-			return emuDoneE( opcode );
+			return emuDoneE( 3 + ( ( m_D & 0xFF ) != 0 ) );
 		}
 		case 0xAD:	// LDA abs
 		{
 			const u8 lo = f8E(); const u8 hi = f8E();
 			const u8 n = rd8E( ( (u32)m_DBR << 16 ) | lo | ( (u16)hi << 8 ) );
 			setA( n ); znE( n );
-			return emuDoneE( opcode );
+			return emuDoneE( 4 );
 		}
 		case 0xBD:	// LDA abs,X   -- mirrors eaAbsoluteIndexed
 		case 0xB9:	// LDA abs,Y
@@ -458,77 +440,75 @@ u32 CW65C816::stepInner()
 			const u8 lo = f8E(); const u8 hi = f8E();
 			const u16 base = (u16)( lo | ( (u16)hi << 8 ) );
 			const u16 idx = ( opcode == 0xBD ) ? m_X : m_Y;
-			if ( ( base ^ (u16)( base + idx ) ) & 0xFF00 ) m_PageCross = true;
+			const bool crossed = ( ( base ^ (u16)( base + idx ) ) & 0xFF00 ) != 0;
 			const u8 n = rd8E( ( ( ( (u32)m_DBR << 16 ) | base ) + idx ) & SCPU_ADDR_MASK );
 			setA( n ); znE( n );
-			return emuDoneE( opcode );
+			return emuDoneE( 4 + crossed );
 		}
 		case 0xA2:	// LDX #
 		{
 			m_X = f8E(); znE( (u8)m_X );
-			return emuDoneE( opcode );
+			return emuDoneE( 2 );
 		}
 		case 0xA0:	// LDY #
 		{
 			m_Y = f8E(); znE( (u8)m_Y );
-			return emuDoneE( opcode );
+			return emuDoneE( 2 );
 		}
 		case 0x85:	// STA dp
 		{
 			const u32 a = (u32)( (u16)( f8E() + m_D ) );
 			wr8E( a, getA() );
-			return emuDoneE( opcode );
+			return emuDoneE( 3 + ( ( m_D & 0xFF ) != 0 ) );
 		}
 		case 0x8D:	// STA abs
 		{
 			const u8 lo = f8E(); const u8 hi = f8E();
 			wr8E( ( (u32)m_DBR << 16 ) | lo | ( (u16)hi << 8 ), getA() );
-			return emuDoneE( opcode );
+			return emuDoneE( 4 );
 		}
 		case 0x49:	// EOR #
 		{
 			const u8 n = (u8)( getA() ^ f8E() ); setA( n ); znE( n );
-			return emuDoneE( opcode );
+			return emuDoneE( 2 );
 		}
 		case 0x29:	// AND #
 		{
 			const u8 n = (u8)( getA() & f8E() ); setA( n ); znE( n );
-			return emuDoneE( opcode );
+			return emuDoneE( 2 );
 		}
 		case 0x09:	// ORA #
 		{
 			const u8 n = (u8)( getA() | f8E() ); setA( n ); znE( n );
-			return emuDoneE( opcode );
+			return emuDoneE( 2 );
 		}
 		case 0xC9:	// CMP #  -- mirrors opCMP(getAcc(), imm, true)
 		{
 			const u8 n = f8E(); const u8 a = getA();
 			m_P = (u8)( ( m_P & (u8)~W65_C ) | ( a >= n ? W65_C : 0 ) );
 			znE( (u8)( a - n ) );
-			return emuDoneE( opcode );
+			return emuDoneE( 2 );
 		}
-		case 0xE8: m_X = (u8)( m_X + 1 ); znE( (u8)m_X ); return emuDoneE( opcode );	// INX
-		case 0xCA: m_X = (u8)( m_X - 1 ); znE( (u8)m_X ); return emuDoneE( opcode );	// DEX
-		case 0xC8: m_Y = (u8)( m_Y + 1 ); znE( (u8)m_Y ); return emuDoneE( opcode );	// INY
-		case 0x88: m_Y = (u8)( m_Y - 1 ); znE( (u8)m_Y ); return emuDoneE( opcode );	// DEY
+		case 0xE8: m_X = (u8)( m_X + 1 ); znE( (u8)m_X ); return emuDoneE( 2 );	// INX
+		case 0xCA: m_X = (u8)( m_X - 1 ); znE( (u8)m_X ); return emuDoneE( 2 );	// DEX
+		case 0xC8: m_Y = (u8)( m_Y + 1 ); znE( (u8)m_Y ); return emuDoneE( 2 );	// INY
+		case 0x88: m_Y = (u8)( m_Y - 1 ); znE( (u8)m_Y ); return emuDoneE( 2 );	// DEY
 		case 0x10: case 0x30: case 0x90: case 0xB0: case 0xD0: case 0xF0:
 		{
-			// Mirrors W65_BRANCH exactly: the page cross is recorded before
-			// the condition is tested.
 			static const u8 flagSel[ 4 ] = { W65_N, W65_V, W65_C, W65_Z };
 			const s8 disp = (s8)f8E();
 			const u16 target = (u16)( m_PC + disp );
-			if ( ( m_PC ^ target ) & 0xFF00 ) m_PageCross = true;
+			const bool crossed = ( ( m_PC ^ target ) & 0xFF00 ) != 0;
 			const bool cond = ( ( m_P & flagSel[ opcode >> 6 ] ) != 0 )
 			               == ( ( opcode & 0x20 ) != 0 );
-			if ( cond ) { m_BranchTaken = true; m_PC = target; }
-			return emuDoneE( opcode );
+			if ( cond ) m_PC = target;
+			return emuDoneE( 2 + ( cond ? 1 + crossed : 0 ) );
 		}
 		case 0x4C:	// JMP abs
 		{
 			const u8 lo = f8E(); const u8 hi = f8E();
 			m_PC = (u16)( lo | ( (u16)hi << 8 ) );
-			return emuDoneE( opcode );
+			return emuDoneE( 3 );
 		}
 		case 0x20:	// JSR abs -- "old" stack, PC-1 pushed high byte first
 		{
@@ -537,19 +517,25 @@ u32 CW65C816::stepInner()
 			pushE8( (u8)( ret >> 8 ) );
 			pushE8( (u8)( ret & 0xFF ) );
 			m_PC = (u16)( lo | ( (u16)hi << 8 ) );
-			return emuDoneE( opcode );
+			return emuDoneE( 6 );
 		}
 		case 0x60:	// RTS -- low byte pulled first
 		{
 			const u8 lo = pullE8(); const u8 hi = pullE8();
 			m_PC = (u16)( ( lo | ( (u16)hi << 8 ) ) + 1 );
-			return emuDoneE( opcode );
+			return emuDoneE( 6 );
 		}
-		case 0x18: m_P = (u8)( m_P & ~W65_C ); return emuDoneE( opcode );	// CLC
-		case 0x38: m_P |= W65_C;               return emuDoneE( opcode );	// SEC
+		case 0x18: m_P = (u8)( m_P & ~W65_C ); return emuDoneE( 2 );	// CLC
+		case 0x38: m_P |= W65_C;               return emuDoneE( 2 );	// SEC
 		default: break;	// fall to the generic switch, opcode in hand
 		}
 	}
+
+	// Only the generic path consumes these scratch fields. Fast E-mode opcodes
+	// use locals and avoid three stores plus the generic cycle epilogue.
+	m_PageCross = false;
+	m_BranchTaken = false;
+	m_EABank0 = false;
 
 	// Captured before dispatch: REP, SEP, PLP, RTI and XCE change the register
 	// widths mid-instruction, but their own cycle counts are the ones for the
@@ -989,11 +975,6 @@ u32 CW65C816::stepInner()
 		// RTI restores m and x from the stacked P -- and can therefore zero XH
 		// and YH -- but it never restores E.
 		applyE();
-		// The accelerator restores its register-bank state here, closing the
-		// loop opened in serviceInterrupt. A stray RTI used as a jump is safe:
-		// the restore is depth-guarded on the accelerator side.
-		if ( m_FastBus )
-			m_FastBus->notifyInterruptReturned();
 		break;
 
 	// --- branches ----------------------------------------------------------

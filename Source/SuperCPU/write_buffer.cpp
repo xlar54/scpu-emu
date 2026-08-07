@@ -136,7 +136,7 @@ bool CWriteBuffer::shouldMirror( u16 addr ) const
 	return ( addr >= m_RangeLo && addr <= m_RangeHi );
 }
 
-void CWriteBuffer::onRamWrite( u16 addr, u8 value )
+bool CWriteBuffer::onRamWrite( u16 addr, u8 value )
 {
 	// Under-I/O shape relocation, when armed. A write into a relocated
 	// $D000-$DFFF block is forwarded to the block's deliverable copy; a
@@ -162,7 +162,7 @@ void CWriteBuffer::onRamWrite( u16 addr, u8 value )
 		{
 			m_RelocShielded++;
 			m_Synced[ addr >> 6 ] &= ~( 1ULL << ( addr & 63 ) );
-			return;
+			return false;
 		}
 	}
 
@@ -178,7 +178,7 @@ void CWriteBuffer::onRamWrite( u16 addr, u8 value )
 		// shapes at $0200-$03FF during init exactly that way, and its balls
 		// stayed garbage on the real screen while the shadow was perfect.
 		m_Synced[ addr >> 6 ] &= ~( 1ULL << ( addr & 63 ) );
-		return;
+		return false;
 	}
 
 	// The caller stores AFTER this sink runs, so m_RAM still holds what real
@@ -195,7 +195,7 @@ void CWriteBuffer::onRamWrite( u16 addr, u8 value )
 		     && ( m_Synced[ w ] & bit ) )
 		{
 			m_WritesEliminated++;
-			return;
+			return false;
 		}
 	}
 
@@ -213,7 +213,7 @@ void CWriteBuffer::onRamWrite( u16 addr, u8 value )
 		if ( isPotentialVICSpritePointer( addr ) )
 			moveDirtyToTail( addr );
 		m_WritesCoalesced++;
-		return;
+		return true;
 	}
 
 	setDirty( addr );
@@ -225,6 +225,7 @@ void CWriteBuffer::onRamWrite( u16 addr, u8 value )
 		m_List[ ( m_Head + m_Count ) & ( SCPU_WRITEBUF_CAPACITY - 1 ) ] = addr;
 		m_Count++;
 	}
+	return true;
 }
 
 void CWriteBuffer::invalidateRange( u16 addr, u32 length )

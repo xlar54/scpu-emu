@@ -91,11 +91,11 @@ public:
 	// data. Bus safety is not the issue -- the burst path yields to the VIC on
 	// BA, exactly as a real REU does.
 	//
-	// The default keeps latency sub-slice (~9 drains/frame at up to 1KB each,
-	// plus free border delivery). 0 restores strict border-only mirroring as
-	// the escape hatch. Sprite pointers of the active screen bypass this queue
-	// entirely -- see CC64Memory::writeFast -- because a late pointer flip
-	// makes the physical VIC display the block the game is already redrawing.
+	// The scheduler spreads the historical eight-drain allowance across 128
+	// points per frame. Thus the default 1024 becomes ~64 bytes per opportunity
+	// and ~8KB/frame: similar throughput without millisecond CPU stalls. 0
+	// restores border-only mirroring. Sprite pointers of the active screen
+	// bypass this queue entirely -- see CC64Memory::writeFast.
 	void setMirrorDisplayBudget( u32 bytes ) { m_MirrorDisplayBudget = bytes; }
 
 	// Diagnostic kill switch: when set, runFrame stops ALL mirror bus traffic
@@ -116,9 +116,6 @@ public:
 		m_Memory.m_NMIRetimeEnable = e;
 		m_Memory.cia2RecomputeNMIState();
 	}
-
-	// Hold NMIs back while the 65816 is in native mode (NMI_NATIVE_DEFER);
-	// see CW65C816::m_DeferNativeNMI for why no real machine takes one.
 	void setDeferNativeNMI( bool e ) { m_Core65816.m_DeferNativeNMI = e; }
 
 	// Interrupt vector reroute into the accelerator EPROM (VECTOR_REROUTE);
@@ -128,6 +125,7 @@ public:
 	// Charge C64-bus accesses their real cost (IO_STRETCH); see
 	// CC64Memory::tickFast.
 	void setIOStretch( bool e ) { m_Memory.m_IOStretchEnable = e; }
+	void setMirrorStretch( bool e ) { m_Memory.m_MirrorStretchEnable = e; }
 	u32  mirrorDisplayBudget() const         { return m_MirrorDisplayBudget; }
 
 	void reset();
@@ -195,6 +193,10 @@ private:
 	bool     m_BootmapEnabled;
 	u32      m_MirrorDisplayBudget;
 	bool     m_MirrorHalted = false;
+	// runFrame() may advance the CPU to reach the physical VIC border before
+	// draining mirrors. Those cycles belong to the following frame; carrying
+	// them here prevents the border phase from becoming a variable turbo boost.
+	u64      m_FrameTickDebt = 0;
 	u32      m_BenchArmPerEmuCycle = 0;
 
 	void benchmark65816();

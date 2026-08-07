@@ -211,28 +211,13 @@ public:
 	u64 m_NativeInstructions;
 	u64 m_IRQsTaken = 0;
 	u64 m_NMIsTaken = 0;
-	u64 m_NMIsDeferred = 0;		// native-mode dispatches held back; see below
-
-	// Hold an NMI back while the processor is in NATIVE mode, releasing it at
-	// the first emulation-mode instruction boundary.
-	//
-	// A native NMI vectors through $00FFEA, and on a SuperCPU that address is
-	// whatever the accelerator's KERNAL window or the program's own code
-	// happens to hold -- neither CMD KERNAL image carries a native vector
-	// table there (both have the C64 jump table), and the EPROM's rerouted
-	// trampoline expects a handler at $00C003 that nothing installs. Winter
-	// Games /SCPU is the proof: its loader keeps 65816 windows whose bytes
-	// OVERLAP $FFE4-$FFEF, and all three candidate targets ($9B4C from the
-	// KERNAL image, $A930 from its own code, $00C003 from the EPROM
-	// trampoline) are garbage or zero. A native NMI there cannot survive on
-	// any real machine either -- so a real machine never takes one, and the
-	// interrupt we synthesise at the physically correct moment must not be
-	// the first ever to do so.
-	//
-	// Deferring is an approximation, not fidelity: a program with a genuine
-	// native-mode NMI handler would see its interrupt late. Config-gated
-	// (NMI_NATIVE_DEFER) so that case has an escape hatch.
+	u64 m_NMIsDeferred = 0;
+	// Compatibility option for software whose short native-mode windows are
+	// timed around a CIA2 NMI. Hardware testing shows Winter Games needs the
+	// pending edge released on return to emulation mode even with EPROM vector
+	// rerouting enabled. This remains an approximation and is config-gated.
 	bool m_DeferNativeNMI = false;
+
 	// Emu-cycle stamp of the most recent NMI dispatch, for the stall
 	// dump's delivery forensics.
 	u64      m_LastNMITakeCycles = 0;
@@ -385,7 +370,7 @@ private:
 	inline void pushE8( u8 v );
 	inline u8   pullE8();
 	inline void znE( u8 v );
-	inline u32  emuDoneE( u8 opcode );
+	inline u32  emuDoneE( u32 used );
 	void opBIT( u16 v, bool immediate );
 
 	// --- interrupts -------------------------------------------------------

@@ -29,7 +29,7 @@
 #define _config_h
 
 
-#define TIMING_NAMES 34
+#define TIMING_NAMES 35
 const char timingNames[TIMING_NAMES][32] = {
 	"WAIT_FOR_SIGNALS", 
 	"WAIT_CYCLE_READ", 
@@ -95,12 +95,6 @@ const char timingNames[TIMING_NAMES][32] = {
 	// native-mode windows; sampling slack landed one inside and the machine
 	// BRK-stormed through the KERNAL's accidental $6C03 vector.
 	"NMI_RETIME",
-	// Not a timing: hold an NMI back while the 65816 is in NATIVE mode and
-	// release it at the next emulation-mode instruction. A native NMI
-	// vectors through $00FFEA, where neither CMD KERNAL image carries a
-	// native vector table and where a 65816 program may have its own code;
-	// no real machine survives one, so none takes one.
-	"NMI_NATIVE_DEFER",
 	// Not a timing: fetch interrupt vectors from the accelerator's own EPROM
 	// ($F80000+vector) when it is acting as an accelerator, as a real
 	// SuperCPU does and VICE models (scpu64_interrupt_reroute).
@@ -108,7 +102,14 @@ const char timingNames[TIMING_NAMES][32] = {
 	// Not a timing: charge a C64-bus access a whole C64 cycle, the way a real
 	// SuperCPU pays for one. Without it, I/O-bound code runs several times
 	// too fast in emulated time. See CC64Memory::tickFast.
-	"IO_STRETCH"
+	"IO_STRETCH",
+	// Compatibility: hold CIA2 NMIs across short native-mode windows. See
+	// CW65C816::m_DeferNativeNMI and the hardware note in default.cfg.
+	"NMI_NATIVE_DEFER",
+	// Model the real card's one-deep mirrored-write buffer in emulated time.
+	// Off by default on RAD because physical deferred delivery already consumes
+	// that time and charging it here too causes visible scheduler starvation.
+	"MIRROR_STRETCH"
 };
 
 // Which CPU core boot.cpp should install. Set from CPU_CORE in the config file;
@@ -158,14 +159,13 @@ extern int cfgHeartbeat;
 // CIA2 timer NMI retiming; see NMI_RETIME in the names table. Default on.
 extern int cfgNMIRetime;
 
-// Native-mode NMI deferral; see NMI_NATIVE_DEFER in the names table.
-extern int cfgNMINativeDefer;
-
 // Interrupt vector reroute; see VECTOR_REROUTE in the names table.
 extern int cfgVectorReroute;
 
 // C64-bus access cost; see IO_STRETCH in the names table. Default on.
 extern int cfgIOStretch;
+extern int cfgNMINativeDefer;
+extern int cfgMirrorStretch;
 
 #define SCPU_CFG_MIRROR_DISPLAY_DEFAULT 1024
 

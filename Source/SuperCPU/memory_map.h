@@ -109,7 +109,10 @@ public:
 		if ( addr < 0x020000 )
 		{
 			m_FastAccesses++;
-			return m_Bank1[ addr - 0x010000 ];
+			const u16 offset = (u16)addr;
+			if ( __builtin_expect( offset < 2, 0 ) )
+				return readBank1Port( offset );
+			return m_Bank1[ offset ];
 		}
 		return readAbove( addr );
 	}
@@ -126,7 +129,13 @@ public:
 		if ( addr < 0x020000 )
 		{
 			m_FastAccesses++;
-			m_Bank1[ addr - 0x010000 ] = value;
+			const u16 offset = (u16)addr;
+			if ( __builtin_expect( offset < 2, 0 ) )
+			{
+				writeBank1Port( offset, value );
+				return;
+			}
+			m_Bank1[ offset ] = value;
 			return;
 		}
 		writeAbove( addr, value );
@@ -149,14 +158,6 @@ public:
 	// slow mode; the latter may be in a serial wait even after the activity
 	// timer has expired.
 	bool fineTicksRequired() const { return m_Bank0 && m_Bank0->fineTicksRequired(); }
-	void notifyInterruptAcknowledged()
-	{
-		if ( m_Bank0 ) m_Bank0->notifyInterruptAcknowledged();
-	}
-	void notifyInterruptReturned()
-	{
-		if ( m_Bank0 ) m_Bank0->notifyInterruptReturned();
-	}
 	bool nmiAsserted() override { return m_Bank0 ? m_Bank0->nmiFast() : false; }
 	void tick( u32 nCycles ) override { if ( m_Bank0 ) m_Bank0->tickFast( nCycles ); }
 
@@ -169,6 +170,13 @@ public:
 	u64 m_FastAccesses;
 
 private:
+	// Bank 1's first two bytes alias the C64 CPU port. Keep that hardware
+	// exception out of the always-inlined common accessor: inlining readFast /
+	// writeFast here replicated the entire bank-0 path through many opcode
+	// handlers even though ordinary bank-1 code never touches those bytes.
+	__attribute__((noinline, cold)) u8 readBank1Port( u16 offset );
+	__attribute__((noinline, cold)) void writeBank1Port( u16 offset, u8 value );
+
 	CC64Memory *m_Bank0;
 	CFastRAM   *m_SIMM;
 	const u8   *m_ROM;

@@ -49,6 +49,8 @@ bool CSuperCPU::init( IC64Bus *bus, SCPUCoreType core, u32 simmMB )
 	m_MemoryMap.attachBank0( &m_Memory );
 	m_MemoryMap.attachFastRAM( &m_FastRAM );
 	m_Registers.attach( &m_WriteBuffer );
+	m_Registers.attachBank1( m_MemoryMap.m_Bank1 );
+	m_Registers.attachFastRAM( &m_FastRAM );
 	// $D0B0 on an SCPU64 reports only the hardware revision; the 64-vs-128
 	// distinction belongs to the SuperCPU 128's own register set, which we do
 	// not emulate yet. The detected machine type is still used elsewhere for
@@ -110,7 +112,7 @@ bool CSuperCPU::init( IC64Bus *bus, SCPUCoreType core, u32 simmMB )
 	// The flag stays as a knob for one open hardware question: whether the
 	// SuperCPU's gate array forwards a cycle with VDA and VPA both low. If
 	// raster interrupts ever misbehave in a way that points here, this is the
-	// first thing to flip. See Docs/research/65816-reference.md section 6 and U2.
+	// first thing to flip. See Docs/SuperCPU64/65816-reference.md section 6 and U2.
 
 	// Measure the interpreter before pacing is armed at a real rate --
 	// reset() below re-seeds bank 1 over the top of the benchmark loop.
@@ -149,6 +151,7 @@ void CSuperCPU::reset()
 	// now would be an unbounded burst at an arbitrary raster position, followed
 	// immediately by clearing the shadow anyway.
 	m_WriteBuffer.discard();
+	m_FrameTickDebt = 0;
 	m_Memory.reset();
 
 	// Bootmap, before the registers are reset -- CSuperCPURegisters::reset()
@@ -338,14 +341,15 @@ static bool c64LineInSpriteFetchSpan( const u8 *vic, u16 line )
 
 static void flushMirrorsRasterAware( CWriteBuffer &buffer, IC64Bus &bus,
                                      const C64Signals &sig, u32 displayBudget,
-                                     const u8 *vicShadow )
+                                     u32 transferBudget, const u8 *vicShadow )
 {
 	const u32 perLine  = c64CyclesPerLine( sig.video );
 	const u32 lines    = c64RasterLines( sig.video );
 	const u32 maxChunk = 64;
 	u32 displayLeft = displayBudget;
+	u32 transferLeft = transferBudget;
 
-	while ( !buffer.empty() )
+	while ( !buffer.empty() && transferLeft != 0 )
 	{
 		const u16 line = bus.rasterLine();
 		u32 budgetBytes;
@@ -359,6 +363,7 @@ static void flushMirrorsRasterAware( CWriteBuffer &buffer, IC64Bus &bus,
 			                    ? ( lines - line ) + c64DisplayFirstLine( sig.video )
 			                    : c64DisplayFirstLine( sig.video ) - line;
 			budgetBytes = ( linesLeft * perLine * 3 ) / 4;
+			if ( budgetBytes > transferLeft ) budgetBytes = transferLeft;
 		}
 		else if ( line < lines && displayLeft != 0
 		          && !c64LineInSpriteFetchSpan( vicShadow, line ) )
@@ -369,7 +374,7 @@ static void flushMirrorsRasterAware( CWriteBuffer &buffer, IC64Bus &bus,
 			// keeps delivering regardless, because parked multiplexer
 			// sprites would otherwise starve it permanently.
 			inDisplay = true;
-			budgetBytes = displayLeft;
+			budgetBytes = displayLeft < transferLeft ? displayLeft : transferLeft;
 		}
 		else
 		{
@@ -395,6 +400,8 @@ static void flushMirrorsRasterAware( CWriteBuffer &buffer, IC64Bus &bus,
 			const u32 sent = before - after;
 			displayLeft = ( displayLeft > sent ) ? ( displayLeft - sent ) : 0;
 		}
+		const u32 sent = before - after;
+		transferLeft = ( transferLeft > sent ) ? ( transferLeft - sent ) : 0;
 	}
 }
 
@@ -415,7 +422,15 @@ u64 CSuperCPU::runFrame()
 	// current instruction, allowing the remainder to be recalculated instead
 	// of finishing a turbo-sized frame budget at 1MHz.
 	const u64 frameTicks = c64CyclesPerFrame * ( SCPU_TURBO_HZ / SCPU_NORMAL_HZ );
-	u64 ticksUsed = 0;
+	// The previous call may have run ahead to meet the physical VIC's border.
+	// Repay that work before granting this frame any new CPU time. Without this
+	// accounting the amount of extra execution depended on the sampled raster,
+	// making games randomly speed up and slow down as the two frame phases
+	// drifted past one another.
+	const u64 repaid = m_FrameTickDebt < frameTicks
+	                 ? m_FrameTickDebt : frameTicks;
+	u64 ticksUsed = repaid;
+	m_FrameTickDebt -= repaid;
 	u64 executed = 0;
 
 	// The frame is run in slices rather than one call, for two reasons. A
@@ -424,11 +439,22 @@ u64 CSuperCPU::runFrame()
 	// the machine falls behind real time, frame boundaries drift out of phase
 	// with the real raster, and a flush attempted only at the boundary lands in
 	// the safe border window by luck -- roughly a third of the time. Screen
-	// writes then reach the C64 in visible ~quarter-second bursts. Eight
-	// chances per frame instead of one makes hitting the border a near
-	// certainty. Once a safe window is found, the helper below rechecks the
-	// raster between every small transfer chunk.
-	const u64 sliceTicks = frameTicks / 8;
+	// writes then reach the C64 in visible ~quarter-second bursts. Frequent,
+	// short opportunities also matter on real hardware: a 1024-byte drain
+	// stalls the emulated CPU for about 1ms while the physical raster continues,
+	// followed by a catch-up sprint. That stop/go cadence jerks scrolling and
+	// can make a raster split restore its display mode late. Spread the same
+	// historical eight-drain allowance over 128 points instead: the default
+	// 1024 setting becomes 64 bytes (~64us) per opportunity and still delivers
+	// roughly 8KB/frame.
+	static const u32 frameSlices = 128;
+	const u64 sliceTicks = frameTicks / frameSlices;
+	const u32 displayPerOpportunity = ( m_MirrorDisplayBudget + 15 ) / 16;
+	// Border-only mode still needs a finite installment. Unlimited border
+	// drains merely move the same millisecond pause outside the picture while
+	// raster-timed CPU code remains stopped.
+	const u32 transferPerOpportunity = displayPerOpportunity
+	                                 ? displayPerOpportunity : 64;
 
 	while ( ticksUsed < frameTicks )
 	{
@@ -464,7 +490,8 @@ u64 CSuperCPU::runFrame()
 		if ( !m_MirrorHalted && !m_Memory.iecBusActive()
 		     && !m_WriteBuffer.empty() && ticksUsed < frameTicks )
 			flushMirrorsRasterAware( m_WriteBuffer, *m_Bus, sig,
-			                         m_MirrorDisplayBudget,
+			                         displayPerOpportunity,
+			                         transferPerOpportunity,
 			                         m_Memory.m_VICRegShadow );
 	}
 
@@ -505,19 +532,23 @@ u64 CSuperCPU::runFrame()
 			const u32 ticksPerCycle = SCPU_TURBO_HZ / clockHz;
 			const u64 ran = m_CPU->run( approachTicks / ticksPerCycle );
 			executed += ran;
+			m_FrameTickDebt += ran * ticksPerCycle;
 		}
 
 		// Re-check the serial bus: the approach run may have started one.
 		if ( !m_MirrorHalted && !m_Memory.iecBusActive() )
 		{
 			flushMirrorsRasterAware( m_WriteBuffer, *m_Bus, sig,
-			                         m_MirrorDisplayBudget,
+			                         displayPerOpportunity,
+			                         transferPerOpportunity,
 			                         m_Memory.m_VICRegShadow );
 
 			// Spare border time goes to convergence: re-deliver a slice of
 			// clean shadow so real DRAM provably approaches shadow no matter
 			// what made them differ (boot-era policy skips, mode switches,
-			// a glitched burst). 512 bytes/frame laps the full 64K in ~2s.
+			// a glitched burst). Keep this to one normal installment too: the old
+			// 512-byte sweep was an otherwise unexplained half-millisecond CPU
+			// pause whenever the ordinary queue happened to empty.
 			if ( m_WriteBuffer.empty() )
 			{
 				const u16 line = m_Bus->rasterLine();
@@ -528,7 +559,7 @@ u64 CSuperCPU::runFrame()
 					                    ? ( lines - line ) + c64DisplayFirstLine( sig.video )
 					                    : c64DisplayFirstLine( sig.video ) - line;
 					if ( linesLeft >= 12 )
-						m_WriteBuffer.resyncSweep( 512 );
+						m_WriteBuffer.resyncSweep( transferPerOpportunity );
 				}
 			}
 		}

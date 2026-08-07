@@ -51,6 +51,9 @@ public:
 	u32  sizeBytes() const { return m_Size; }
 	u32  sizeMB() const    { return m_Size >> 20; }
 	bool present() const   { return m_Size != 0; }
+	void setConfig( u8 value );
+	u8   config() const { return m_Config; }
+	u32  accessPenaltyHalfCycles( u32 offset, bool write );
 
 	// Reads and writes are masked into range rather than bounds-checked and
 	// rejected. A real SIMM decodes a fixed number of address lines, so an
@@ -58,12 +61,12 @@ public:
 	// probes for size relies on exactly that behaviour.
 	inline u8 read( u32 offset ) const
 	{
-		return m_Size ? m_RAM[ offset & m_Mask ] : 0x00;
+		return m_Size ? m_RAM[ offset & m_DecodeMask ] : 0x00;
 	}
 
 	inline void write( u32 offset, u8 value )
 	{
-		if ( m_Size ) m_RAM[ offset & m_Mask ] = value;
+		if ( m_Size ) m_RAM[ offset & m_DecodeMask ] = value;
 	}
 
 	u8 *raw() { return m_RAM; }
@@ -72,6 +75,10 @@ private:
 	u8 *m_RAM;
 	u32 m_Size;
 	u32 m_Mask;
+	u32 m_DecodeMask;
+	u32 m_RowMask;
+	u32 m_LastCell;
+	u8  m_Config;
 };
 
 #endif

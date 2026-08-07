@@ -42,6 +42,7 @@
 #include "../Common/types.h"
 #include "../C64/c64_memory.h"
 #include "write_buffer.h"
+#include "fast_ram.h"
 
 // --- $D07x, write-sensitive ------------------------------------------------
 #define SCPU_REG_D071           0xD071	// decoded, no effect
@@ -125,6 +126,8 @@ public:
 		m_WriteBuffer = writeBuffer;
 		applyOptimisation();
 	}
+	void attachBank1( u8 *bank1 ) { m_Bank1 = bank1; }
+	void attachFastRAM( CFastRAM *ram ) { m_FastRAM = ram; if ( ram ) ram->setConfig( m_SIMMConfig ); }
 
 	void setHardwareVersion( SCPUHardwareVersion v ) { m_Version = v; }
 
@@ -154,6 +157,20 @@ public:
 	// --- IIOInterceptor ---------------------------------------------------
 	bool ioRead( u16 addr, u8 &value ) override;
 	bool ioWrite( u16 addr, u8 value ) override;
+	bool ioAccessNeedsStretch( u16 addr, bool write ) const override
+	{
+		if ( !write )
+			return addr >= 0xD071 && addr <= 0xD07F;
+		return ( addr >= 0xD071 && addr <= 0xD07F )
+		    || ( addr >= 0xD0B0 && addr <= 0xD0BF );
+	}
+	bool ioAccessUsesWriteBuffer( u16 addr, bool write ) const override
+	{
+		if ( !write ) return false;
+		if ( m_Version == SCPU_V2 && addr >= 0xD800 && addr <= 0xDBFF )
+			return true;
+		return m_HWRegsEnabled && addr >= 0xD200 && addr <= 0xD3FF;
+	}
 
 	// --- state ------------------------------------------------------------
 	// The machine runs fast only when nothing is asking for 1MHz. Three
@@ -179,72 +196,12 @@ public:
 	{
 		return m_HWRegsEnabled || m_Sys1MHz || m_DOSExt || m_RAMLink;
 	}
-
-	// Servicing an interrupt closes the register bank.
-	//
-	// CMD's own vector table proves it. With the bank OPEN, $E000-$FFFF is the
-	// KS image, whose IRQ vector reads $FF48 -- and $FF48 sits inside a HOLE in
-	// that same image ($FF2D-$FF74 is zeros in both the 1.4 and 2.04 ROMs).
-	// A vector pointing at a hole in the image that supplied it is only
-	// coherent if the handler runs from somewhere else, and $FF48 in the KT
-	// image is the genuine KERNAL IRQ entry. So the bank must close as the
-	// interrupt is taken, which is also what lets CMD leave it open across long
-	// stretches of code without disabling interrupts.
-	//
-	// Without this the machine executes $00 = BRK at $FF48, which vectors
-	// straight back to $FF48: an infinite BRK loop with the stack filling,
-	// captured on hardware as a frozen C64 and a live Pi.
-	void onInterruptAcknowledged() override
-	{
-		// Remember whether the bank was open, then close it for the handler.
-		// RTI restores what was remembered -- see onInterruptReturned. The
-		// depth-limited bit-stack keeps nested NMI-in-IRQ straight.
-		if ( m_InterruptDepth < 32 )
-		{
-			m_RTIBankStack = ( m_RTIBankStack << 1 )
-			               | ( m_HWRegsEnabled ? 1u : 0u );
-			m_InterruptDepth++;
-		}
-		if ( m_HWRegsEnabled )
-		{
-			m_HWRegsEnabled = false;
-			m_InterruptBankCloses++;
-			applyKernalShadow();
-		}
-	}
-
-	// The other half, and the half whose absence broke CMD's DOS: without it,
-	// code interrupted with the bank open resumed with the bank silently
-	// closed, its next $D2xx scratch write was discarded by the write gate,
-	// and the corrupted command state surfaced as sporadic warm resets on
-	// wedge commands. The interrupted code must get the world back exactly as
-	// it left it.
-	void onInterruptReturned()
-	{
-		if ( !m_InterruptDepth )
-			return;					// a stray RTI used as a jump, not an exit
-		m_InterruptDepth--;
-		const bool wasOpen = ( m_RTIBankStack & 1u ) != 0;
-		m_RTIBankStack >>= 1;
-		if ( wasOpen && !m_HWRegsEnabled )
-		{
-			m_HWRegsEnabled = true;
-			applyKernalShadow();
-		}
-	}
-
-	// How often an interrupt arrived with the bank open. Reported by the
-	// firmware heartbeat: a healthy machine does this routinely.
-	u64 m_InterruptBankCloses = 0;
-
-private:
-	u32 m_RTIBankStack = 0;
-	u32 m_InterruptDepth = 0;
-public:
+	bool dosExtensionEnabled() const override { return m_DOSExt; }
+	bool simmWindowWritesEnabled() const override { return m_HWRegsEnabled; }
 
 	// Diagnostics only: peek the $D200 scratch window without going through
 	// the I/O path.
-	u8 sysRAM( u8 offset ) const { return m_SysRAM[ offset ]; }
+	u8 sysRAM( u8 offset ) const { return bank1Read( (u16)( SCPU_SYSRAM_BASE + offset ) ); }
 	bool bootmapEnabled() const      { return m_Bootmap; }
 
 	// Point this at CC64Memory::m_BootmapActive. A $D0B6 write then takes
@@ -258,7 +215,6 @@ public:
 	// register bank moves the KERNAL window between two different parts of
 	// bank 1 -- see the note on that member.
 	void trackKernalShadow( u32 *base ) { m_KernalShadowBase = base; applyKernalShadow(); }
-	bool dosExtensionEnabled() const { return m_DOSExt; }
 	u8   simmConfig() const          { return m_SIMMConfig; }
 	u8   optimRegister() const       { return m_Optim; }
 
@@ -312,6 +268,31 @@ private:
 
 	u8   m_SysRAM[ SCPU_SYSRAM_SIZE ];
 	u8   m_UserRAM[ SCPU_USERRAM_SIZE ];
+	u8   m_ColorRAM[ 0x400 ];
+	u8  *m_Bank1 = 0;
+	CFastRAM *m_FastRAM = 0;
+
+	u8 bank1Read( u16 addr ) const
+	{
+		if ( m_Bank1 ) return m_Bank1[ addr ];
+		if ( addr >= SCPU_SYSRAM_BASE && addr < SCPU_SYSRAM_BASE + SCPU_SYSRAM_SIZE )
+			return m_SysRAM[ addr - SCPU_SYSRAM_BASE ];
+		if ( addr >= SCPU_USERRAM_BASE && addr < SCPU_USERRAM_BASE + SCPU_USERRAM_SIZE )
+			return m_UserRAM[ addr - SCPU_USERRAM_BASE ];
+		if ( addr >= 0xD800 && addr <= 0xDBFF )
+			return m_ColorRAM[ addr - 0xD800 ];
+		return 0;
+	}
+	void bank1Write( u16 addr, u8 value )
+	{
+		if ( m_Bank1 ) { m_Bank1[ addr ] = value; return; }
+		if ( addr >= SCPU_SYSRAM_BASE && addr < SCPU_SYSRAM_BASE + SCPU_SYSRAM_SIZE )
+			m_SysRAM[ addr - SCPU_SYSRAM_BASE ] = value;
+		else if ( addr >= SCPU_USERRAM_BASE && addr < SCPU_USERRAM_BASE + SCPU_USERRAM_SIZE )
+			m_UserRAM[ addr - SCPU_USERRAM_BASE ] = value;
+		else if ( addr >= 0xD800 && addr <= 0xDBFF )
+			m_ColorRAM[ addr - 0xD800 ] = value;
+	}
 
 	void applyOptimisation();
 

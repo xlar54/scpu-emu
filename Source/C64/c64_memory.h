@@ -49,7 +49,10 @@ public:
 	// Called BEFORE the shadow byte is stored, so the sink can read the OLD
 	// value through the RAM pointer it was attached with and drop writes that
 	// change nothing.
-	virtual void onRamWrite( u16 addr, u8 value ) = 0;
+	// Returns true when the write was accepted by the active mirroring policy.
+	// The SuperCPU uses this to model its one-deep posted write buffer; skipped
+	// and same-value-eliminated writes do not occupy that hardware buffer.
+	virtual bool onRamWrite( u16 addr, u8 value ) = 0;
 	virtual void flush() = 0;
 	virtual u32  pendingBytes() { return 0; }
 
@@ -70,12 +73,15 @@ public:
 	// Return true if the access was handled and must not go to the bus.
 	virtual bool ioRead( u16 addr, u8 &value ) = 0;
 	virtual bool ioWrite( u16 addr, u8 value ) = 0;
-
-	// The CPU is servicing an interrupt / returning from one. The accelerator
-	// closes its register bank for the handler and restores it on return; see
-	// CSuperCPURegisters::onInterruptAcknowledged / onInterruptReturned.
-	virtual void onInterruptAcknowledged() {}
-	virtual void onInterruptReturned() {}
+	// Timing class for an intercepted access. v2 private SRAM is fast on reads
+	// and uses the posted write buffer on accepted writes; hardware-register
+	// writes still perform the ordinary SuperCPU I/O stretch.
+	virtual bool ioAccessNeedsStretch( u16 addr, bool write ) const
+		{ (void)addr; return write; }
+	virtual bool ioAccessUsesWriteBuffer( u16 addr, bool write ) const
+		{ (void)addr; (void)write; return false; }
+	virtual bool dosExtensionEnabled() const { return false; }
+	virtual bool simmWindowWritesEnabled() const { return true; }
 
 	// True when accelerator state wants interrupt vectors fetched from the
 	// accelerator's own ROM; see CC64Memory::interruptRerouteActive.
@@ -194,6 +200,8 @@ public:
 	// keeps this small enough to actually inline.
 	__attribute__((always_inline)) inline u8 readFast( u16 a )
 	{
+		if ( dosExtensionMapsBank1( a ) )
+			return m_ROMShadow[ a ];
 		if ( a > 1 && !m_BootmapActive && c64MapRead( a, m_BankMode ) == REG_RAM )
 			return m_RAM[ a ];
 		return read8( a );
@@ -201,6 +209,11 @@ public:
 
 	__attribute__((always_inline)) inline void writeFast( u16 a, u8 v )
 	{
+		if ( dosExtensionMapsBank1( a ) )
+		{
+			m_ROMShadow[ a ] = v;
+			return;
+		}
 		// Note the mirror sink still has to be told: the VIC-II only sees what
 		// reaches the C64's own DRAM.
 		if ( a > 1 && c64MapRead( a, m_BankMode ) != REG_IO )
@@ -209,7 +222,8 @@ public:
 			// its shadow pointer and drops writes that change nothing.
 			const u8 old = m_RAM[ a ];
 			m_RamWrites++;
-			if ( m_Mirror ) m_Mirror->onRamWrite( a, v );
+			if ( m_Mirror && m_Mirror->onRamWrite( a, v ) )
+				noteMirrorWrite();
 			m_RAM[ a ] = v;
 
 			// The active screen's sprite pointers bypass the queue and land
@@ -266,22 +280,65 @@ public:
 	u64  m_VectorReroutes = 0;				// statistics
 
 	// --- C64-bus access cost ----------------------------------------------
-	// Set by the I/O paths when an access actually reaches the real bus, and
-	// charged at the end of the instruction in tickFast(). Accelerator
-	// registers we intercept never touch the bus and cost nothing.
+	// Accesses are queued in program order and charged at the end of the
+	// current instruction. Keeping every event matters: the old two-Boolean
+	// model collapsed an RMW's read and two writes, or a whole eight-
+	// instruction batch, into one access. fineTicksRequired() breaks a batch
+	// as soon as an event appears, so only one instruction's events accumulate.
 	bool m_IOStretchEnable = true;			// config IO_STRETCH
-	u8   m_PendingIOAccess = 0;
-	u8   m_PendingIOExtra = 0;				// extra whole C64 cycles (CIA)
-	u64  m_IOStretchCycles = 0;				// statistics
-
-	inline void noteBusAccess( u16 addr )
+	bool m_MirrorStretchEnable = false;		// config MIRROR_STRETCH
+	enum BusTimingEvent : u8
 	{
-		m_PendingIOAccess = 1;
-		// VICE charges CIA accesses an additional whole cycle
-		// (scpu64_clock_write_stretch_io_start_cia / _io_cia).
-		if ( ( addr & 0xFC00 ) == 0xDC00 && m_PendingIOExtra < 4 )
-			m_PendingIOExtra++;
+		BUS_EVENT_IO = 1,
+		BUS_EVENT_CIA_WRITE,
+		BUS_EVENT_MIRROR_WRITE
+	};
+	static const u32 BUS_EVENT_CAPACITY = 32;
+	u8   m_BusEvents[ BUS_EVENT_CAPACITY ];
+	u8   m_BusEventCount = 0;
+	u64  m_MirrorBufferFreeAt = 0;
+	u64  m_IOStretchCycles = 0;				// statistics
+	u64  m_MirrorStretchCycles = 0;
+	u32  m_PendingFastHalfCycles = 0;
+	u8   m_FastHalfCarry = 0;
+	u64  m_RegionStretchCycles = 0;
+
+	inline void noteTimingEvent( BusTimingEvent event )
+	{
+		if ( m_BusEventCount < BUS_EVENT_CAPACITY )
+			m_BusEvents[ m_BusEventCount++ ] = (u8)event;
 	}
+	inline void noteBusAccess( u16 addr, bool write )
+	{
+		// VICE's additional CIA cycle applies only to CIA writes. Reads and the
+		// expansion-port windows at $DE00/$DF00 use the ordinary I/O path.
+		const bool ciaWrite = write && ( ( addr & 0xFE00 ) == 0xDC00 );
+		noteTimingEvent( ciaWrite ? BUS_EVENT_CIA_WRITE : BUS_EVENT_IO );
+	}
+	inline void noteMirrorWrite()
+	{
+		// On RAD the queued byte is delivered later over the physical bus, so
+		// MIRROR_STRETCH defaults off. In that mode it must be completely free:
+		// merely queuing an event makes fineTicksRequired() break the CPU batch
+		// after every RAM write even though tickFast() then discards the event.
+		if ( m_MirrorStretchEnable )
+			noteTimingEvent( BUS_EVENT_MIRROR_WRITE );
+	}
+	inline void noteFastHalfCycles( u32 halfCycles )
+	{
+		m_PendingFastHalfCycles += halfCycles;
+	}
+	inline bool dosExtensionMapsBank1( u16 addr ) const
+	{
+		// Reject the common address case before making the virtual register-bank
+		// query. This helper is on every bank-0 read/write fast path.
+		return ( ( addr >= 0x1000 && addr <= 0x5FFF )
+		      || ( addr >= 0x8000 && addr <= 0x9FFF ) )
+		    && !m_BootmapActive && m_ROMShadow && m_IO
+		    && m_IO->dosExtensionEnabled();
+	}
+	bool simmWindowWritesEnabled() const
+		{ return !m_IO || m_IO->simmWindowWritesEnabled(); }
 
 	bool interruptRerouteActive( bool emulationMode ) const
 	{
@@ -350,16 +407,6 @@ public:
 	// Out of line: a timer deadline arrived. Exposes the NMI and re-arms
 	// (continuous) or disarms (one-shot) the model.
 	void ciaTimerNMIDue();
-	// Tell the accelerator an interrupt is being serviced / returned from.
-	inline void notifyInterruptAcknowledged()
-	{
-		if ( m_IO ) m_IO->onInterruptAcknowledged();
-	}
-	inline void notifyInterruptReturned()
-	{
-		if ( m_IO ) m_IO->onInterruptReturned();
-	}
-
 	inline bool irqFast() { refreshInterruptsIfDue(); return m_CachedIRQ; }
 	inline bool nmiFast() { refreshInterruptsIfDue(); return m_CachedNMI; }
 
@@ -381,6 +428,19 @@ public:
 	inline void tickFast( u32 nCycles )
 	{
 		m_EmuCycles += nCycles;
+		if ( m_PendingFastHalfCycles )
+		{
+			if ( m_IOStretchEnable && effectiveCIAFactor() > 1 )
+			{
+				const u32 halves = m_PendingFastHalfCycles + m_FastHalfCarry;
+				const u32 extra = halves >> 1;
+				m_FastHalfCarry = (u8)( halves & 1 );
+				m_EmuCycles += extra;
+				nCycles += extra;
+				m_RegionStretchCycles += extra;
+			}
+			m_PendingFastHalfCycles = 0;
+		}
 
 		// A C64-bus access does not cost the accelerator the handful of cycles
 		// its opcode takes: it costs a WHOLE C64 cycle, because the SuperCPU
@@ -401,9 +461,7 @@ public:
 		// at a completely different instruction. That is what put Winter Games'
 		// throwaway NMI inside a native-mode window it was written to survive.
 		//
-		// Modelled as: an access completes at the next C64-cycle boundary,
-		// with an extra whole cycle for the CIAs (which VICE charges twice).
-		if ( m_PendingIOAccess )
+		if ( m_BusEventCount )
 		{
 			// EFFECTIVE emulated cycles per C64 cycle, not the nominal
 			// selection: at 1MHz -- explicitly chosen, or forced by the IEC
@@ -411,20 +469,64 @@ public:
 			// there is nothing to stall for, so no stretch applies and the
 			// serial paths keep their per-instruction tick granularity.
 			const u64 perC64 = effectiveCIAFactor();
-			u64 extra = 0;
+			u64 ioExtra = 0;
+			u64 mirrorExtra = 0;
 			if ( m_IOStretchEnable && perC64 > 1 )
 			{
-				const u64 phase = m_EmuCycles % perC64;
-				if ( phase )
-					extra += perC64 - phase;
-				extra += (u64)m_PendingIOExtra * perC64;
+				for ( u32 i = 0; i < m_BusEventCount; i++ )
+				{
+					const BusTimingEvent event = (BusTimingEvent)m_BusEvents[ i ];
+					if ( event == BUS_EVENT_MIRROR_WRITE )
+					{
+						if ( !m_MirrorStretchEnable )
+						{
+							m_MirrorBufferFreeAt = 0;
+							continue;
+						}
+						// The real card has one posted mirrored-write slot. A write
+						// can retire in the background, but the next accepted write
+						// must wait if that slot is still occupied.
+						if ( m_EmuCycles < m_MirrorBufferFreeAt )
+						{
+							const u64 wait = m_MirrorBufferFreeAt - m_EmuCycles;
+							m_EmuCycles += wait;
+							mirrorExtra += wait;
+						}
+						const u64 phase = m_EmuCycles % perC64;
+						m_MirrorBufferFreeAt = m_EmuCycles
+						                     + ( phase ? perC64 - phase : perC64 );
+						continue;
+					}
+
+					// Any real I/O access first drains the posted write buffer.
+					if ( m_EmuCycles < m_MirrorBufferFreeAt )
+					{
+						const u64 wait = m_MirrorBufferFreeAt - m_EmuCycles;
+						m_EmuCycles += wait;
+						mirrorExtra += wait;
+					}
+
+					// Complete at the next PHI2 boundary. If an earlier event in
+					// this instruction already put us exactly on a boundary, this
+					// event consumes the following whole C64 cycle instead of
+					// collapsing into the same one.
+					const u64 phase = m_EmuCycles % perC64;
+					const u64 wait = phase ? perC64 - phase : perC64;
+					m_EmuCycles += wait;
+					ioExtra += wait;
+					if ( event == BUS_EVENT_CIA_WRITE )
+					{
+						m_EmuCycles += perC64;
+						ioExtra += perC64;
+					}
+				}
 			}
-			m_PendingIOAccess = 0;
-			m_PendingIOExtra = 0;
+			m_BusEventCount = 0;
+			const u64 extra = ioExtra + mirrorExtra;
 			if ( extra )
 			{
-				m_EmuCycles += extra;
-				m_IOStretchCycles += extra;
+				m_IOStretchCycles += ioExtra;
+				m_MirrorStretchCycles += mirrorExtra;
 				nCycles += (u32)extra;
 			}
 		}
@@ -573,10 +675,10 @@ public:
 		return m_IECHoldCycles != 0 || m_IECActivityCycles != 0
 		    || m_IECPollHoldCycles != 0
 		    || m_CIA2NMIDeadline != 0 || m_CIA2ArmPending != 0
+		    || m_BusEventCount != 0 || m_PendingFastHalfCycles != 0
 		    || ( m_SelectedEmulatedHz != 0
 		         && m_SelectedEmulatedHz <= 1000000u );
 	}
-
 	// True while a serial TRANSACTION is in progress, independent of what
 	// speed is selected. This is the flag that suppresses mirror flushing and
 	// raster polling: the slow protocol assigns meaning to pauses, so the CPU
@@ -631,30 +733,15 @@ public:
 	u64  m_CIA2TADeadline = 0, m_CIA2TBDeadline = 0;	// emu-cycle underflow, 0=off
 	u64  m_CIA2NMIDeadline = 0;			// min armed deadline: the hot-path fast-out
 	u64  m_CIA2FactorInUse = 1;			// emu-cycles-per-C64-cycle the deadlines are in
-	// A CIA counts REAL microseconds. Emulated cycles are the wrong currency
-	// for it: an I/O-heavy stretch -- a raster poll loop, a serial poll loop
-	// -- burns real time on every bus access that the emulated cycle counter
-	// never sees, so "N cycles x speed factor" drifts arbitrarily far from
-	// "N microseconds". Winter Games arms a 20-cycle NMI inside a $D012 poll
-	// loop at turbo; measured on hardware, we made the deadline 420 emulated
-	// cycles and delivered ~100 instructions past where the real chip fires,
-	// inside the native-mode window the loader had timed itself to survive.
-	// So when the bus offers a real clock, deadlines live in HOST cycles and
-	// need no rescaling at all: real time is real time whatever the CPU is
-	// doing. The emulated-cycle path remains for the host tests, which have
-	// no clock.
-	bool m_CIAUseHostClock = false;
-	u64  m_CIAHostPerC64 = 0;			// host cycles per C64 cycle (~1us)
-	// "Now", in whichever units the armed deadlines are held.
-	inline u64 ciaNow()
-	{
-		return ( m_CIAUseHostClock && m_C64 ) ? m_C64->hostCycles() : m_EmuCycles;
-	}
-	// The length of n C64 cycles, in those same units.
-	inline u64 ciaSpan( u64 n ) const
-	{
-		return m_CIAUseHostClock ? n * m_CIAHostPerC64 : n * m_CIA2FactorInUse;
-	}
+	// CIA deadlines live in EMULATED cycles. C64Tests/16-NMITIMING proved why:
+	// a wall-clock deadline expired after only half the expected instructions
+	// whenever its armed state forced the RAD interpreter out of batching
+	// (about 10MHz unbatched versus VICE's emulated 20MHz). I/O stretch now
+	// charges every real C64-bus wait into m_EmuCycles, so this clock includes
+	// the physical stalls which originally motivated the host-clock model while
+	// remaining independent of how fast the ARM happens to execute the core.
+	inline u64 ciaNow() { return m_EmuCycles; }
+	inline u64 ciaSpan( u64 n ) const { return n * m_CIA2FactorInUse; }
 	u64  m_SynthNMIsDelivered = 0;		// statistics
 	u64  m_CIA2Rescales = 0;			// deadline re-denominations at speed changes
 	// Forensic trace of the LAST timer-NMI lifecycle, for the stall dump:
@@ -682,8 +769,7 @@ public:
 	{
 		if ( gen != m_NMITraceGen || at < m_NMITraceArmAt )
 			return 0xFFFFFFFF;
-		const u64 per = ( m_CIAUseHostClock && m_CIAHostPerC64 )
-		              ? m_CIAHostPerC64 : 1;
+		const u64 per = m_CIA2FactorInUse ? m_CIA2FactorInUse : 1;
 		return (u32)( ( at - m_NMITraceArmAt ) / per );
 	}
 
@@ -756,6 +842,7 @@ private:
 	// the sentinel when the screen sits under the I/O window and cannot be
 	// mirrored at all. Kept fresh by writes to $D018 and $DD00.
 	u32  m_SpritePtrBase;
+	u32  m_PreviousSpritePtrBase;
 	u8   m_LastD018;
 public:
 	// Writes aimed at the active sprite-pointer row, same-value or not. A
@@ -860,7 +947,10 @@ private:
 		               + ( (u32)( m_LastD018 >> 4 ) << 10 ) + 0x3F8;
 		// Screen under the I/O window: the pointer row is unreachable over
 		// the bus (real $01 stays $37), so the fast path must never try.
-		m_SpritePtrBase = ( ( base & 0xF000 ) == 0xD000 ) ? 0xFFFFFFFF : base;
+		const u32 next = ( ( base & 0xF000 ) == 0xD000 ) ? 0xFFFFFFFF : base;
+		if ( next != m_SpritePtrBase )
+			m_PreviousSpritePtrBase = m_SpritePtrBase;
+		m_SpritePtrBase = next;
 	}
 	bool m_HaveCIA2PortARead;
 	bool m_HaveCIA2DDRA;

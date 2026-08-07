@@ -173,7 +173,6 @@ struct SCPUResetDiagnostic
 	u32 nmiTraceLatch;
 	u32 nmiTraceExpose;
 	u32 nmiTraceTake;
-	u32 nmiDeferred;
 	u8  nmiOwned;
 	u8  nmiMask;
 	u32 nmiFactor;
@@ -241,9 +240,6 @@ static void scpuSnapshotResetDiagnostic( CSuperCPU *scpu )
 		d.nmiTraceExpose = m.nmiTraceStageUS( m.m_NMITraceExposeAt, m.m_NMITraceExposeGen );
 		d.nmiTraceTake   = m.nmiTraceStageUS( m.m_NMITraceTakeAt,   m.m_NMITraceTakeGen );
 		d.nmiTraceArm = (u32)m.m_NMITraceGen;
-		d.nmiDeferred = 0;
-		if ( CW65C816 *core816 = scpu->core65816() )
-			d.nmiDeferred = (u32)core816->m_NMIsDeferred;
 	}
 
 	for ( u32 i = 0; i < 16; i++ )
@@ -362,9 +358,8 @@ static void scpuEmitResetDiagnostic()
 			}
 		}
 		s_Logger->Write( "SCPU", LogNotice,
-		               "  nmi trace: arm#%u latch=%sus expose=%sus take=%sus deferred=%u",
-		               (unsigned)d.nmiTraceArm, lat, exp, tak,
-		               (unsigned)d.nmiDeferred );
+			               "  nmi trace: arm#%u latch=%sus expose=%sus take=%sus",
+			               (unsigned)d.nmiTraceArm, lat, exp, tak );
 	}
 
 	char line[ SCPU_DUMP_LINE_SIZE ];
@@ -590,13 +585,12 @@ static bool scpuCheckButton( void *ctx )
 			{
 				CScopedLoggingIRQs irqs;
 				s_Logger->Write( "SCPU", LogNotice,
-				               "hb PC=$%06X..$%06X wb=%u iec=%u BA=%u PHI=%u irqbank=%u%s",
+				               "hb PC=$%06X..$%06X wb=%u iec=%u BA=%u PHI=%u%s",
 				               (unsigned)s_HeartbeatPCLow, (unsigned)s_HeartbeatPCHigh,
 				               (unsigned)scpu->writeBuffer().pending(),
 				               (unsigned)( scpu->memory().iecBusActive() ? 1 : 0 ),
 				               (unsigned)radBAWaitTimeouts,
 				               (unsigned)radPHIWaitTimeouts,
-				               (unsigned)scpu->registers().m_InterruptBankCloses,
 				               stalled ? "  <-- STALLED" : "" );
 			}
 
@@ -1031,13 +1025,16 @@ void scpuBootRun( CLogger *logger )
 	superCPU.setDeferNativeNMI( cfgNMINativeDefer != 0 );
 	superCPU.setVectorReroute( cfgVectorReroute != 0 );
 	superCPU.setIOStretch( cfgIOStretch != 0 );
+	superCPU.setMirrorStretch( cfgMirrorStretch != 0 );
 	logger->Write( "SCPU", LogNotice,
 	               "nmi retime: %s, native defer: %s, vector reroute: %s",
 	               cfgNMIRetime ? "on" : "off",
 	               cfgNMINativeDefer ? "on" : "off",
 	               cfgVectorReroute ? "on" : "off" );
-	logger->Write( "SCPU", LogNotice, "bus access cost (io stretch): %s",
-	               cfgIOStretch ? "on" : "off" );
+	logger->Write( "SCPU", LogNotice,
+	               "access cost: io=%s mirror=%s",
+	               cfgIOStretch ? "on" : "off",
+	               cfgMirrorStretch ? "on" : "off" );
 
 	// From superCPU.init() onward the Pi owns and accesses the C64 bus in
 	// sub-microsecond GPIO windows. Circle's timer/SD IRQs may pre-empt at any
@@ -1078,9 +1075,17 @@ void scpuBootRun( CLogger *logger )
 
 	// The pure-interpreter figure, no bus and no scheduler: 70 means 20MHz.
 	if ( superCPU.benchArmPerEmuCycle() )
+	{
 		logger->Write( "SCPU", LogNotice,
 		               "interpreter: %u arm/emucycle pure (70 = 20MHz)",
 		               (unsigned)superCPU.benchArmPerEmuCycle() );
+		logger->Write( "SCPU", LogNotice,
+		               "pmu/1k emucycles: insn=%u irefill=%u drefill=%u brmiss=%u",
+		               (unsigned)superCPU.m_BenchInstrPer1k,
+		               (unsigned)superCPU.m_BenchL1IRefillPer1k,
+		               (unsigned)superCPU.m_BenchL1DRefillPer1k,
+		               (unsigned)superCPU.m_BenchBranchMissPer1k );
+	}
 
 	const C64Signals &sig = radBus.signals();
 	logger->Write( "SCPU", LogNotice, "SuperRAM: %u MB%s",
