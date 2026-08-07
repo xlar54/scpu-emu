@@ -87,6 +87,11 @@ int cfgMirrorDisplayBytes = SCPU_CFG_MIRROR_DISPLAY_DEFAULT;
 int cfgBootAnimation = 1;
 int cfgMirrorHaltAfterS = 0;
 int cfgMirrorD000Relocate = 1;
+int cfgHeartbeat = 0;
+int cfgNMIRetime = 1;
+int cfgNMINativeDefer = 1;
+int cfgVectorReroute = 1;
+int cfgIOStretch = 1;
 
 char cfg[ 65536 ];
 
@@ -106,6 +111,11 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	cfgBootAnimation = 1;
 	cfgMirrorHaltAfterS = 0;
 	cfgMirrorD000Relocate = 1;
+	cfgHeartbeat = 0;
+	cfgNMIRetime = 1;
+	cfgNMINativeDefer = 1;
+	cfgVectorReroute = 1;
+	cfgIOStretch = 1;
 
 	// Leave a byte spare so cfg is always NUL-terminated for the line scanner.
 	if ( !readFile( logger, DRIVE, FILENAME, (u8*)cfg, &cfgBytes, sizeof( cfg ) - 1 ) )
@@ -119,6 +129,11 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	bool mirrorDisplaySeen = false;
 	bool bootAnimSeen = false;
 	bool relocSeen = false;
+	bool heartbeatSeen = false;
+	bool nmiRetimeSeen = false;
+	bool nmiDeferSeen = false;
+	bool rerouteSeen = false;
+	bool ioStretchSeen = false;
 
 	while ( *cfgPos != 0 )
 	{
@@ -144,6 +159,11 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 						if ( i == 24 ) mirrorDisplaySeen = true;
 						if ( i == 26 ) bootAnimSeen = true;
 						if ( i == 28 ) relocSeen = true;
+						if ( i == 29 ) heartbeatSeen = true;
+						if ( i == 30 ) nmiRetimeSeen = true;
+						if ( i == 31 ) nmiDeferSeen = true;
+						if ( i == 32 ) rerouteSeen = true;
+						if ( i == 33 ) ioStretchSeen = true;
 						while ( *ptr == '\t' || *ptr == ' ' ) ptr++;
 					#ifdef DEBUG_OUT
 						logger->Write( "RaspiMenu", LogNotice, "  %s >%d< (%s)", timingNames[ i ], timingValues[ i ], ptr );
@@ -208,6 +228,28 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	// A flag: MIRROR_D000_RELOCATE 0 must be able to switch relocation off.
 	if ( relocSeen )
 		cfgMirrorD000Relocate = ( timingValues[ 28 ] != 0 ) ? 1 : 0;
+
+	// A flag, default off: HEARTBEAT 1 turns the per-second line on.
+	if ( heartbeatSeen )
+		cfgHeartbeat = ( timingValues[ 29 ] != 0 ) ? 1 : 0;
+
+	// A flag, default on: NMI_RETIME 0 restores sampled-line delivery.
+	if ( nmiRetimeSeen )
+		cfgNMIRetime = ( timingValues[ 30 ] != 0 ) ? 1 : 0;
+
+	// A flag, default on: NMI_NATIVE_DEFER 0 dispatches natively as the
+	// processor would.
+	if ( nmiDeferSeen )
+		cfgNMINativeDefer = ( timingValues[ 31 ] != 0 ) ? 1 : 0;
+
+	// A flag, default on: VECTOR_REROUTE 0 fetches vectors from the C64 map.
+	if ( rerouteSeen )
+		cfgVectorReroute = ( timingValues[ 32 ] != 0 ) ? 1 : 0;
+
+	// A flag, default on: IO_STRETCH 0 charges bus accesses nothing, as
+	// before the access-cost model existed.
+	if ( ioStretchSeen )
+		cfgIOStretch = ( timingValues[ 33 ] != 0 ) ? 1 : 0;
 
 	return 1;
 }

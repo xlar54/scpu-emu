@@ -62,6 +62,241 @@ CC64Memory::CC64Memory()
 	updateBankMode();
 }
 
+// --- CIA2 timer NMI retiming -----------------------------------------------
+// See the header note. All cold paths: register writes and expired deadlines.
+
+void CC64Memory::notePollHold()
+{
+	// A read of the serial port registers -- a mere poll included -- keeps
+	// the real SuperCPU at 1MHz for a short window: its auto-slow re-arms on
+	// every serial-port ACCESS. Winter Games' loader arms a 20-cycle timer
+	// NMI in the middle of a $DD00 poll phase and its handler expects to
+	// interrupt the very next instructions at 1MHz; with only edge-armed
+	// holds, our machine had drifted back to turbo there and the NMI landed
+	// 400 cycles deep, inside a native-mode window.
+	//
+	// The top-up is SHORT, CMD-scale: a poll LOOP (iterations tens of µs
+	// apart) sustains it seamlessly, while a game that reads $DD00 once a
+	// frame pays about a millisecond and returns to turbo -- no latch-up.
+	// Deliberately does NOT touch m_IECActivityCycles: mirror suppression
+	// still requires real evidence of a transaction (see the $DD00 read
+	// handler), which is the lesson the mirror-blackout latch-up taught.
+	const bool explicitlySlow = m_SelectedEmulatedHz != 0
+	                         && m_SelectedEmulatedHz <= 1000000u;
+	if ( !m_IECThrottleEnabled || explicitlySlow )
+		return;
+	if ( m_IECPollHoldCycles < 1000 )
+	{
+		const bool wasInactive = ( m_IECPollHoldCycles == 0
+		                        && m_IECHoldCycles == 0 );
+		m_IECPollHoldCycles = 1000;
+		if ( wasInactive )
+		{
+			cia2OnRateChange();		// effective speed just changed
+			if ( m_TimingHook )
+				m_TimingHook( m_TimingHookCtx );
+		}
+	}
+}
+
+void CC64Memory::cia2OnRateChange()
+{
+	// Host-cycle deadlines are speed-independent by construction: nothing to
+	// re-denominate, ever.
+	if ( m_CIAUseHostClock )
+		return;
+	const u64 f = effectiveCIAFactor();
+	if ( f == m_CIA2FactorInUse )
+		return;
+	// Re-denominate the REMAINING count of every armed deadline. A deadline
+	// already reached stays reached (remaining clamps at zero: fires on the
+	// next check).
+	if ( m_CIA2TADeadline )
+	{
+		const u64 rem = ( m_CIA2TADeadline > m_EmuCycles )
+		              ? ( m_CIA2TADeadline - m_EmuCycles ) : 0;
+		m_CIA2TADeadline = m_EmuCycles + rem * f / m_CIA2FactorInUse;
+		if ( m_CIA2TADeadline == m_EmuCycles ) m_CIA2TADeadline = m_EmuCycles + 1;
+		m_CIA2Rescales++;
+	}
+	if ( m_CIA2TBDeadline )
+	{
+		const u64 rem = ( m_CIA2TBDeadline > m_EmuCycles )
+		              ? ( m_CIA2TBDeadline - m_EmuCycles ) : 0;
+		m_CIA2TBDeadline = m_EmuCycles + rem * f / m_CIA2FactorInUse;
+		if ( m_CIA2TBDeadline == m_EmuCycles ) m_CIA2TBDeadline = m_EmuCycles + 1;
+		m_CIA2Rescales++;
+	}
+	m_CIA2FactorInUse = f;
+	cia2RecomputeNMIState();
+}
+
+void CC64Memory::cia2TimerWrite( u16 a, u8 v )
+{
+	// Keep the stored denomination in sync with the current speed BEFORE any
+	// arithmetic: deadlines armed here are in effectiveCIAFactor() units, and
+	// cia2OnRateChange() re-denominates them at every later speed change.
+	cia2OnRateChange();
+
+	switch ( a )
+	{
+	case 0xDD04: m_CIA2TALatch = (u16)( ( m_CIA2TALatch & 0xFF00 ) | v ); break;
+	case 0xDD05: m_CIA2TALatch = (u16)( ( m_CIA2TALatch & 0x00FF ) | ( (u16)v << 8 ) ); break;
+	case 0xDD06: m_CIA2TBLatch = (u16)( ( m_CIA2TBLatch & 0xFF00 ) | v ); break;
+	case 0xDD07: m_CIA2TBLatch = (u16)( ( m_CIA2TBLatch & 0x00FF ) | ( (u16)v << 8 ) ); break;
+
+	case 0xDD0D:
+		// Set/clear semantics via bit 7, like the chip.
+		if ( v & 0x80 ) m_CIA2ICRMask |= (u8)( v & 0x1F );
+		else            m_CIA2ICRMask &= (u8)~( v & 0x1F );
+		// Disabling both timer sources ends any synthetic assertion: on the
+		// chip that mask change is exactly what releases the line.
+		if ( !( m_CIA2ICRMask & 0x03 ) )
+			m_SynthNMIActive = false;
+		else
+		{
+			// Enabling with an underflow already pending asserts the line
+			// RIGHT NOW -- the chip evaluates (pending & mask) continuously.
+			// Winter Games' arm sequence starts its 20-cycle timer two
+			// instructions before enabling the mask; a base computed a few
+			// cycles stale can put the underflow in that gap.
+			cia2RecomputeNMIState();
+			cia2MaybeDeliverSynthNMI();
+		}
+		break;
+
+	case 0xDD0E:
+		// Timer A control. START on a stopped timer -- or a force-load strobe
+		// -- (re)computes the underflow deadline; STOP disarms it. A write
+		// that leaves a running timer running does not restart the count,
+		// exactly like the chip. Counting CNT pulses (bit 5) is external
+		// input we cannot model: disarm and let the sampled line handle it.
+		if ( v & 0x20 )
+			m_CIA2TADeadline = 0;
+		else if ( ( v & 0x01 ) && ( !( m_CIA2TACR & 0x01 ) || ( v & 0x10 ) ) )
+			m_CIA2ArmPending |= 0x01;		// anchored in cia2FinishArm()
+		else if ( !( v & 0x01 ) )
+			m_CIA2TADeadline = 0;
+		m_CIA2TACR = v;
+		break;
+
+	case 0xDD0F:
+		// Timer B: as A, plus bits 5-6 select CNT or timer-A-underflow
+		// counting -- both unmodelable here.
+		if ( v & 0x60 )
+			m_CIA2TBDeadline = 0;
+		else if ( ( v & 0x01 ) && ( !( m_CIA2TBCR & 0x01 ) || ( v & 0x10 ) ) )
+			m_CIA2ArmPending |= 0x02;		// anchored in cia2FinishArm()
+		else if ( !( v & 0x01 ) )
+			m_CIA2TBDeadline = 0;
+		m_CIA2TBCR = v;
+		break;
+
+	default:
+		return;						// $DD08-$DD0C: TOD and SDR, no model
+	}
+	const bool wasArmed = ( m_CIA2NMIDeadline != 0 );
+	cia2RecomputeNMIState();
+	// A deadline coming live must take effect on the very NEXT instruction:
+	// the run loop batches bus ticks, and a 20-cycle deadline checked
+	// against a clock that only advances per batch slips past the designed
+	// landing zone -- Winter Games' throwaway RTI-handler NMI then falls
+	// into the long MVN inside its native-mode window instead of the five
+	// plain instructions after the arm. The armed deadline switches
+	// fineTicksRequired() on; the hook breaks the current batch.
+	if ( !wasArmed && m_CIA2NMIDeadline && m_TimingHook )
+		m_TimingHook( m_TimingHookCtx );
+}
+
+void CC64Memory::cia2RecomputeNMIState()
+{
+	// Nearest armed deadline, for the hot path's single compare.
+	u64 next = m_CIA2TADeadline;
+	if ( m_CIA2TBDeadline && ( !next || m_CIA2TBDeadline < next ) )
+		next = m_CIA2TBDeadline;
+	m_CIA2NMIDeadline = m_NMIRetimeEnable ? next : 0;
+
+	// The timers own the NMI line only while EVERY enabled NMI source is a
+	// modeled timer. A program mixing FLAG or SDR interrupts with timer
+	// interrupts gets the sampled line for everything -- jittery, but never
+	// wrong about which sources exist.
+	m_CIA2NMIOwned = m_NMIRetimeEnable
+	              && ( m_CIA2ICRMask & 0x03 ) != 0
+	              && ( m_CIA2ICRMask & 0x1C ) == 0;
+}
+
+void CC64Memory::cia2FinishArm()
+{
+	cia2OnRateChange();				// units first, then the anchor
+	const u64 now = ciaNow();
+	if ( m_CIA2ArmPending & 0x01 )
+	{
+		m_CIA2TADeadline = now + ciaSpan( (u64)m_CIA2TALatch + 1 );
+		m_NMITraceArmAt = now;
+		m_NMITraceGen++;
+	}
+	if ( m_CIA2ArmPending & 0x02 )
+		m_CIA2TBDeadline = now + ciaSpan( (u64)m_CIA2TBLatch + 1 );
+	m_CIA2ArmPending = 0;
+	cia2RecomputeNMIState();
+}
+
+void CC64Memory::cia2MaybeDeliverSynthNMI()
+{
+	// The line asserts when an enabled source is pending -- evaluated
+	// continuously by the chip, so both "underflow while enabled" and
+	// "enable while pending" produce the edge. A new edge only if the
+	// previous assertion was acknowledged: an unread ICR holds the real
+	// line low too, and a held line has no edges.
+	if ( m_CIA2NMIOwned && !m_SynthNMIActive
+	     && ( m_CIA2ICRPending & m_CIA2ICRMask & 0x03 ) )
+	{
+		m_SynthNMIActive = true;
+		m_CachedNMI = true;				// exposed NOW; the next sample sees it
+		m_SynthNMIsDelivered++;
+		m_NMITraceExposeAt = ciaNow();
+		m_NMITraceExposeGen = m_NMITraceGen;
+		// Break the run loop: interrupt sampling happens at slice entry, so
+		// without this the exposed edge waits out the rest of the slice.
+		if ( m_TimingHook )
+			m_TimingHook( m_TimingHookCtx );
+	}
+}
+
+void CC64Memory::ciaTimerNMIDue()
+{
+	cia2OnRateChange();				// continuous re-arm below uses fresh units
+	const u64 now = ciaNow();
+
+	if ( m_CIA2TADeadline && now >= m_CIA2TADeadline )
+	{
+		m_CIA2ICRPending |= 0x01;		// latches regardless of the mask
+		m_NMITraceLatchAt = now;
+		m_NMITraceLatchGen = m_NMITraceGen;
+		if ( m_CIA2TACR & 0x08 )
+		{
+			m_CIA2TADeadline = 0;			// one-shot: the chip clears START
+			m_CIA2TACR &= (u8)~0x01;
+		}
+		else
+			m_CIA2TADeadline += ciaSpan( (u64)m_CIA2TALatch + 1 );
+	}
+	if ( m_CIA2TBDeadline && now >= m_CIA2TBDeadline )
+	{
+		m_CIA2ICRPending |= 0x02;
+		if ( m_CIA2TBCR & 0x08 )
+		{
+			m_CIA2TBDeadline = 0;
+			m_CIA2TBCR &= (u8)~0x01;
+		}
+		else
+			m_CIA2TBDeadline += ciaSpan( (u64)m_CIA2TBLatch + 1 );
+	}
+
+	cia2MaybeDeliverSynthNMI();
+	cia2RecomputeNMIState();
+}
+
 // Claim a free deliverable block in $C000-$CBFF as the relocated home of
 // under-I/O shape block v ($40-$7F), and queue the block's current shadow
 // content at its new address. Returns the relocated block value, or $FF when
@@ -125,6 +360,7 @@ void CC64Memory::reset()
 	m_PacerWaitHostCycles = m_SlowPacedCycles = m_IECThrottledCycles = 0;
 	m_IECHoldCycles = 0;
 	m_IECActivityCycles = 0;
+	m_IECPollHoldCycles = 0;
 	m_MaxTickChunk = 0;
 	m_CIA2PortALatch = 0;
 	m_LastCIA2PortARead = 0;
@@ -155,6 +391,18 @@ void CC64Memory::reset()
 	}
 	m_IntCredit = 0xFFFFF;
 	m_CachedIRQ = m_CachedNMI = false;
+	// CIA2 timer NMI retiming model; m_NMIRetimeEnable itself is config-owned.
+	m_CIA2NMIOwned = false;
+	m_SynthNMIActive = false;
+	m_CIA2ICRMask = 0;
+	m_CIA2TACR = m_CIA2TBCR = 0;
+	m_CIA2TALatch = m_CIA2TBLatch = 0xFFFF;
+	m_CIA2ICRPending = 0;
+	m_CIA2ArmPending = 0;
+	m_PendingIOAccess = 0;
+	m_PendingIOExtra = 0;
+	m_CIA2TADeadline = m_CIA2TBDeadline = m_CIA2NMIDeadline = 0;
+	m_CIA2FactorInUse = effectiveCIAFactor();
 	resyncPacing();
 
 	for ( u32 i = 0; i < C64_RAM_SIZE; i++ )
@@ -180,8 +428,12 @@ void CC64Memory::noteIECActivity()
 		if ( wasInactive )
 			m_IECThrottleEvents++;
 		m_IECHoldCycles = 100000;
-		if ( wasInactive && m_TimingHook )
-			m_TimingHook( m_TimingHookCtx );
+		if ( wasInactive )
+		{
+			cia2OnRateChange();		// hold arming changes the effective speed
+			if ( m_TimingHook )
+				m_TimingHook( m_TimingHookCtx );
+		}
 	}
 }
 
@@ -311,6 +563,7 @@ u8 CC64Memory::read8( scpu_addr_t addr )
 			// points the VIC at it may show stale data for one frame. The real
 			// SuperCPU mirrors asynchronously and has the same property.
 			m_IOReads++;
+			noteBusAccess( a );
 			v = m_C64 ? m_C64->read( a ) : 0xFF;
 			m_IOLog[ m_IOLogPos++ & 63 ] = (u32)a | ( (u32)v << 16 );
 			if ( ( a & 0xFE00 ) == 0xDC00 )
@@ -327,6 +580,14 @@ u8 CC64Memory::read8( scpu_addr_t addr )
 						m_C64 ? (u32)m_C64->hostCycles() : (u32)m_EmuCycles;
 					m_CIALog[ m_CIALogPos++ & 63 ] = composite;
 				}
+			}
+			if ( a == 0xDD00 || a == 0xDD02 )
+			{
+				// ANY serial-port read keeps the SPEED at 1MHz for a short
+				// window, polls included -- that is the real SuperCPU's
+				// auto-slow rule, and cycle-timed code depends on it. The
+				// MIRROR window below stays evidence-gated.
+				notePollHold();
 			}
 			if ( a == 0xDD00 )
 			{
@@ -360,6 +621,15 @@ u8 CC64Memory::read8( scpu_addr_t addr )
 				// half-delivered smear.
 				if ( inputChanged || inputAsserted )
 					noteIECActivity();
+			}
+			else if ( a == 0xDD0D )
+			{
+				// ICR read: the program acknowledged its NMI. The real read
+				// (already performed above) cleared the chip; drop the
+				// synthetic level and pending bits so the next underflow is
+				// a fresh edge.
+				m_SynthNMIActive = false;
+				m_CIA2ICRPending = 0;
 			}
 			else if ( a == 0xDD02 )
 			{
@@ -400,6 +670,19 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 	{
 		if ( m_IO && m_IO->ioWrite( a, value ) )
 		{
+			// An explicit software speed selection ends the ADVISORY
+			// poll-slow immediately, even when the selection does not change
+			// the nominal speed (then no speed hook fires, so it must happen
+			// here): a program declaring its speed means the poll heuristic
+			// must yield. The EDGE-armed hold is left alone -- it protects
+			// live transactions and real edges re-arm it anyway.
+			if ( ( a == 0xD07A || a == 0xD07B ) && m_IECPollHoldCycles )
+			{
+				m_IECPollHoldCycles = 0;
+				cia2OnRateChange();
+				if ( m_TimingHook )
+					m_TimingHook( m_TimingHookCtx );
+			}
 			// Intercepted SuperCPU-register writes are logged too, tagged with
 			// bit 25 -- the freeze forensics need to see the WHOLE conversation,
 			// and CMD's idle loops are made almost entirely of these.
@@ -460,6 +743,12 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 			if ( cia2IECChanged )
 				noteIECActivity();
 		}
+		else if ( a >= 0xDD04 && a <= 0xDD0F )
+		{
+			// CIA2 timer and interrupt-mask writes feed the NMI retiming
+			// model on their way to the real chip.
+			cia2TimerWrite( a, value );
+		}
 
 		m_IOWrites++;
 		if ( a < 0xD040 )
@@ -472,6 +761,7 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 				m_C64 ? (u32)m_C64->hostCycles() : (u32)m_EmuCycles;
 			m_CIALog[ m_CIALogPos++ & 63 ] = (u32)a | ( (u32)value << 16 ) | ( 1u << 24 );
 		}
+		noteBusAccess( a );
 		if ( m_C64 ) m_C64->write( a, value );
 		return;
 	}
@@ -512,10 +802,29 @@ void CC64Memory::setPacing( u64 hostCyclesPerSecond, u32 emulatedHz )
 	m_PacingCheckCycles = emulatedHz / 1000000u;
 	if ( m_PacingCheckCycles < 1 ) m_PacingCheckCycles = 1;
 
+	// Prefer the real clock for CIA deadlines when the bus has one; see
+	// m_CIAUseHostClock. A clock appearing or vanishing would change the
+	// units under an armed deadline, so re-arm those from scratch.
+	const u64 hostPerC64 = hostCyclesPerSecond / 1000000ULL;
+	const bool useHost = ( hostPerC64 != 0 );
+	if ( useHost != m_CIAUseHostClock )
+	{
+		m_CIAUseHostClock = useHost;
+		if ( m_CIA2TADeadline ) m_CIA2ArmPending |= 0x01;
+		if ( m_CIA2TBDeadline ) m_CIA2ArmPending |= 0x02;
+		m_CIA2TADeadline = m_CIA2TBDeadline = m_CIA2NMIDeadline = 0;
+	}
+	m_CIAHostPerC64 = hostPerC64;
+
 	// An explicit slow request supersedes any heuristic hold, so a later $D07B
 	// can restore turbo immediately rather than inheriting a 100ms tail.
 	if ( emulatedHz != 0 && emulatedHz <= 1000000u )
 		m_IECHoldCycles = 0;
+
+	// Speed selection is the canonical rate transition: Winter Games arms
+	// its transition timer and writes $D07B (1MHz) one instruction later.
+	// Armed CIA2 deadlines must follow the machine into the new units.
+	cia2OnRateChange();
 
 	if ( hostCyclesPerSecond == 0 || emulatedHz == 0 )
 	{

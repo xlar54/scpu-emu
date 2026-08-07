@@ -46,6 +46,7 @@ tests will report that no accelerator was detected.
 | `12-RASTERIRQ` | ML | VIC raster IRQ delivery while running Turbo | stable bars and increasing IRQ count; key exits |
 | `13-VICBANKS` | ML | VIC banks 0-3 and accelerator write mirroring | four stable solid-colour screens; key advances |
 | `14-SPRITEBALLS` | ML | all eight sprites, ninth X bits, frame pacing and VIC writes | eight differently coloured balls bounce smoothly; key exits |
+| `15-SCPU128PROBE` | ML/C128 | read-only SCPU128, 8722 MMU, ROM-window and 24-bit bank fingerprints | creates `SCPU128 LOG` as a sequential file on device 8 |
 
 `01-SPEED` reports raw jiffies, the Normal/Turbo ratio, and an effective MHz
 estimate obtained by treating the forced-Normal run as the 1.0 MHz reference.
@@ -104,6 +105,17 @@ write policy. Press a key after each solid-colour screen.
 `14-SPRITEBALLS` uses all eight hardware sprites over a black screen. Each ball
 has its own colour, position and velocity; several cross X=255 to exercise
 `$D010`. Press any key to restore the VIC state and return to BASIC.
+
+`15-SCPU128PROBE` is a native C128-mode program with a BASIC 7 loader at
+`$1C01`; unlike the other tests, it must be run before `GO64`. It is deliberately
+read-only apart from briefly opening and closing the documented SuperCPU
+hardware-register gate. It captures the closed/open `$D0B0-$D0BF` views, the
+8722 registers at `$D500-$D50B` and `$FF00-$FF04`, visible ROM-window CRCs, and
+256-byte fingerprints reached through 65816 banks `$00` and `$01`. The report
+is written as `SCPU128 LOG` on device 8, replacing the previous report. Make a
+fresh copy after each run and repeat after cold boots in C128 40-column, C128
+80-column, Normal and Turbo configurations. Also record the machine revision,
+PAL/NTSC standard, SCPU ROM revision, physical switch position and SIMM size.
 
 ## Interpreting failures
 

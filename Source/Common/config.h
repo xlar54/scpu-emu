@@ -29,7 +29,7 @@
 #define _config_h
 
 
-#define TIMING_NAMES 29
+#define TIMING_NAMES 34
 const char timingNames[TIMING_NAMES][32] = {
 	"WAIT_FOR_SIGNALS", 
 	"WAIT_CYCLE_READ", 
@@ -82,7 +82,33 @@ const char timingNames[TIMING_NAMES][32] = {
 	// $D000-$DFFF (RAM to the VIC, chip registers to our bus writes), deliver
 	// a translated pointer into a relocated copy at $C000-$CBFF instead of
 	// silently showing stale DRAM. 3D Pool needs it; see CC64Memory.
-	"MIRROR_D000_RELOCATE"
+	"MIRROR_D000_RELOCATE",
+	// Not a timing: print the once-per-second status line. The write goes out
+	// through the logger with IRQs briefly unmasked, and that window is long
+	// enough to show as a momentary display stutter -- so it defaults OFF.
+	// Stall self-detection stays armed either way; it only prints when a
+	// stall is actually found.
+	"HEARTBEAT",
+	// Not a timing: deliver CIA2 timer NMIs at the exact emulated cycle the
+	// timer writes imply, instead of at the sampled line's µs-jittered
+	// arrival. Winter Games /SCPU cycle-times a 20-cycle NMI around
+	// native-mode windows; sampling slack landed one inside and the machine
+	// BRK-stormed through the KERNAL's accidental $6C03 vector.
+	"NMI_RETIME",
+	// Not a timing: hold an NMI back while the 65816 is in NATIVE mode and
+	// release it at the next emulation-mode instruction. A native NMI
+	// vectors through $00FFEA, where neither CMD KERNAL image carries a
+	// native vector table and where a 65816 program may have its own code;
+	// no real machine survives one, so none takes one.
+	"NMI_NATIVE_DEFER",
+	// Not a timing: fetch interrupt vectors from the accelerator's own EPROM
+	// ($F80000+vector) when it is acting as an accelerator, as a real
+	// SuperCPU does and VICE models (scpu64_interrupt_reroute).
+	"VECTOR_REROUTE",
+	// Not a timing: charge a C64-bus access a whole C64 cycle, the way a real
+	// SuperCPU pays for one. Without it, I/O-bound code runs several times
+	// too fast in emulated time. See CC64Memory::tickFast.
+	"IO_STRETCH"
 };
 
 // Which CPU core boot.cpp should install. Set from CPU_CORE in the config file;
@@ -124,6 +150,22 @@ extern int cfgMirrorHaltAfterS;
 // Under-I/O sprite-shape relocation; see MIRROR_D000_RELOCATE in the names
 // table. Default on.
 extern int cfgMirrorD000Relocate;
+
+// Once-per-second status line; see HEARTBEAT in the names table. Default off:
+// the logger write stutters the display for a visible instant.
+extern int cfgHeartbeat;
+
+// CIA2 timer NMI retiming; see NMI_RETIME in the names table. Default on.
+extern int cfgNMIRetime;
+
+// Native-mode NMI deferral; see NMI_NATIVE_DEFER in the names table.
+extern int cfgNMINativeDefer;
+
+// Interrupt vector reroute; see VECTOR_REROUTE in the names table.
+extern int cfgVectorReroute;
+
+// C64-bus access cost; see IO_STRETCH in the names table. Default on.
+extern int cfgIOStretch;
 
 #define SCPU_CFG_MIRROR_DISPLAY_DEFAULT 1024
 

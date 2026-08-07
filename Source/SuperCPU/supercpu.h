@@ -108,6 +108,26 @@ public:
 	// CC64Memory's relocation section. On by default; the switch exists so a
 	// game that goes wrong with it can prove it with one config line.
 	void setUnderIORelocate( bool e ) { m_Memory.m_RelocEnable = e; }
+
+	// CIA2 timer NMI retiming (NMI_RETIME); see CC64Memory's retiming
+	// section. On by default, same escape-hatch reasoning.
+	void setNMIRetime( bool e )
+	{
+		m_Memory.m_NMIRetimeEnable = e;
+		m_Memory.cia2RecomputeNMIState();
+	}
+
+	// Hold NMIs back while the 65816 is in native mode (NMI_NATIVE_DEFER);
+	// see CW65C816::m_DeferNativeNMI for why no real machine takes one.
+	void setDeferNativeNMI( bool e ) { m_Core65816.m_DeferNativeNMI = e; }
+
+	// Interrupt vector reroute into the accelerator EPROM (VECTOR_REROUTE);
+	// see CC64Memory::interruptRerouteActive.
+	void setVectorReroute( bool e ) { m_Memory.m_VectorRerouteEnable = e; }
+
+	// Charge C64-bus accesses their real cost (IO_STRETCH); see
+	// CC64Memory::tickFast.
+	void setIOStretch( bool e ) { m_Memory.m_IOStretchEnable = e; }
 	u32  mirrorDisplayBudget() const         { return m_MirrorDisplayBudget; }
 
 	void reset();

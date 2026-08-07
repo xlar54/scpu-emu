@@ -76,6 +76,10 @@ public:
 	// CSuperCPURegisters::onInterruptAcknowledged / onInterruptReturned.
 	virtual void onInterruptAcknowledged() {}
 	virtual void onInterruptReturned() {}
+
+	// True when accelerator state wants interrupt vectors fetched from the
+	// accelerator's own ROM; see CC64Memory::interruptRerouteActive.
+	virtual bool interruptRerouteRequested() const { return false; }
 };
 
 #define C64_RAM_SIZE      0x10000
@@ -238,6 +242,61 @@ public:
 		write8( a, v );
 	}
 
+	// --- interrupt vector reroute -----------------------------------------
+	// A real SuperCPU does not fetch interrupt vectors from the C64 map at
+	// all when it is running as an accelerator: it redirects the fetch into
+	// its OWN EPROM at $F80000+vector, which carries a genuine 65816 vector
+	// table pointing at trampolines ($FCA4 = JML $00C003 for NMI, $FC94 =
+	// JML $00FBE1 for IRQ/BRK, and so on). That is why the KERNAL images can
+	// get away with holding the C64 jump table across $FFE4-$FFEF, and why a
+	// 65816 program may put its own code there: nothing ever reads those
+	// bytes as vectors.
+	//
+	// VICE implements it as scpu64_interrupt_reroute() (scpu64mem.c) hooked
+	// into LOAD_INT_ADDR (scpu64cpu.c). Both halves of its condition are
+	// reproduced here: page $FF must be served by the accelerator's own
+	// KERNAL window rather than C64 DRAM, AND the processor must be in
+	// native mode or the accelerator must have its registers open / be in
+	// system 1MHz / DOS-extension / RAMLink state.
+	//
+	// Ordinary C64 operation satisfies neither half of the second clause in
+	// emulation mode, so the stock KERNAL's own vectors are used exactly as
+	// before; the reroute engages only where a real card would take over.
+	bool m_VectorRerouteEnable = true;		// config VECTOR_REROUTE
+	u64  m_VectorReroutes = 0;				// statistics
+
+	// --- C64-bus access cost ----------------------------------------------
+	// Set by the I/O paths when an access actually reaches the real bus, and
+	// charged at the end of the instruction in tickFast(). Accelerator
+	// registers we intercept never touch the bus and cost nothing.
+	bool m_IOStretchEnable = true;			// config IO_STRETCH
+	u8   m_PendingIOAccess = 0;
+	u8   m_PendingIOExtra = 0;				// extra whole C64 cycles (CIA)
+	u64  m_IOStretchCycles = 0;				// statistics
+
+	inline void noteBusAccess( u16 addr )
+	{
+		m_PendingIOAccess = 1;
+		// VICE charges CIA accesses an additional whole cycle
+		// (scpu64_clock_write_stretch_io_start_cia / _io_cia).
+		if ( ( addr & 0xFC00 ) == 0xDC00 && m_PendingIOExtra < 4 )
+			m_PendingIOExtra++;
+	}
+
+	bool interruptRerouteActive( bool emulationMode ) const
+	{
+		if ( !m_VectorRerouteEnable )
+			return false;
+		// Bootmap already maps the EPROM over $E000-$FFFF, so the ordinary
+		// fetch reads the very bytes the reroute would.
+		if ( m_BootmapActive || !m_ROMShadow )
+			return false;
+		if ( c64MapRead( 0xFF00, m_BankMode ) != REG_KERNAL )
+			return false;
+		return !emulationMode
+		    || ( m_IO && m_IO->interruptRerouteRequested() );
+	}
+
 	// --- interrupts, cached -----------------------------------------------
 	// /IRQ and /NMI come from the VIC-II and the CIAs, which live in the C64's
 	// 1MHz domain: the lines physically cannot change faster than about once a
@@ -254,15 +313,43 @@ public:
 	// is reused here; at 1MHz that is every cycle, i.e. the old behaviour.
 	inline void refreshInterruptsIfDue()
 	{
+		// CIA2 timer NMIs are delivered on the EMULATED clock, not the sampled
+		// line. Checked before the credit gate: the deadline is in emulated
+		// cycles and must not wait out the sampling quantum. Costs one compare
+		// against an almost-always-zero u64.
+		if ( m_CIA2NMIDeadline && ciaNow() >= m_CIA2NMIDeadline )
+			ciaTimerNMIDue();
+
 		// Under automatic IEC throttling, a nominal 20MHz cycle lasts one
 		// microsecond. Use the effective rate so the cache does not become 20us.
-		const u32 threshold = m_IECHoldCycles ? 1 : m_PacingCheckCycles;
+		const u32 threshold = ( m_IECHoldCycles || m_IECPollHoldCycles )
+		                    ? 1 : m_PacingCheckCycles;
 		if ( m_IntCredit >= threshold && m_C64 )
 		{
-			m_C64->sampleInterrupts( m_CachedIRQ, m_CachedNMI );
+			bool irq, nmi;
+			m_C64->sampleInterrupts( irq, nmi );
+			m_CachedIRQ = irq;
+
+			// While a CIA2 timer NMI is armed, the TIMERS own the NMI line:
+			// delivery is synthetic, at the deadline the emulated clock
+			// computes from the timer writes, and the sampled line -- which
+			// carries the same interrupts, only µs-jittered -- is ignored
+			// entirely. Programs arm these timers to hit an exact spot in
+			// their instruction stream (Winter Games /SCPU fires one every
+			// transfer chunk and its only protection for a native-mode window
+			// is that the NMI always lands outside it); sampling slack broke
+			// that contract. When no timer NMI is armed the line passes
+			// through as always: RESTORE, FLAG and friends are unaffected.
+			if ( m_CIA2NMIOwned )
+				m_CachedNMI = m_SynthNMIActive;
+			else
+				m_CachedNMI = nmi || m_SynthNMIActive;
 			m_IntCredit = 0;
 		}
 	}
+	// Out of line: a timer deadline arrived. Exposes the NMI and re-arms
+	// (continuous) or disarms (one-shot) the model.
+	void ciaTimerNMIDue();
 	// Tell the accelerator an interrupt is being serviced / returned from.
 	inline void notifyInterruptAcknowledged()
 	{
@@ -294,10 +381,73 @@ public:
 	inline void tickFast( u32 nCycles )
 	{
 		m_EmuCycles += nCycles;
+
+		// A C64-bus access does not cost the accelerator the handful of cycles
+		// its opcode takes: it costs a WHOLE C64 cycle, because the SuperCPU
+		// stalls until PHI2, performs the access at 1MHz, and only then runs
+		// on. VICE charges this explicitly (scpu64cpu.c
+		// scpu64_clock_read_stretch_io / _write_stretch_io_*, one
+		// scpu64_maincpu_inc() per access and a second for CIA accesses, then
+		// a phase relock). We charged nothing at all, and that is the deepest
+		// timing error in this emulator: it makes I/O-bound code run several
+		// times too fast in emulated time.
+		//
+		// The visible consequence is quantisation. A poll loop
+		//   LDA $D012 / CMP #x / BNE
+		// takes exactly ONE C64 cycle per iteration on a real SuperCPU -- the
+		// nine processor cycles vanish inside the stall -- so 1000 iterations
+		// are 1000 microseconds. Charging only the opcode cycles made the same
+		// loop nine emulated cycles, and a CIA timer armed for 21us then fired
+		// at a completely different instruction. That is what put Winter Games'
+		// throwaway NMI inside a native-mode window it was written to survive.
+		//
+		// Modelled as: an access completes at the next C64-cycle boundary,
+		// with an extra whole cycle for the CIAs (which VICE charges twice).
+		if ( m_PendingIOAccess )
+		{
+			// EFFECTIVE emulated cycles per C64 cycle, not the nominal
+			// selection: at 1MHz -- explicitly chosen, or forced by the IEC
+			// throttle -- the processor already runs at the bus's own rate and
+			// there is nothing to stall for, so no stretch applies and the
+			// serial paths keep their per-instruction tick granularity.
+			const u64 perC64 = effectiveCIAFactor();
+			u64 extra = 0;
+			if ( m_IOStretchEnable && perC64 > 1 )
+			{
+				const u64 phase = m_EmuCycles % perC64;
+				if ( phase )
+					extra += perC64 - phase;
+				extra += (u64)m_PendingIOExtra * perC64;
+			}
+			m_PendingIOAccess = 0;
+			m_PendingIOExtra = 0;
+			if ( extra )
+			{
+				m_EmuCycles += extra;
+				m_IOStretchCycles += extra;
+				nCycles += (u32)extra;
+			}
+		}
+
 		if ( nCycles > m_MaxTickChunk )
 			m_MaxTickChunk = nCycles;
 		if ( m_IntCredit < 0x100000 )
 			m_IntCredit += nCycles;
+
+		// A timer armed during the instruction just ticked gets its deadline
+		// anchored NOW, with that instruction's cycles included: this is the
+		// moment the byte would have reached the real chip.
+		if ( m_CIA2ArmPending )
+			cia2FinishArm();
+
+		// CIA2 timer NMI deadlines are checked HERE, not only in the
+		// interrupt-cache refresh: the run loop samples interrupts once per
+		// slice, and a 20-cycle deadline armed mid-slice would otherwise
+		// deliver milliseconds late. An armed deadline also forces fine
+		// ticks (see fineTicksRequired), so this executes per instruction
+		// while it matters and is one compare against zero otherwise.
+		if ( m_CIA2NMIDeadline && ciaNow() >= m_CIA2NMIDeadline )
+			ciaTimerNMIDue();
 
 		// The serial-activity window counts down here. Without this decrement
 		// the flag armed at CMD's boot-time drive probe and never expired:
@@ -308,7 +458,23 @@ public:
 			m_IECActivityCycles = ( m_IECActivityCycles > nCycles )
 			                    ? ( m_IECActivityCycles - nCycles ) : 0;
 
-		const bool iecActive = ( m_IECHoldCycles != 0 );
+		// The poll-sustained SPEED hold decays the same way; its expiry is a
+		// rate transition for armed CIA2 deadlines.
+		if ( m_IECPollHoldCycles )
+		{
+			m_IECPollHoldCycles = ( m_IECPollHoldCycles > nCycles )
+			                    ? ( m_IECPollHoldCycles - nCycles ) : 0;
+			if ( m_IECPollHoldCycles == 0 && m_IECHoldCycles == 0 )
+			{
+				if ( m_CIA2NMIDeadline )
+					cia2OnRateChange();
+				if ( m_TimingHook )
+					m_TimingHook( m_TimingHookCtx );
+			}
+		}
+
+		const bool iecActive = ( m_IECHoldCycles != 0 )
+		                    || ( m_IECPollHoldCycles != 0 );
 		if ( iecActive )
 			m_IECThrottledCycles += nCycles;
 		if ( iecActive || ( m_SelectedEmulatedHz != 0
@@ -318,8 +484,15 @@ public:
 		{
 			m_IECHoldCycles = ( m_IECHoldCycles > nCycles )
 			                ? ( m_IECHoldCycles - nCycles ) : 0;
-			if ( m_IECHoldCycles == 0 && m_TimingHook )
-				m_TimingHook( m_TimingHookCtx );
+			if ( m_IECHoldCycles == 0 )
+			{
+				// Hold expiry is an effective-speed transition; armed CIA2
+				// deadlines re-denominate (cold: once per expiry).
+				if ( m_CIA2NMIDeadline )
+					cia2OnRateChange();
+				if ( m_TimingHook )
+					m_TimingHook( m_TimingHookCtx );
+			}
 		}
 
 		if ( m_HostPerEmuQ16 == 0 || !m_C64 )
@@ -385,7 +558,10 @@ public:
 	// and DDRA transitions arm a hold-off during which pacing runs at 1MHz
 	// whatever speed the accelerator is nominally set to.
 	void setIECThrottle( bool enabled ) { m_IECThrottleEnabled = enabled; }
-	bool iecThrottleActive() const { return m_IECHoldCycles > 0; }
+	bool iecThrottleActive() const
+	{
+		return m_IECHoldCycles > 0 || m_IECPollHoldCycles > 0;
+	}
 
 	// The 65816 normally batches several instructions before ticking the C64
 	// bus. That is safe at turbo speed, but not at an effective/selected 1MHz:
@@ -395,6 +571,8 @@ public:
 	bool fineTicksRequired() const
 	{
 		return m_IECHoldCycles != 0 || m_IECActivityCycles != 0
+		    || m_IECPollHoldCycles != 0
+		    || m_CIA2NMIDeadline != 0 || m_CIA2ArmPending != 0
 		    || ( m_SelectedEmulatedHz != 0
 		         && m_SelectedEmulatedHz <= 1000000u );
 	}
@@ -419,6 +597,118 @@ public:
 	u32  m_IntCredit = 0xFFFFF;	// starts "due" so the first query samples
 	bool m_CachedIRQ = false;
 	bool m_CachedNMI = false;
+
+	// --- CIA2 timer NMI retiming ------------------------------------------
+	// The physical NMI line is sampled with up to a microsecond of slack and
+	// delivered at instruction-batch boundaries -- jitter that is invisible
+	// to almost everything and fatal to code that arms a short CIA2 timer
+	// NMI to land at an exact spot in its instruction stream. We see every
+	// timer register write on its way to the real chip, so the underflow
+	// moment is computable on the emulated clock exactly. While such a timer
+	// NMI is armed (and no other NMI source shares the mask), delivery is
+	// synthetic-at-deadline and the sampled line is ignored; the moment the
+	// mask clears, the line passes through again untouched.
+	bool m_NMIRetimeEnable = true;		// config NMI_RETIME
+	bool m_CIA2NMIOwned = false;		// timers own the line: synth-only delivery
+	bool m_SynthNMIActive = false;		// synthetic level; falls on ICR read/mask clear
+	u8   m_CIA2ICRMask = 0;				// CIA2 interrupt enable mask, bits 0/1 = timers
+	// Underflows latch here REGARDLESS of the mask, like the chip's ICR: a
+	// timer that expires masked still delivers the instant the mask is
+	// enabled. Cleared by the ICR read, like the chip.
+	u8   m_CIA2ICRPending = 0;
+	u8   m_CIA2TACR = 0, m_CIA2TBCR = 0;
+	// A START write records the arm here instead of computing the deadline on
+	// the spot. The write is observed from inside write8(), where m_EmuCycles
+	// has NOT yet been advanced by the storing instruction -- on real hardware
+	// the byte reaches the chip on that instruction's LAST cycle, so anchoring
+	// there fires every timer ~4 cycles early. Four cycles is nothing against
+	// a frame, and everything against Winter Games' ~20-cycle landing window:
+	// early delivery beat the loader's own STA $01 and the NMI vectored out of
+	// un-set-up RAM. tickFast() finalises the anchor once the instruction's
+	// cycles are in. Bit 0 = timer A, bit 1 = timer B.
+	u8   m_CIA2ArmPending = 0;
+	u16  m_CIA2TALatch = 0xFFFF, m_CIA2TBLatch = 0xFFFF;
+	u64  m_CIA2TADeadline = 0, m_CIA2TBDeadline = 0;	// emu-cycle underflow, 0=off
+	u64  m_CIA2NMIDeadline = 0;			// min armed deadline: the hot-path fast-out
+	u64  m_CIA2FactorInUse = 1;			// emu-cycles-per-C64-cycle the deadlines are in
+	// A CIA counts REAL microseconds. Emulated cycles are the wrong currency
+	// for it: an I/O-heavy stretch -- a raster poll loop, a serial poll loop
+	// -- burns real time on every bus access that the emulated cycle counter
+	// never sees, so "N cycles x speed factor" drifts arbitrarily far from
+	// "N microseconds". Winter Games arms a 20-cycle NMI inside a $D012 poll
+	// loop at turbo; measured on hardware, we made the deadline 420 emulated
+	// cycles and delivered ~100 instructions past where the real chip fires,
+	// inside the native-mode window the loader had timed itself to survive.
+	// So when the bus offers a real clock, deadlines live in HOST cycles and
+	// need no rescaling at all: real time is real time whatever the CPU is
+	// doing. The emulated-cycle path remains for the host tests, which have
+	// no clock.
+	bool m_CIAUseHostClock = false;
+	u64  m_CIAHostPerC64 = 0;			// host cycles per C64 cycle (~1us)
+	// "Now", in whichever units the armed deadlines are held.
+	inline u64 ciaNow()
+	{
+		return ( m_CIAUseHostClock && m_C64 ) ? m_C64->hostCycles() : m_EmuCycles;
+	}
+	// The length of n C64 cycles, in those same units.
+	inline u64 ciaSpan( u64 n ) const
+	{
+		return m_CIAUseHostClock ? n * m_CIAHostPerC64 : n * m_CIA2FactorInUse;
+	}
+	u64  m_SynthNMIsDelivered = 0;		// statistics
+	u64  m_CIA2Rescales = 0;			// deadline re-denominations at speed changes
+	// Forensic trace of the LAST timer-NMI lifecycle, for the stall dump:
+	// emu-cycle stamps at arm (deadline computed), underflow latch, and
+	// synthetic exposure. The core stamps the take separately.
+	// Each arm starts a new GENERATION; a stage that never happened for the
+	// current one is reported as absent rather than as a wrapped subtraction
+	// of two unrelated stamps. All four stamps are in ciaNow() units.
+	u32  m_NMITraceGen = 0;
+	u64  m_NMITraceArmAt = 0;
+	u64  m_NMITraceLatchAt = 0;   u32 m_NMITraceLatchGen = 0xFFFFFFFF;
+	u64  m_NMITraceExposeAt = 0;  u32 m_NMITraceExposeGen = 0xFFFFFFFF;
+	u64  m_NMITraceTakeAt = 0;    u32 m_NMITraceTakeGen = 0xFFFFFFFF;
+
+	// The core calls this when it actually dispatches an NMI, so the dump can
+	// show delivery latency in the same clock as everything else.
+	void noteNMITaken()
+	{
+		m_NMITraceTakeAt = ciaNow();
+		m_NMITraceTakeGen = m_NMITraceGen;
+	}
+	// Stamps as microseconds since the arm, or 0xFFFFFFFF for "never happened
+	// for this arm".
+	u32 nmiTraceStageUS( u64 at, u32 gen ) const
+	{
+		if ( gen != m_NMITraceGen || at < m_NMITraceArmAt )
+			return 0xFFFFFFFF;
+		const u64 per = ( m_CIAUseHostClock && m_CIAHostPerC64 )
+		              ? m_CIAHostPerC64 : 1;
+		return (u32)( ( at - m_NMITraceArmAt ) / per );
+	}
+
+	// Cold: timer/mask register writes ($DD04-$DD0F) update the model.
+	void cia2TimerWrite( u16 addr, u8 value );
+	void cia2RecomputeNMIState();
+	void cia2MaybeDeliverSynthNMI();
+	// Anchor a START recorded by cia2TimerWrite; see m_CIA2ArmPending.
+	void cia2FinishArm();
+	// Serial-port reads sustain the 1MHz hold with a short top-up, matching
+	// the real SuperCPU's access-triggered auto-slow. Mirror suppression is
+	// NOT touched by polls; see the implementation.
+	void notePollHold();
+	// The CIA counts C64 cycles; our deadlines are stored in emulated cycles
+	// under some emu-per-C64 factor. EVERY effective-speed transition must
+	// re-denominate outstanding deadlines -- Winter Games arms its timer in
+	// turbo and selects 1MHz ($D07B) one instruction later, and a deadline
+	// left in turbo units fires 20x late in C64 time, exactly late enough to
+	// land inside the native-mode window it was engineered to miss.
+	void cia2OnRateChange();
+	inline u64 effectiveCIAFactor() const
+	{
+		return ( m_IECHoldCycles || m_IECPollHoldCycles ) ? 1ULL
+		     : (u64)( m_PacingCheckCycles ? m_PacingCheckCycles : 1 );
+	}
 private:
 
 private:
@@ -440,6 +730,11 @@ private:
 	bool m_IECThrottleEnabled;
 	u32  m_IECHoldCycles;		// emulated cycles left at forced 1MHz
 	u32  m_IECActivityCycles = 0;	// emulated cycles since last serial edge (countdown)
+	// SPEED-only hold sustained by serial-port READS (mere polls included):
+	// the real SuperCPU's auto-slow re-arms on every access. Kept apart from
+	// m_IECHoldCycles because iecBusActive() -- the MIRROR gate -- must never
+	// see it: polls suppressing mirroring is the blackout latch-up.
+	u32  m_IECPollHoldCycles = 0;
 public:
 	// Largest single tickFast() chunk seen. The 65816 run() loop batches bus
 	// ticks for speed but must drop to per-instruction ticks while the serial

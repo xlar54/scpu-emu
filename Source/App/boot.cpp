@@ -165,6 +165,19 @@ struct SCPUResetDiagnostic
 	u32 nmisTaken;
 	bool liveIRQ;
 	bool liveNMI;
+	// CIA2 timer-NMI model state at snapshot time.
+	u32 nmiSynth;
+	u8  nmiHoldActive;
+	u32 nmiRescales;
+	u32 nmiTraceArm;
+	u32 nmiTraceLatch;
+	u32 nmiTraceExpose;
+	u32 nmiTraceTake;
+	u32 nmiDeferred;
+	u8  nmiOwned;
+	u8  nmiMask;
+	u32 nmiFactor;
+	u8  nmiDeadlineArmed;
 	u8 stack[ 16 ];
 	u8 code[ 16 ];
 	u32 cia[ 64 ];
@@ -209,6 +222,28 @@ static void scpuSnapshotResetDiagnostic( CSuperCPU *scpu )
 		d.irqsTaken = core->m_IRQsTaken;
 		d.nmisTaken = core->m_NMIsTaken;
 		radBusSampleInterrupts( d.liveIRQ, d.liveNMI );
+	}
+
+	{
+		CC64Memory &m = scpu->memory();
+		d.nmiSynth = (u32)m.m_SynthNMIsDelivered;
+		d.nmiHoldActive = m.iecThrottleActive() ? 1 : 0;
+		d.nmiRescales = (u32)m.m_CIA2Rescales;
+		d.nmiOwned = m.m_CIA2NMIOwned ? 1 : 0;
+		d.nmiMask = m.m_CIA2ICRMask;
+		d.nmiFactor = (u32)m.m_CIA2FactorInUse;
+		d.nmiDeadlineArmed = m.m_CIA2NMIDeadline ? 1 : 0;
+		// Lifecycle deltas of the LAST timer NMI, all relative to the arm:
+		// where the time went between the deadline and the core's dispatch.
+		// Microseconds since the arm, per stage, for the CURRENT arm only;
+		// 0xFFFFFFFF means that stage never happened for it.
+		d.nmiTraceLatch  = m.nmiTraceStageUS( m.m_NMITraceLatchAt,  m.m_NMITraceLatchGen );
+		d.nmiTraceExpose = m.nmiTraceStageUS( m.m_NMITraceExposeAt, m.m_NMITraceExposeGen );
+		d.nmiTraceTake   = m.nmiTraceStageUS( m.m_NMITraceTakeAt,   m.m_NMITraceTakeGen );
+		d.nmiTraceArm = (u32)m.m_NMITraceGen;
+		d.nmiDeferred = 0;
+		if ( CW65C816 *core816 = scpu->core65816() )
+			d.nmiDeferred = (u32)core816->m_NMIsDeferred;
 	}
 
 	for ( u32 i = 0; i < 16; i++ )
@@ -298,6 +333,39 @@ static void scpuEmitResetDiagnostic()
 		               d.p, ( d.p & W65_I ) ? 1 : 0, d.e,
 		               (unsigned)d.irqsTaken, (unsigned)d.nmisTaken,
 		               d.liveIRQ ? 1 : 0, d.liveNMI ? 1 : 0 );
+
+	// The CIA2 timer-NMI model's view at snapshot time -- which mode
+	// delivered the NMIs, and how the deadline units moved with speed.
+	s_Logger->Write( "SCPU", LogNotice,
+	               "  nmi model: synth=%u hold=%u rescales=%u owned=%u mask=$%02X factor=%u deadline=%s",
+	               (unsigned)d.nmiSynth, (unsigned)d.nmiHoldActive,
+	               (unsigned)d.nmiRescales, (unsigned)d.nmiOwned,
+	               d.nmiMask, (unsigned)d.nmiFactor,
+	               d.nmiDeadlineArmed ? "armed" : "none" );
+	{
+		// Absent stages print as "-", so an armed-but-never-fired timer (or an
+		// NMI held back by the native-mode deferral) reads as exactly that
+		// instead of as a wrapped subtraction.
+		char lat[ 16 ], exp[ 16 ], tak[ 16 ];
+		const u32 stages[ 3 ] = { d.nmiTraceLatch, d.nmiTraceExpose, d.nmiTraceTake };
+		char *outs[ 3 ] = { lat, exp, tak };
+		for ( u32 i = 0; i < 3; i++ )
+		{
+			u32 n = 0;
+			if ( stages[ i ] == 0xFFFFFFFF )
+			{
+				outs[ i ][ 0 ] = '-'; outs[ i ][ 1 ] = 0;
+			} else {
+				scpuLineStart( outs[ i ], 16, n );
+				scpuLineChar( outs[ i ], 16, n, '+' );
+				scpuLineDecimal( outs[ i ], 16, n, stages[ i ] );
+			}
+		}
+		s_Logger->Write( "SCPU", LogNotice,
+		               "  nmi trace: arm#%u latch=%sus expose=%sus take=%sus deferred=%u",
+		               (unsigned)d.nmiTraceArm, lat, exp, tak,
+		               (unsigned)d.nmiDeferred );
+	}
 
 	char line[ SCPU_DUMP_LINE_SIZE ];
 	u32 n = 0;
@@ -512,16 +580,25 @@ static bool scpuCheckButton( void *ctx )
 			                       && s_HeartbeatPCHigh <= 0x00E5D8 );
 			const bool stalled = ( span < 64 ) && !kernalIdle;
 
-			CScopedLoggingIRQs irqs;
-			s_Logger->Write( "SCPU", LogNotice,
-			               "hb PC=$%06X..$%06X wb=%u iec=%u BA=%u PHI=%u irqbank=%u%s",
-			               (unsigned)s_HeartbeatPCLow, (unsigned)s_HeartbeatPCHigh,
-			               (unsigned)scpu->writeBuffer().pending(),
-			               (unsigned)( scpu->memory().iecBusActive() ? 1 : 0 ),
-			               (unsigned)radBAWaitTimeouts,
-			               (unsigned)radPHIWaitTimeouts,
-			               (unsigned)scpu->registers().m_InterruptBankCloses,
-			               stalled ? "  <-- STALLED" : "" );
+			// The print is optional (HEARTBEAT, default off): one logger write
+			// with IRQs unmasked costs enough real time to stutter the display
+			// for a visible instant, once per second. The sampling above and
+			// the stall detection below stay armed regardless -- they cost
+			// nothing until a stall is actually found, and a found stall is
+			// worth a stutter.
+			if ( cfgHeartbeat )
+			{
+				CScopedLoggingIRQs irqs;
+				s_Logger->Write( "SCPU", LogNotice,
+				               "hb PC=$%06X..$%06X wb=%u iec=%u BA=%u PHI=%u irqbank=%u%s",
+				               (unsigned)s_HeartbeatPCLow, (unsigned)s_HeartbeatPCHigh,
+				               (unsigned)scpu->writeBuffer().pending(),
+				               (unsigned)( scpu->memory().iecBusActive() ? 1 : 0 ),
+				               (unsigned)radBAWaitTimeouts,
+				               (unsigned)radPHIWaitTimeouts,
+				               (unsigned)scpu->registers().m_InterruptBankCloses,
+				               stalled ? "  <-- STALLED" : "" );
+			}
 
 			if ( stalled )
 			{
@@ -532,8 +609,12 @@ static bool scpuCheckButton( void *ctx )
 					s_HeartbeatDumped = true;
 					scpuSnapshotResetDiagnostic( scpu );
 					CScopedLoggingIRQs dumpIRQs;
+					// Self-contained: with HEARTBEAT off there were no hb
+					// lines before this, so name the loop here.
 					s_Logger->Write( "SCPU", LogNotice,
-					               "STALL DETECTED -- dumping state (no reset pressed)" );
+					               "STALL DETECTED at PC=$%06X..$%06X -- dumping state (no reset pressed)",
+					               (unsigned)s_HeartbeatPCLow,
+					               (unsigned)s_HeartbeatPCHigh );
 					scpuEmitResetDiagnostic();
 				}
 			}
@@ -938,6 +1019,25 @@ void scpuBootRun( CLogger *logger )
 	superCPU.setUnderIORelocate( cfgMirrorD000Relocate != 0 );
 	logger->Write( "SCPU", LogNotice, "mirror: under-I/O sprite relocation %s",
 	               cfgMirrorD000Relocate ? "on" : "off" );
+
+	// Say once whether the per-second line will follow, so a quiet log reads
+	// as configured rather than wedged. Stall detection is armed either way.
+	logger->Write( "SCPU", LogNotice, "heartbeat: %s (stall detector always armed)",
+	               cfgHeartbeat ? "on" : "off" );
+
+	// CIA2 timer NMIs delivered on the emulated clock instead of the sampled
+	// line; cycle-timed loader NMIs (Winter Games /SCPU) depend on it.
+	superCPU.setNMIRetime( cfgNMIRetime != 0 );
+	superCPU.setDeferNativeNMI( cfgNMINativeDefer != 0 );
+	superCPU.setVectorReroute( cfgVectorReroute != 0 );
+	superCPU.setIOStretch( cfgIOStretch != 0 );
+	logger->Write( "SCPU", LogNotice,
+	               "nmi retime: %s, native defer: %s, vector reroute: %s",
+	               cfgNMIRetime ? "on" : "off",
+	               cfgNMINativeDefer ? "on" : "off",
+	               cfgVectorReroute ? "on" : "off" );
+	logger->Write( "SCPU", LogNotice, "bus access cost (io stretch): %s",
+	               cfgIOStretch ? "on" : "off" );
 
 	// From superCPU.init() onward the Pi owns and accesses the C64 bus in
 	// sub-microsecond GPIO windows. Circle's timer/SD IRQs may pre-empt at any

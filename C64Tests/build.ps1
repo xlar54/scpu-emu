@@ -20,9 +20,14 @@ foreach ($source in Get-ChildItem -Path (Join-Path $testRoot "basic") -Filter "*
 foreach ($source in Get-ChildItem -Path (Join-Path $testRoot "ml") -Filter "*.asm") {
     $object = Join-Path $objDir ($source.BaseName + ".o")
     $output = Join-Path $binDir ($source.BaseName.ToUpperInvariant() + ".prg")
+    $linkConfig = if ($source.Name -eq "15-scpu128probe.asm") {
+        Join-Path $testRoot "ml\c128-prg.cfg"
+    } else {
+        Join-Path $testRoot "ml\c64-prg.cfg"
+    }
     & ca65 --cpu 65816 -I (Join-Path $testRoot "ml") -o $object $source.FullName
     if ($LASTEXITCODE -ne 0) { throw "ca65 failed for $($source.Name)" }
-    & ld65 -C (Join-Path $testRoot "ml\c64-prg.cfg") -o $output $object
+    & ld65 -C $linkConfig -o $output $object
     if ($LASTEXITCODE -ne 0) { throw "ld65 failed for $($source.Name)" }
 }
 

@@ -65,6 +65,24 @@ public:
 	// KERNAL out of bank 0 and never needs the accelerator's ROM.
 	void setROM( const u8 *image, u32 length );
 	bool hasROM() const { return m_ROMLength != 0; }
+
+	// --- interrupt vector reroute -----------------------------------------
+	// See CC64Memory::interruptRerouteActive. When it applies, the vector
+	// comes from the accelerator's EPROM at $F80000+vector instead of the
+	// C64 map.
+	bool interruptRerouteActive( bool emulationMode ) const
+	{
+		return m_Bank0 && m_ROMLength
+		    && m_Bank0->interruptRerouteActive( emulationMode );
+	}
+	void noteNMITaken() { if ( m_Bank0 ) m_Bank0->noteNMITaken(); }
+
+	u16 rerouteVector( u16 addr )
+	{
+		m_Bank0->m_VectorReroutes++;
+		return (u16)( read8( SCPU_ROM_BASE + addr )
+		            | ( (u16)read8( SCPU_ROM_BASE + addr + 1 ) << 8 ) );
+	}
 	const u8 *romImage() const { return m_ROM; }
 	u32  romLength() const { return m_ROMLength; }
 

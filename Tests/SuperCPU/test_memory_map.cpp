@@ -493,3 +493,723 @@ TEST( scpu_boot_animation_deviation_is_one_byte_wide )
 	regs.ioWrite( SCPU_REG_HWREGS_ENABLE, 0 );
 	CHECK( regs.ioRead( 0xD20C, v ) ); CHECK_EQ( v, 0xFF );
 }
+
+// ---------------------------------------------------------------------------
+// CIA2 timer NMI retiming
+//
+// The physical NMI line is sampled with up to a microsecond of slack; code
+// that arms a short CIA2 timer NMI to land at an exact instruction cannot
+// survive that jitter. Winter Games /SCPU fires a 20-cycle one-shot timer
+// NMI per transfer chunk while keeping native-mode windows whose only
+// protection is the NMI's timing. These tests drive the model through
+// CC64Memory's real write8/read8/tickFast paths with a host bus standing in
+// for the physical line. Pacing is off, so one emulated cycle equals one C64
+// cycle and the $14 latch means a deadline 21 cycles out.
+// ---------------------------------------------------------------------------
+
+struct RetimeFixture
+{
+	CHostBus   bus;
+	CC64Memory mem;
+
+	RetimeFixture()
+	{
+		mem.attachBus( &bus );
+		mem.reset();
+	}
+
+	// The Winter Games arm sequence, exactly: latch $0014, one-shot START,
+	// then enable the timer-A NMI mask.
+	void armWinterGames()
+	{
+		mem.write8( 0xDD04, 0x14 );
+		mem.write8( 0xDD05, 0x00 );
+		mem.write8( 0xDD0E, 0x09 );
+		mem.tickFast( 4 );		// the STA $DD0E instruction completes
+		mem.write8( 0xDD0D, 0x81 );
+	}
+
+	// Advance time and ask for the NMI the way the core does.
+	bool nmiAfter( u32 cycles )
+	{
+		mem.tickFast( cycles );
+		return mem.nmiFast();
+	}
+};
+
+TEST( nmi_retime_delivers_at_the_emulated_deadline_not_the_sampled_line )
+{
+	RetimeFixture f;
+	f.armWinterGames();
+
+	// The physical line asserts EARLY -- the jitter this exists to erase.
+	f.bus.m_NMI = true;
+
+	// Ten cycles in: before the deadline, and the early line is ignored.
+	CHECK( !f.nmiAfter( 10 ) );
+	// Twenty-one cycles total: the timer underflows on the emulated clock.
+	CHECK( f.nmiAfter( 11 ) );
+}
+
+TEST( nmi_retime_ack_ends_the_assertion_and_the_next_shot_is_a_new_edge )
+{
+	RetimeFixture f;
+	f.armWinterGames();
+	f.bus.m_NMI = true;
+	CHECK( f.nmiAfter( 21 ) );
+
+	// The handler acknowledges; the line (still sampled high -- the real
+	// chip has not been serviced in this fake) no longer reaches the core:
+	// the timers own it while the mask holds.
+	f.mem.read8( 0xDD0D );
+	f.bus.m_NMI = false;
+	CHECK( !f.nmiAfter( 1 ) );
+
+	// Re-arm for the next chunk; a fresh deadline, a fresh edge.
+	f.mem.write8( 0xDD0E, 0x09 );
+	f.mem.tickFast( 4 );		// the STA $DD0E instruction completes
+	CHECK( !f.nmiAfter( 10 ) );
+	CHECK( f.nmiAfter( 11 ) );
+}
+
+TEST( nmi_retime_unarmed_line_passes_through )
+{
+	RetimeFixture f;
+	// No timer, no mask: RESTORE-style NMIs behave exactly as before.
+	CHECK( !f.nmiAfter( 5 ) );
+	f.bus.m_NMI = true;
+	CHECK( f.nmiAfter( 1 ) );
+	f.bus.m_NMI = false;
+	CHECK( !f.nmiAfter( 1 ) );
+}
+
+TEST( nmi_retime_mixed_sources_fall_back_to_the_line )
+{
+	RetimeFixture f;
+	f.mem.write8( 0xDD04, 0x14 );
+	f.mem.write8( 0xDD05, 0x00 );
+	f.mem.write8( 0xDD0E, 0x09 );
+	f.mem.tickFast( 4 );		// the STA $DD0E instruction completes
+	// Timer A AND FLAG enabled: FLAG events are invisible to the model, so
+	// the timers cannot own the line; sampled delivery for everything.
+	f.mem.write8( 0xDD0D, 0x91 );
+	f.bus.m_NMI = true;
+	CHECK( f.nmiAfter( 1 ) );		// immediate, jitter and all
+}
+
+TEST( nmi_retime_stop_and_mask_clear_disarm )
+{
+	RetimeFixture f;
+	f.armWinterGames();
+	f.mem.write8( 0xDD0E, 0x08 );	// STOP before underflow
+	CHECK( !f.nmiAfter( 64 ) );		// never fires
+
+	f.armWinterGames();
+	f.mem.write8( 0xDD0D, 0x7F );	// mask cleared: source disabled
+	CHECK( !f.nmiAfter( 64 ) );
+}
+
+TEST( nmi_retime_continuous_mode_fires_every_period )
+{
+	RetimeFixture f;
+	f.mem.write8( 0xDD04, 0x14 );
+	f.mem.write8( 0xDD05, 0x00 );
+	f.mem.write8( 0xDD0E, 0x01 );	// continuous
+	f.mem.tickFast( 4 );			// the STA $DD0E instruction completes
+	f.mem.write8( 0xDD0D, 0x81 );
+
+	CHECK( !f.nmiAfter( 10 ) );
+	CHECK( f.nmiAfter( 11 ) );		// first underflow
+	f.mem.read8( 0xDD0D );			// ack
+	CHECK( !f.nmiAfter( 1 ) );
+	CHECK( f.nmiAfter( 21 ) );		// second period, second edge
+}
+
+TEST( nmi_retime_disabled_restores_line_delivery )
+{
+	RetimeFixture f;
+	f.mem.m_NMIRetimeEnable = false;
+	f.armWinterGames();
+	f.mem.cia2RecomputeNMIState();
+
+	f.bus.m_NMI = true;
+	CHECK( f.nmiAfter( 1 ) );		// the sampled line, as before the feature
+	CHECK_EQ( f.mem.m_SynthNMIsDelivered, 0u );
+}
+
+#include "../../Source/CPU/W65C816/w65c816.h"
+#include <initializer_list>
+
+TEST( nmi_retime_keeps_the_nmi_out_of_a_native_mode_window )
+{
+	// The Winter Games shape, end to end on the real core: arm the 20-cycle
+	// one-shot timer NMI, then pass through a short CLC/XCE native window
+	// (its only protection being that the NMI lands outside it), with the
+	// physical line asserting IN the window the way jittered sampling saw
+	// it. Retimed delivery must hold the NMI to the deadline, which lies
+	// beyond the SEC/XCE -- so the core takes it in emulation mode, where
+	// the vectors are sane. This is the exact contract whose violation
+	// BRK-stormed the real machine through KT's accidental $6C03 vector.
+	CHostBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+
+	// All-RAM banking so $FFFA comes from RAM, like the game's loader phase.
+	mem.write8( 0x0001, 0x35 );
+
+	u16 a = 0x1000;
+	auto emit = [&]( std::initializer_list<int> bytes )
+	{
+		for ( int b : bytes ) mem.write8( a++, (u8)b );
+	};
+	emit( { 0x78 } );							// SEI
+	emit( { 0xA9, 0x14, 0x8D, 0x04, 0xDD } );	// LDA #$14  STA $DD04
+	emit( { 0xA9, 0x00, 0x8D, 0x05, 0xDD } );	// LDA #$00  STA $DD05
+	emit( { 0xA9, 0x09, 0x8D, 0x0E, 0xDD } );	// LDA #$09  STA $DD0E  (one-shot START)
+	emit( { 0xA9, 0x81, 0x8D, 0x0D, 0xDD } );	// LDA #$81  STA $DD0D  (NMI enable)
+	// The window must COMPLETE before the deadline -- that is the contract
+	// the game's engineering establishes and the retimer preserves. Arm at
+	// ~cycle 16, deadline 21 later at 37; this window spans cycles 26-34.
+	const u16 windowEntry = a;
+	emit( { 0x18, 0xFB } );						// CLC XCE      -> native
+	emit( { 0x38, 0xFB } );						// SEC XCE      -> emulation
+	const u16 windowExit = a;
+	for ( u32 i = 0; i < 40; i++ ) emit( { 0xEA } );	// post-window run
+	emit( { 0x4C, (u8)( ( a + 3 ) & 0xFF ), (u8)( ( a + 3 ) >> 8 ) } );	// JMP next
+	// NMI handler: just RTI; taking it at all is what the test observes.
+	mem.write8( 0x2000, 0x40 );
+	mem.write8( 0xFFFA, 0x00 );
+	mem.write8( 0xFFFB, 0x20 );
+
+	CW65C816 cpu;
+	cpu.attachBus( &mem );
+	cpu.m_PC = 0x1000; cpu.m_PBR = 0; cpu.m_E = true;
+	cpu.m_S = 0x01F0;
+
+	u64 lastNMIs = cpu.m_NMIsTaken;
+	bool tookInNative = false, tookInEmulation = false;
+	for ( u32 step = 0; step < 400 && !( tookInNative || tookInEmulation ); step++ )
+	{
+		// The moment the core enters the native window, the "physical" line
+		// asserts -- the early, jittered arrival.
+		if ( cpu.m_PC >= windowEntry && cpu.m_PC < windowExit && !cpu.m_E )
+			bus.m_NMI = true;
+
+		cpu.step();
+
+		if ( cpu.m_NMIsTaken != lastNMIs )
+		{
+			lastNMIs = cpu.m_NMIsTaken;
+			if ( cpu.m_E ) tookInEmulation = true;
+			else           tookInNative    = true;
+		}
+	}
+
+	CHECK( tookInEmulation );
+	CHECK( !tookInNative );
+	CHECK_EQ( mem.m_SynthNMIsDelivered, 1u );
+}
+
+TEST( nmi_retime_serial_polls_sustain_the_1mhz_hold_for_the_arm )
+{
+	// Winter Games arms its timer NMI in the middle of a $DD00 poll phase.
+	// A real SuperCPU's auto-slow re-arms on EVERY serial-port access, polls
+	// included, so the arm and its aftermath run at 1MHz and the NMI lands a
+	// handful of instructions later, exactly where the handler expects. Our
+	// edge-armed hold had expired there; polls must sustain the SPEED hold.
+	CHostBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	mem.setPacing( 0, 20000000 );
+
+	// Serial lines idle-high: these are MERE polls, no receive evidence.
+	bus.m_Memory[ 0xDD00 ] = 0xFF;
+	// An old edge, long expired; the KERNAL keeps polling while the drive
+	// steps between sectors.
+	mem.write8( 0xDD00, 0x17 );
+	mem.tickFast( 110000 );				// the edge-armed hold fully decays
+	CHECK( !mem.iecThrottleActive() );
+	for ( u32 i = 0; i < 300; i++ )
+	{
+		mem.tickFast( 700 );			// polls tens of microseconds apart
+		mem.read8( 0xDD00 );
+	}
+	CHECK( mem.iecThrottleActive() );	// sustained by polls alone
+
+	mem.write8( 0xDD04, 0x14 );
+	mem.write8( 0xDD05, 0x00 );
+	mem.write8( 0xDD0E, 0x09 );
+	mem.tickFast( 4 );		// the STA $DD0E instruction completes
+	mem.write8( 0xDD0D, 0x81 );
+
+	// Deadline in HELD units: 21 emulated cycles, the 1MHz landing zone.
+	mem.tickFast( 10 );
+	CHECK( !mem.nmiFast() );
+	mem.tickFast( 12 );
+	CHECK( mem.nmiFast() );
+	CHECK_EQ( mem.m_SynthNMIsDelivered, 1u );
+}
+
+TEST( nmi_retime_poll_hold_decays_quickly_without_polls )
+{
+	// The top-up is short by design: a game reading $DD00 once per frame
+	// pays about a millisecond, not the 100ms edge-hold -- no latch-up.
+	CHostBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	mem.setPacing( 0, 20000000 );
+	bus.m_Memory[ 0xDD00 ] = 0xFF;		// idle lines: a poll, not a receive
+
+	mem.read8( 0xDD00 );				// one isolated poll from cold
+	CHECK( mem.iecThrottleActive() );
+	mem.tickFast( 1100 );
+	CHECK( !mem.iecThrottleActive() );	// gone within ~a millisecond
+}
+
+TEST( nmi_retime_deadline_survives_an_explicit_speed_change_mid_count )
+{
+	// Winter Games' arm sequence ends with a $D07B write: timer armed in
+	// turbo, machine dropped to 1MHz ONE INSTRUCTION LATER. The deadline was
+	// computed as 21 C64 cycles = 420 turbo emu-cycles; after the switch
+	// those same C64 cycles are 21 emu-cycles. Without re-denomination the
+	// NMI fires 20x late in C64 time -- landing, deterministically, inside
+	// the native window it was engineered to miss.
+	CHostBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	mem.setPacing( 0, 20000000 );	// turbo: 20 emu cycles per C64 cycle
+
+	mem.write8( 0xDD04, 0x14 );
+	mem.write8( 0xDD05, 0x00 );
+	mem.write8( 0xDD0E, 0x09 );
+	mem.tickFast( 4 );		// the STA $DD0E instruction completes
+	mem.write8( 0xDD0D, 0x81 );
+
+	mem.setPacing( 0, 1000000 );	// the $D07B: explicit 1MHz
+	CHECK( mem.m_CIA2Rescales >= 1u );
+
+	// 21 C64 cycles at the new rate: fire at ~21 emulated cycles, not 420.
+	mem.tickFast( 10 );
+	CHECK( !mem.nmiFast() );
+	mem.tickFast( 12 );
+	CHECK( mem.nmiFast() );
+	CHECK_EQ( mem.m_SynthNMIsDelivered, 1u );
+}
+
+TEST( nmi_retime_deadline_survives_a_speed_up_mid_count )
+{
+	// The mirror image: armed at 1MHz, then turbo selected. 21 C64 cycles
+	// become 420 emu-cycles of code; firing at emu-cycle 21 would be 20x
+	// EARLY, interrupting code that has barely begun.
+	CHostBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	mem.setPacing( 0, 1000000 );
+
+	mem.write8( 0xDD04, 0x14 );
+	mem.write8( 0xDD05, 0x00 );
+	mem.write8( 0xDD0E, 0x09 );
+	mem.tickFast( 4 );		// the STA $DD0E instruction completes
+	mem.write8( 0xDD0D, 0x81 );
+
+	mem.setPacing( 0, 20000000 );
+
+	mem.tickFast( 100 );
+	CHECK( !mem.nmiFast() );
+	mem.tickFast( 250 );
+	CHECK( !mem.nmiFast() );
+	mem.tickFast( 100 );
+	CHECK( mem.nmiFast() );
+}
+
+TEST( nmi_retime_explicit_speed_select_clears_the_poll_hold )
+{
+	// Winter Games' OTHER arm site: arm under the poll-sustained 1MHz, then
+	// write $D07B to run the timed section at turbo. Turbo may already be
+	// the nominal selection -- no speed change, no speed hook -- yet the
+	// declaration must still end the advisory poll-slow and re-denominate
+	// the armed deadline, or the code runs 20x dilated into a native window
+	// while the NMI arrives dead on time.
+	CHostBus bus;
+	CC64Memory mem;
+	CSuperCPURegisters regs;
+	mem.attachBus( &bus );
+	mem.setIOInterceptor( &regs );
+	regs.reset();
+	mem.reset();
+	mem.setPacing( 0, 20000000 );
+	bus.m_Memory[ 0xDD00 ] = 0xFF;		// idle lines: polls, not receives
+
+	mem.read8( 0xDD00 );				// the KERNAL's poll loop
+	CHECK( mem.iecThrottleActive() );
+
+	mem.write8( 0xDD04, 0x14 );			// arm under the poll hold: factor 1
+	mem.write8( 0xDD05, 0x00 );
+	mem.write8( 0xDD0E, 0x09 );
+	mem.tickFast( 4 );		// the STA $DD0E instruction completes
+	mem.write8( 0xDD0D, 0x81 );
+
+	mem.write8( 0xD07B, 0x01 );			// the game declares its speed
+
+	CHECK( !mem.iecThrottleActive() );	// advisory hold gone
+	CHECK( mem.m_CIA2Rescales >= 1u );	// deadline moved into turbo units
+
+	// ~21 C64 cycles at full speed: ~420 emulated cycles, not 21.
+	mem.tickFast( 30 );
+	CHECK( !mem.nmiFast() );
+	mem.tickFast( 350 );
+	CHECK( !mem.nmiFast() );
+	mem.tickFast( 60 );
+	CHECK( mem.nmiFast() );
+	CHECK_EQ( mem.m_SynthNMIsDelivered, 1u );
+}
+
+#include "../../Source/SuperCPU/supercpu.h"
+
+TEST( nmi_retime_delivery_is_punctual_through_the_run_loop )
+{
+	// The full delivery chain through the REAL run loop, whose batching and
+	// per-slice interrupt sampling are what actually delayed Winter Games'
+	// NMI on hardware. The game's contract: a 20-cycle one-shot NMI with a
+	// throwaway RTI handler, armed a handful of 1MHz instructions before a
+	// native-mode section containing a LONG interruptible MVN -- the NMI
+	// must land in the plain code right after the arm (emulation mode,
+	// where its vectors are sane), never inside the native section.
+	//
+	// Two distinguishable handlers make the landing mode observable: the
+	// emulation vector counts at $0FFD, the native vector counts at $0FFE.
+	static CHostBus bus;
+	static CSuperCPU scpu;
+	static u8 kernal[ 8192 ], basic[ 8192 ], chargen[ 4096 ];
+	std::memset( kernal, 0xAA, sizeof kernal );
+	std::memset( basic, 0xAA, sizeof basic );
+	std::memset( chargen, 0, sizeof chargen );
+	scpu.setKernalROM( kernal );
+	scpu.setBasicROM( basic );
+	scpu.setCharROM( chargen );
+	CHECK( scpu.init( &bus, SCPU_CORE_65816, SCPU_SIMM_NONE ) );
+
+	CC64Memory &mem = scpu.memory();
+	mem.write8( 0x0001, 0x35 );			// all-RAM banking, like the loader
+	bus.m_Memory[ 0xDD00 ] = 0xFF;
+
+	u16 a = 0x1000;
+	auto emit = [&]( int b ) { mem.write8( a++, (u8)b ); };
+	auto emit3 = [&]( int x, int y, int z ) { emit( x ); emit( y ); emit( z ); };
+	emit( 0x78 );						// SEI
+	emit( 0xA9 ); emit( 0x14 ); emit3( 0x8D, 0x04, 0xDD );
+	emit( 0xA9 ); emit( 0x00 ); emit3( 0x8D, 0x05, 0xDD );
+	emit( 0xA9 ); emit( 0x09 ); emit3( 0x8D, 0x0E, 0xDD );
+	emit( 0xA9 ); emit( 0x81 ); emit3( 0x8D, 0x0D, 0xDD );
+	for ( u32 i = 0; i < 12; i++ ) emit( 0xEA );	// the designed landing zone
+	emit( 0x18 ); emit( 0xFB );			// CLC XCE: native
+	for ( u32 i = 0; i < 300; i++ ) emit( 0xEA );	// long native section (the MVN)
+	emit( 0x38 ); emit( 0xFB );			// SEC XCE: back
+	const u16 loop = a;
+	emit3( 0x4C, loop & 0xFF, loop >> 8 );
+
+	mem.write8( 0x2000, 0xEE ); mem.write8( 0x2001, 0xFD ); mem.write8( 0x2002, 0x0F );
+	mem.write8( 0x2003, 0x40 );			// INC $0FFD / RTI      (emulation NMI)
+	mem.write8( 0x2100, 0xEE ); mem.write8( 0x2101, 0xFE ); mem.write8( 0x2102, 0x0F );
+	mem.write8( 0x2103, 0xDB );			// INC $0FFE / STP      (native NMI)
+	mem.write8( 0xFFFA, 0x00 ); mem.write8( 0xFFFB, 0x20 );
+	mem.write8( 0xFFEA, 0x00 ); mem.write8( 0xFFEB, 0x21 );
+	mem.write8( 0x0FFD, 0x00 ); mem.write8( 0x0FFE, 0x00 );
+
+	CW65C816 *c = scpu.core65816();
+	c->m_PC = 0x1000; c->m_PBR = 0; c->m_E = true;
+	c->m_S = 0x01F0;
+
+	// The device state at the crash: the KERNAL's poll loop has the machine
+	// under the 1MHz poll hold, so the arm computes a 21-cycle deadline.
+	mem.read8( 0xDD00 );
+
+	// Large budgets exercise the batch path; re-entry after a run break is
+	// how the exposed edge reaches the core, exactly as on the device.
+	for ( u32 i = 0; i < 40 && c->m_NMIsTaken == 0; i++ )
+		c->run( 2000 );
+	for ( u32 i = 0; i < 10; i++ )
+		c->run( 2000 );					// let the RTI path settle
+
+	CHECK_EQ( c->m_NMIsTaken, 1u );
+	CHECK_EQ( mem.m_RAM[ 0x0FFD ], 1 );	// landed in emulation mode
+	CHECK_EQ( mem.m_RAM[ 0x0FFE ], 0 );	// never inside the native section
+	CHECK( !c->m_Stopped );
+}
+
+TEST( nmi_native_defer_holds_until_emulation_mode )
+{
+	// A native-mode NMI vectors through $00FFEA. On a SuperCPU nothing valid
+	// is there, so the deferral holds the dispatch until the processor is
+	// back in emulation mode, where the vector is the machine's real one.
+	CHostBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	mem.write8( 0x0001, 0x35 );			// all-RAM: vectors come from RAM
+
+	u16 a = 0x1000;
+	auto emit = [&]( int b ) { mem.write8( a++, (u8)b ); };
+	emit( 0x18 ); emit( 0xFB );			// CLC XCE -> native
+	for ( u32 i = 0; i < 20; i++ ) emit( 0xEA );
+	const u16 backToEmu = a;
+	emit( 0x38 ); emit( 0xFB );			// SEC XCE -> emulation
+	for ( u32 i = 0; i < 10; i++ ) emit( 0xEA );
+
+	// Distinguishable handlers: emulation counts $0FFD, native counts $0FFE.
+	mem.write8( 0x2000, 0xEE ); mem.write8( 0x2001, 0xFD ); mem.write8( 0x2002, 0x0F );
+	mem.write8( 0x2003, 0x40 );
+	mem.write8( 0x2100, 0xEE ); mem.write8( 0x2101, 0xFE ); mem.write8( 0x2102, 0x0F );
+	mem.write8( 0x2103, 0x40 );
+	mem.write8( 0xFFFA, 0x00 ); mem.write8( 0xFFFB, 0x20 );
+	mem.write8( 0xFFEA, 0x00 ); mem.write8( 0xFFEB, 0x21 );
+
+	CW65C816 cpu;
+	cpu.attachBus( &mem );
+	cpu.m_DeferNativeNMI = true;
+	cpu.m_PC = 0x1000; cpu.m_PBR = 0; cpu.m_E = true; cpu.m_S = 0x01F0;
+
+	cpu.step();							// CLC
+	cpu.step();							// XCE -> native
+	CHECK( !cpu.m_E );
+
+	bus.m_NMI = true;					// the line asserts INSIDE native mode
+	for ( u32 i = 0; i < 12 && cpu.m_PC < backToEmu; i++ )
+		cpu.step();
+	CHECK_EQ( cpu.m_NMIsTaken, 0u );	// held
+	CHECK( cpu.m_NMIsDeferred > 0u );
+	CHECK_EQ( mem.m_RAM[ 0x0FFE ], 0 );	// never dispatched natively
+
+	// Back to emulation mode: the held NMI is delivered at once.
+	for ( u32 i = 0; i < 40 && cpu.m_NMIsTaken == 0; i++ )
+		cpu.step();
+	for ( u32 i = 0; i < 4; i++ ) cpu.step();		// let the handler run
+	CHECK_EQ( cpu.m_NMIsTaken, 1u );
+	CHECK_EQ( mem.m_RAM[ 0x0FFD ], 1 );	// through the emulation vector
+	CHECK_EQ( mem.m_RAM[ 0x0FFE ], 0 );
+}
+
+TEST( nmi_native_defer_off_dispatches_natively )
+{
+	// With the escape hatch clear, the processor behaves as itself.
+	CHostBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	mem.write8( 0x0001, 0x35 );
+
+	u16 a = 0x1000;
+	auto emit = [&]( int b ) { mem.write8( a++, (u8)b ); };
+	emit( 0x18 ); emit( 0xFB );
+	for ( u32 i = 0; i < 10; i++ ) emit( 0xEA );
+
+	mem.write8( 0x2100, 0xEE ); mem.write8( 0x2101, 0xFE ); mem.write8( 0x2102, 0x0F );
+	mem.write8( 0x2103, 0x40 );
+	mem.write8( 0xFFEA, 0x00 ); mem.write8( 0xFFEB, 0x21 );
+
+	CW65C816 cpu;
+	cpu.attachBus( &mem );
+	cpu.m_DeferNativeNMI = false;
+	cpu.m_PC = 0x1000; cpu.m_PBR = 0; cpu.m_E = true; cpu.m_S = 0x01F0;
+
+	cpu.step(); cpu.step();				// into native mode
+	bus.m_NMI = true;
+	for ( u32 i = 0; i < 6 && cpu.m_NMIsTaken == 0; i++ )
+		cpu.step();
+	for ( u32 i = 0; i < 4; i++ ) cpu.step();		// let the handler run
+	CHECK_EQ( cpu.m_NMIsTaken, 1u );
+	CHECK_EQ( mem.m_RAM[ 0x0FFE ], 1 );	// dispatched through the native vector
+}
+
+// ---------------------------------------------------------------------------
+// Interrupt vector reroute
+//
+// A real SuperCPU does not fetch interrupt vectors from the C64 map while it
+// is acting as an accelerator: it redirects the fetch into its own EPROM at
+// $F80000+vector, which carries a genuine 65816 vector table. VICE models
+// this as scpu64_interrupt_reroute() hooked into LOAD_INT_ADDR. It is why the
+// KERNAL images can hold the ordinary C64 jump table across $FFE4-$FFEF and
+// why a 65816 program may keep its own code at those addresses.
+// ---------------------------------------------------------------------------
+
+struct RerouteFixture
+{
+	CHostBus            bus;
+	CC64Memory          bank0;
+	CFastRAM            simm;
+	CSuperCPUMemoryMap  map;
+	CSuperCPURegisters  regs;
+	u8                  bank1[ 0x10000 ];
+	u8                  rom[ 0x20000 ];
+
+	RerouteFixture()
+	{
+		std::memset( bank1, 0, sizeof bank1 );
+		std::memset( rom, 0, sizeof rom );
+		// EPROM vectors, deliberately distinct from the C64 map's.
+		rom[ 0xFFEA ] = 0x34; rom[ 0xFFEB ] = 0x12;		// native NMI -> $1234
+		rom[ 0xFFFE ] = 0x78; rom[ 0xFFFF ] = 0x56;		// emu IRQ/BRK -> $5678
+		// What the accelerator's KERNAL window holds at the same addresses.
+		bank1[ 0xFFEA ] = 0xAD; bank1[ 0xFFEB ] = 0xDE;	// -> $DEAD
+		bank1[ 0xFFFE ] = 0xEF; bank1[ 0xFFFF ] = 0xBE;	// -> $BEEF
+
+		bank0.attachBus( &bus );
+		bank0.setIOInterceptor( &regs );
+		bank0.setROMShadow( bank1 );
+		regs.trackKernalShadow( &bank0.m_KernalShadowBase );
+		regs.reset();
+		simm.init( SCPU_SIMM_NONE );
+		map.attachBank0( &bank0 );
+		map.attachFastRAM( &simm );
+		bank0.reset();
+		map.reset();
+		map.setROM( rom, sizeof rom );
+	}
+};
+
+TEST( vector_reroute_applies_in_native_mode )
+{
+	RerouteFixture f;
+	// Default banking has the KERNAL window at page $FF.
+	CHECK( f.map.interruptRerouteActive( false ) );		// native: always
+	CHECK_EQ( f.map.rerouteVector( 0xFFEA ), 0x1234 );	// from the EPROM
+	CHECK_EQ( f.bank0.read8( 0xFFEA ), 0xAD );			// map still reads KT
+}
+
+TEST( vector_reroute_stays_out_of_ordinary_emulation_mode )
+{
+	RerouteFixture f;
+	// Emulation mode with the card idle is an ordinary C64: the KERNAL's own
+	// vectors are used, exactly as before this existed.
+	CHECK( !f.regs.hardwareRegsEnabled() );
+	CHECK( !f.map.interruptRerouteActive( true ) );
+
+	// ...but with the hardware registers open, the card has taken over.
+	f.bank0.write8( SCPU_REG_HWREGS_ENABLE, 0 );
+	CHECK( f.regs.hardwareRegsEnabled() );
+	CHECK( f.map.interruptRerouteActive( true ) );
+	CHECK_EQ( f.map.rerouteVector( 0xFFFE ), 0x5678 );
+}
+
+TEST( vector_reroute_needs_the_accelerator_kernal_window )
+{
+	RerouteFixture f;
+	// With RAM banked in at $E000-$FFFF the vectors are the program's own and
+	// page $FF is C64 DRAM, so nothing is rerouted -- in either mode.
+	f.bank0.write8( 0x0001, 0x35 );
+	CHECK( !f.map.interruptRerouteActive( false ) );
+	CHECK( !f.map.interruptRerouteActive( true ) );
+}
+
+TEST( vector_reroute_disabled_by_config )
+{
+	RerouteFixture f;
+	f.bank0.m_VectorRerouteEnable = false;
+	CHECK( !f.map.interruptRerouteActive( false ) );
+}
+
+TEST( vector_reroute_reaches_the_core )
+{
+	// End to end: a native-mode interrupt taken by the real core must land on
+	// the EPROM's vector, not the KERNAL window's.
+	RerouteFixture f;
+	CW65C816 cpu;
+	cpu.attachFastBus( &f.map );
+	cpu.m_PC = 0x1000; cpu.m_PBR = 0; cpu.m_E = true; cpu.m_S = 0x01F0;
+
+	// Into native mode: CLC XCE.
+	f.bank0.write8( 0x1000, 0x18 );
+	f.bank0.write8( 0x1001, 0xFB );
+	cpu.step(); cpu.step();
+	CHECK( !cpu.m_E );
+
+	f.bus.m_NMI = true;
+	for ( u32 i = 0; i < 8 && cpu.m_NMIsTaken == 0; i++ )
+		cpu.step();
+	CHECK_EQ( cpu.m_NMIsTaken, 1u );
+	CHECK_EQ( cpu.m_PC, 0x1234 );				// the EPROM's vector
+	CHECK( f.bank0.m_VectorReroutes > 0 );
+}
+
+TEST( io_stretch_quantises_a_poll_loop_to_c64_cycles )
+{
+	// The property that matters, and the one we had wrong: on a real
+	// SuperCPU a C64-bus access costs a WHOLE C64 cycle, so a poll loop
+	//     LDA $D012 / CMP #x / BNE
+	// takes exactly one C64 cycle per iteration -- the processor's own nine
+	// cycles disappear inside the stall. 1000 iterations are 1000
+	// microseconds, not 450. VICE charges this in
+	// scpu64_clock_read_stretch_io(); we charged nothing, and a CIA timer
+	// armed for 21us landed at a completely different instruction.
+	CHostBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	mem.setPacing( 0, 20000000 );			// turbo: 20 emulated cycles per C64 cycle
+
+	u16 loop = 0x1000;
+	mem.write8( loop + 0, 0xAD ); mem.write8( loop + 1, 0x12 ); mem.write8( loop + 2, 0xD0 );
+	mem.write8( loop + 3, 0xC9 ); mem.write8( loop + 4, 0xFF );	// never equal
+	mem.write8( loop + 5, 0xD0 ); mem.write8( loop + 6, 0xF9 );
+
+	CW65C816 cpu;
+	cpu.attachBus( &mem );
+	cpu.m_PC = loop; cpu.m_PBR = 0; cpu.m_E = true; cpu.m_S = 0x01F0;
+
+	const u64 start = mem.m_EmuCycles;
+	for ( u32 i = 0; i < 100; i++ )
+	{
+		cpu.step();							// LDA $D012
+		cpu.step();							// CMP #$00
+		cpu.step();							// BNE
+	}
+	const u64 elapsed = mem.m_EmuCycles - start;
+
+	// One C64 cycle per iteration -- 100 accesses stretched to 20 emulated
+	// cycles each -- plus the last iteration's CMP and BNE, which have no
+	// following access to be absorbed into.
+	CHECK_EQ( elapsed, 2005u );
+	CHECK( mem.m_IOStretchCycles > 0 );
+
+	// Without the stretch the same loop would be nine cycles an iteration --
+	// the error that made I/O-bound code run several times too fast.
+	CHostBus bus2;
+	CC64Memory mem2;
+	mem2.attachBus( &bus2 );
+	mem2.reset();
+	mem2.setPacing( 0, 20000000 );
+	mem2.m_IOStretchEnable = false;
+	for ( u16 i = 0; i < 7; i++ ) mem2.write8( loop + i, mem.m_RAM[ loop + i ] );
+	CW65C816 cpu2;
+	cpu2.attachBus( &mem2 );
+	cpu2.m_PC = loop; cpu2.m_PBR = 0; cpu2.m_E = true; cpu2.m_S = 0x01F0;
+	const u64 start2 = mem2.m_EmuCycles;
+	for ( u32 i = 0; i < 100; i++ ) { cpu2.step(); cpu2.step(); cpu2.step(); }
+	CHECK_EQ( mem2.m_EmuCycles - start2, 900u );
+}
+
+TEST( io_stretch_does_not_apply_at_1mhz )
+{
+	// At 1MHz the processor already runs at the bus rate: nothing to stall
+	// for, and the serial paths keep their per-instruction granularity.
+	CHostBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	mem.setPacing( 0, 1000000 );
+
+	mem.write8( 0x1000, 0xAD ); mem.write8( 0x1001, 0x12 ); mem.write8( 0x1002, 0xD0 );
+	CW65C816 cpu;
+	cpu.attachBus( &mem );
+	cpu.m_PC = 0x1000; cpu.m_PBR = 0; cpu.m_E = true; cpu.m_S = 0x01F0;
+
+	const u64 start = mem.m_EmuCycles;
+	cpu.step();
+	CHECK_EQ( mem.m_EmuCycles - start, 4u );	// LDA abs, and nothing added
+	CHECK_EQ( mem.m_IOStretchCycles, 0u );
+}

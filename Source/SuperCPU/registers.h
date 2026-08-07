@@ -169,6 +169,17 @@ public:
 	bool turboEnabled() const        { return fastMode(); }
 	bool hardwareRegsEnabled() const { return m_HWRegsEnabled; }
 
+	// True when the accelerator claims interrupt vector fetches for its own
+	// EPROM; see CC64Memory::interruptRerouteActive for the whole rule. This
+	// is the accelerator-state half of VICE's scpu64_interrupt_reroute()
+	// (scpu64mem.c): hardware registers open, system 1MHz, the DOS extension
+	// or RAMLink. Native mode -- the other half -- is CPU state and is passed
+	// in by the caller.
+	bool interruptRerouteRequested() const override
+	{
+		return m_HWRegsEnabled || m_Sys1MHz || m_DOSExt || m_RAMLink;
+	}
+
 	// Servicing an interrupt closes the register bank.
 	//
 	// CMD's own vector table proves it. With the bank OPEN, $E000-$FFFF is the

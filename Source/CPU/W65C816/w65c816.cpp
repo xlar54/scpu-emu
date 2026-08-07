@@ -240,7 +240,15 @@ void CW65C816::serviceInterrupt( u32 vectorNative, u32 vectorEmu, bool isBRKorCO
 	// interrupt taken while executing outside bank 0 cannot be returned from.
 	m_PBR = 0;
 
-	m_PC = read16Bank0( (u16)( m_E ? vectorEmu : vectorNative ) );
+	// A SuperCPU redirects interrupt vector fetches into its own EPROM
+	// whenever it is acting as an accelerator, which is why neither KERNAL
+	// image needs a native vector table and why a 65816 program may keep its
+	// own code across $FFE4-$FFEF. See CC64Memory::interruptRerouteActive.
+	const u16 vec = (u16)( m_E ? vectorEmu : vectorNative );
+	if ( m_FastBus && m_FastBus->interruptRerouteActive( m_E ) )
+		m_PC = m_FastBus->rerouteVector( vec );
+	else
+		m_PC = read16Bank0( vec );
 	applyE();
 }
 
@@ -357,17 +365,22 @@ u32 CW65C816::stepInner()
 		          | ( m_NMIPending ? W65_PEND_NMI : 0 ) );
 	}
 
-	if ( m_NMIPending )
+	if ( m_NMIPending && !( m_DeferNativeNMI && !m_E ) )
 	{
 		m_NMIPending = false;
 		m_Waiting = false;
 		m_Pending &= (u8)~( W65_PEND_NMI | W65_PEND_WAITING );
 		m_NMIsTaken++;
+		m_LastNMITakeCycles = m_Cycles;
+		if ( m_FastBus ) m_FastBus->noteNMITaken();
 		const u32 c = m_E ? 7 : 8;
 		serviceInterrupt( W65_VEC_NATIVE_NMI, W65_VEC_EMU_NMI, false );
 		m_Cycles += c;
 		return c;
 	}
+
+	if ( m_NMIPending && m_DeferNativeNMI && !m_E )
+		m_NMIsDeferred++;		// held for the next emulation-mode boundary
 
 	// WAI parks the processor until an interrupt appears. It resumes even when
 	// the interrupt is masked -- and that second exit is the whole point of the
