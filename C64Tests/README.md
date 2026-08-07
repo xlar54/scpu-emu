@@ -47,6 +47,7 @@ tests will report that no accelerator was detected.
 | `13-VICBANKS` | ML | VIC banks 0-3 and accelerator write mirroring | four stable solid-colour screens; key advances |
 | `14-SPRITEBALLS` | ML | all eight sprites, ninth X bits, frame pacing and VIC writes | eight differently coloured balls bounce smoothly; key exits |
 | `15-SCPU128PROBE` | ML/C128 | read-only SCPU128, 8722 MMU, ROM-window and 24-bit bank fingerprints | creates `SCPU128 LOG` as a sequential file on device 8 |
+| `16-NMITIMING` | ML | CIA2 Timer-A one-shot timing, native-window delivery and 1024-edge stress | repeatable sweep signatures, zero misses, and native/deferred totals adding to `$40` |
 
 `01-SPEED` reports raw jiffies, the Normal/Turbo ratio, and an effective MHz
 estimate obtained by treating the forced-Normal run as the 1.0 MHz reference.
@@ -116,6 +117,32 @@ is written as `SCPU128 LOG` on device 8, replacing the previous report. Make a
 fresh copy after each run and repeat after cold boots in C128 40-column, C128
 80-column, Normal and Turbo configurations. Also record the machine revision,
 PAL/NTSC standard, SCPU ROM revision, physical switch position and SIMM size.
+
+`16-NMITIMING` is for side-by-side RAD, VICE SCPU64 and real-SuperCPU
+comparison. Select forced 1 MHz or Turbo at its start screen. It temporarily
+banks out the KERNAL and installs direct handlers in RAM under `$FFEA/$FFFA`,
+removing the KERNAL prologue from the measurement; it also puts a temporary
+`JML` at `$C003` for the SuperCPU EPROM native-vector route. Five CIA2 Timer-A
+latch values are sampled 32 times. `MIN`, `MAX`, and `SUM` identify the
+instruction boundary where each NMI arrived. Exact signatures can differ
+between implementations, but repeated runs on one implementation should be
+tight. The native-window line classifies 64 NMIs as taken while `E=0`, deferred
+until `E=1`, or missed. The final 1024 varying one-shots must report `OK $0400`
+and `MISS $0000`; `SUM` is a comparison signature. Space is checked between
+trials, then saved vectors, banking and CIA state are restored before BASIC.
+
+Reference capture from 2026-08-07, before the emulated-cycle deadline fix
+(RAD kernel 096): both implementations delivered all 1024 stress edges. VICE
+reported native `$40`, deferred `$00`; RAD with `NMI_NATIVE_DEFER=1` reported
+native `$00`, deferred `$40`. At Turbo, the latch `$10->$20` captured-X slope
+was `$1E->$38` on VICE but only `$0D->$1A` on RAD. Since the measured loop is
+about 12 CPU cycles, those slopes correspond to approximately 19.5 MHz and
+9.75 MHz respectively. This identified the old RAD wall-clock deadline: an
+armed timer forced the interpreter onto its unbatched path, so real time
+expired after only half the intended emulated instructions. Kernel 097 changes
+CIA deadlines to emulated cycles; I/O stretch now accounts for physical bus
+time separately. This reference note preserves the distinguishing signatures
+needed to recognize that regression.
 
 ## Interpreting failures
 
