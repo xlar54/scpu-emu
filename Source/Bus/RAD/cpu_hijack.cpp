@@ -85,6 +85,124 @@ void radResetMachine()
 	INP_GPIO( RESET_OUT );
 }
 
+static u8 takeoverROM[ 256 ];
+
+static const u8 takeoverROMPrefix[] = {
+	0x78,                         // SEI
+	0xA9, 0x00,                   // LDA #$00
+	0x8D, 0x11, 0xD0,             // STA $D011 (blank display)
+	0x8D, 0x20, 0xD0,             // STA $D020
+	0x8D, 0x21, 0xD0,             // STA $D021
+	0xA9, 0x35, 0x85, 0x01,       // LDA #$35 / STA $01
+	0xA9, 0x2F, 0x85, 0x00        // LDA #$2F / STA $00
+};
+
+bool radHijackCPUWithUltimax()
+{
+	register u32 g2, g3;
+
+	// Materialise the exact 256-byte image generated from upstream RAD's
+	// C64Side/ultimax_memcfg.a.  Keeping a complete table also keeps the timed
+	// response loop identical to startWithUltimax(): one indexed byte load.
+	for ( u32 i = 0; i < sizeof( takeoverROM ); i++ ) takeoverROM[ i ] = 0xEA;
+	for ( u32 i = 0; i < sizeof( takeoverROMPrefix ); i++ )
+		takeoverROM[ i ] = takeoverROMPrefix[ i ];
+	takeoverROM[ 0xFC ] = 0x00;
+	takeoverROM[ 0xFD ] = 0xFF;
+	takeoverROM[ 0xFE ] = 0x00;
+	takeoverROM[ 0xFF ] = 0x00;
+
+	CACHE_PRELOAD_INSTRUCTION_CACHE( (void *)radHijackCPUWithUltimax, 4096 );
+	CACHE_PRELOAD_DATA_CACHE( &takeoverROM[ 0 ], 256, CACHE_PRELOADL2KEEP )
+	FORCE_READ_LINEARa( (void *)radHijackCPUWithUltimax, 4096, 65536 );
+	FORCE_READ_LINEAR32a( &takeoverROM, 256, 256 * 32 );
+
+	for ( u32 attempt = 0; attempt < 8; attempt++ )
+	{
+		u32 nCycles = 0;
+		u32 nNOPs = 0;
+
+		// Hold RESET, GAME and DMA low while the cartridge-facing pins are made
+		// outputs.  Releasing RESET and DMA together below lets the C128's Z80
+		// observe GAME, choose C64 mode and hand a known reset stream to the 8502.
+		SET_GPIO( bLATCH_A_OE | bIRQ_OUT | bOE_Dx | bRW_OUT );
+		INP_GPIO_RW();
+		INP_GPIO_IRQ();
+		OUT_GPIO( RESET_OUT );
+		OUT_GPIO( GAME_OUT );
+		OUT_GPIO( DMA_OUT );
+		CLR_GPIO( bRESET_OUT | bGAME_OUT | bDMA_OUT );
+		CLR_GPIO( bMPLEX_SEL );
+
+		DELAY( 1 << 20 );
+
+		WAIT_FOR_CPU_HALFCYCLE
+		BEGIN_CYCLE_COUNTER
+		WAIT_FOR_VIC_HALFCYCLE
+		SET_GPIO( bRESET_OUT | bDMA_OUT );
+		INP_GPIO( RESET_OUT );
+
+		while ( nCycles++ < 1000000 )
+		{
+			WAIT_FOR_CPU_HALFCYCLE
+			RESTART_CYCLE_COUNTER
+			WAIT_UP_TO_CYCLE( WAIT_FOR_SIGNALS + TIMING_OFFSET_CBTD );
+			g2 = read32( ARM_GPIO_GPLEV0 );
+
+			SET_GPIO( bMPLEX_SEL );
+			WAIT_UP_TO_CYCLE( WAIT_CYCLE_MULTIPLEXER );
+			g3 = read32( ARM_GPIO_GPLEV0 );
+			CLR_GPIO( bMPLEX_SEL );
+
+			// Use RAD's dedicated high-byte comparator, exactly as upstream's
+			// C128-safe startWithUltimax().  /ROMH is a PLA output and is not a
+			// reliable substitute during the C128's Z80-to-8502 cartridge handoff.
+			if ( ADDRESS_FFxx && CPU_READS_FROM_BUS )
+			{
+				const u8 data = takeoverROM[ ADDRESS0to7 ];
+				register u32 dd = ( (u32)data ) << D0;
+				write32( ARM_GPIO_GPCLR0,
+				         ( D_FLAG & ( ~dd ) ) | bOE_Dx | bDIR_Dx );
+				write32( ARM_GPIO_GPSET0, dd );
+				SET_BANK2_OUTPUT
+				WAIT_UP_TO_CYCLE( WAIT_CYCLE_READ );
+				SET_GPIO( bOE_Dx | bDIR_Dx );
+
+				if ( data == 0xEA )
+					nNOPs++;
+			}
+
+			WAIT_FOR_VIC_HALFCYCLE
+
+			if ( nNOPs > 12 )
+			{
+				// Every instruction in this region is a read-only NOP.  /DMA
+				// therefore cannot catch the 8502 in the write-cycle hazard
+				// documented in the C128 service manual.
+				CLR_GPIO( bDMA_OUT );
+				WAIT_FOR_CPU_HALFCYCLE
+				WAIT_FOR_VIC_HALFCYCLE
+				WAIT_FOR_CPU_HALFCYCLE
+				WAIT_FOR_VIC_HALFCYCLE
+				WAIT_FOR_CPU_HALFCYCLE
+				WAIT_FOR_VIC_HALFCYCLE
+				RESTART_CYCLE_COUNTER
+				return true;
+			}
+		}
+	}
+
+	// Give the machine back a conventional cartridge-free reset if none of
+	// the attempts reached the NOP stream.
+	SET_GPIO( bLATCH_A_OE | bOE_Dx | bRW_OUT | bGAME_OUT | bDMA_OUT );
+	INP_GPIO_RW();
+	SET_BANK2_OUTPUT
+	INP_GPIO( GAME_OUT );
+	INP_GPIO( DMA_OUT );
+	radResetMachine();
+	return false;
+}
+
 bool radHijackCPU()
 {
 	register u32 g2;
@@ -164,32 +282,27 @@ void radReleaseCPU()
 C64MachineType radDetectMachine()
 {
 	register u32 g2;
-	u8 x, y;
-	bool isC128 = false;
+	u32 c128Votes = 0;
 
-	// $D030 exists on the C128 (its 2MHz mode register) and reads back as $FF
-	// on a C64, where nothing decodes the address.
-	RAD_SPEEK( 0xD030, y );
-
-	if ( y == 0xFF )
+	// Authoritative current RAD probe.  After the Ultimax takeover the VIC-IIe
+	// test register reads $FE or $FC; a C64 does not produce either value. This
+	// probe now runs before timing calibration so C128 refresh can start before
+	// the long write grid. Repeat it to tolerate the already-observed first
+	// transfer loss and occasional buffered-port residue at the configured
+	// baseline sample point. Requiring four votes prevents a single floating
+	// C64 open-bus value from selecting C128 policy.
+	for ( u32 i = 0; i < 16; i++ )
 	{
-		RAD_SPOKE( 0xD030, 0xFC );
-		RAD_SPEEK( 0xD030, x );
-		if ( x == 0xFC )
-			isC128 = true;
-		RAD_SPOKE( 0xD030, 0xFF );
-	} else
-	{
-		isC128 = true;
+		u8 y;
+		RAD_SPEEK( 0xD030, y );
+		if ( y == 0xFE || y == 0xFC ) c128Votes++;
 	}
-
-	RAD_SPOKE( 0xD030, y );
 
 	WAIT_FOR_CPU_HALFCYCLE
 	WAIT_FOR_VIC_HALFCYCLE
 	RESTART_CYCLE_COUNTER
 
-	return isC128 ? MACHINE_C128 : MACHINE_C64;
+	return c128Votes >= 4 ? MACHINE_C128 : MACHINE_C64;
 }
 
 C64VideoStandard radDetectVideoStandard()

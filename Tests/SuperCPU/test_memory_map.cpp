@@ -297,6 +297,52 @@ TEST( bootmap_leaves_io_and_low_ram_alone )
 	CHECK_EQ( mem.read8( 0x7FFF ), 0x22 );
 }
 
+TEST( scpu128_bootmap_enters_the_upper_dos204_extension_half )
+{
+	static u8 rom[ 0x20000 ];
+	for ( u32 i = 0; i < sizeof( rom ); i++ ) rom[ i ] = 0;
+	rom[ 0x05E45 ] = 0x00;       // low-half target is deliberately empty
+	rom[ 0x15E45 ] = 0xB5;       // actual DOS 2.04 C128 entry byte
+	rom[ 0x0FE00 ] = 0x78;       // common reset stub remains in the low half
+
+	CC64Memory mem;
+	mem.setBootmapROM( rom, sizeof( rom ) );
+	mem.setSCPU128Mode( true );
+	mem.m_BootmapActive = true;
+
+	CHECK_EQ( mem.read8( 0xFE00 ), 0x78 );
+	CHECK_EQ( mem.read8( 0x5E45 ), 0xB5 );
+	mem.m_RAM[ 0x6000 ] = 0x66;
+	CHECK_EQ( mem.read8( 0x6000 ), 0x66 );
+}
+
+TEST( scpu128_always_visible_mmu_registers_bypass_c64_pla_and_bootmap )
+{
+	static u8 rom[ 0x20000 ];
+	for ( u32 i = 0; i < sizeof( rom ); i++ ) rom[ i ] = 0xA5;
+
+	CHostBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.setBootmapROM( rom, sizeof( rom ) );
+	mem.setSCPU128Mode( true );
+	mem.m_BootmapActive = true;
+	mem.m_Port01 = 0xE3;         // would hide I/O in the C64 PLA model
+	mem.updateBankMode();
+
+	bus.m_Memory[ 0xD505 ] = 0xB7;
+	bus.m_Memory[ 0xD600 ] = 0x5A;
+	bus.m_Memory[ 0xFF00 ] = 0x3E;
+	CHECK_EQ( mem.read8( 0xD505 ), 0xB7 );
+	CHECK_EQ( mem.read8( 0xD600 ), 0x5A );
+	CHECK_EQ( mem.read8( 0xFF00 ), 0x3E );
+
+	mem.write8( 0xD505, 0xF7 );
+	mem.write8( 0xFF00, 0x00 );
+	CHECK_EQ( bus.m_Memory[ 0xD505 ], 0xF7 );
+	CHECK_EQ( bus.m_Memory[ 0xFF00 ], 0x00 );
+}
+
 TEST( bootmap_off_restores_the_normal_c64_map )
 {
 	static u8 rom[ 0x10000 ];
@@ -479,6 +525,34 @@ TEST( scpu_v2_private_ram_aliases_bank1_sram )
 	u8 v = 0;
 	CHECK( regs.ioRead( 0xD345, v ) );
 	CHECK_EQ( v, 0xA5 );
+}
+
+TEST( scpu128_native_reset_selects_the_dos204_c128_branch )
+{
+	CSuperCPURegisters regs;
+	regs.setSCPU128Mode( true );
+	regs.reset();
+
+	u8 v = 0;
+	CHECK( regs.ioRead( SCPU_REG_VERSION, v ) );
+	CHECK_EQ( v, 0x01 );
+	CHECK( regs.ioRead( SCPU_REG_STATUS, v ) );
+	CHECK_EQ( v, 0x81 );
+	CHECK( regs.ioRead( SCPU_REG_OPTIM_V2, v ) );
+	CHECK_EQ( v, 0xC1 );
+	CHECK( regs.hardwareRegsEnabled() );
+	CHECK_EQ( regs.optimRegister(), 0xC1 );
+
+	// Switching the same model back to its C64 personality restores the v2
+	// SCPU64-compatible reset values used by DOS 2.04's other branch.
+	regs.setSCPU128Mode( false );
+	regs.reset();
+	CHECK( regs.ioRead( SCPU_REG_VERSION, v ) );
+	CHECK_EQ( v, 0x47 );
+	CHECK( regs.ioRead( SCPU_REG_STATUS, v ) );
+	CHECK_EQ( v, 0x07 );
+	CHECK( !regs.hardwareRegsEnabled() );
+	CHECK_EQ( regs.optimRegister(), 0xC7 );
 }
 
 TEST( scpu_v2_colour_ram_is_a_full_byte_bank1_cache )
@@ -1015,6 +1089,70 @@ TEST( nmi_retime_explicit_speed_select_clears_the_poll_hold )
 }
 
 #include "../../Source/SuperCPU/supercpu.h"
+
+TEST( scpu_c128_host_uses_stable_ff_presets_or_an_explicit_mode )
+{
+	static u8 scpuROM[ 0x20000 ];
+	static u8 basic[ C64_BASIC_SIZE ];
+	static u8 kernal[ C64_KERNAL_SIZE ];
+	static u8 chargen[ 4096 ];
+	std::memset( scpuROM, 0xEA, sizeof scpuROM );
+	std::memset( basic, 0xEA, sizeof basic );
+	std::memset( kernal, 0xEA, sizeof kernal );
+	std::memset( chargen, 0, sizeof chargen );
+
+	{
+		static CHostBus nativeBus;
+		static CSuperCPU nativeSCPU;
+		nativeBus.m_Signals.machine = MACHINE_C128;
+		nativeBus.m_Memory[ 0xFF01 ] = 0x3F;
+		nativeBus.m_Memory[ 0xFF02 ] = 0x7F;
+		nativeBus.m_Memory[ 0xFF03 ] = 0x01;
+		nativeBus.m_Memory[ 0xFF04 ] = 0x41;
+		nativeSCPU.memoryMap().setROM( scpuROM, sizeof scpuROM );
+		nativeSCPU.setBasicROM( basic );
+		nativeSCPU.setKernalROM( kernal );
+		nativeSCPU.setCharROM( chargen );
+		CHECK( nativeSCPU.init( &nativeBus, SCPU_CORE_65816, SCPU_SIMM_NONE ) );
+		CHECK( nativeSCPU.registers().scpu128Mode() );
+	}
+
+	{
+		static CHostBus c64Bus;
+		static CSuperCPU c64SCPU;
+		c64Bus.m_Signals.machine = MACHINE_C128;
+		// In C64 mode this window is ordinary KERNAL ROM, not the MMU presets.
+		c64Bus.m_Memory[ 0xFF01 ] = 0x8D;
+		c64Bus.m_Memory[ 0xFF02 ] = 0x07;
+		c64Bus.m_Memory[ 0xFF03 ] = 0xDD;
+		c64Bus.m_Memory[ 0xFF04 ] = 0x4C;
+		c64SCPU.memoryMap().setROM( scpuROM, sizeof scpuROM );
+		c64SCPU.setBasicROM( basic );
+		c64SCPU.setKernalROM( kernal );
+		c64SCPU.setCharROM( chargen );
+		CHECK( c64SCPU.init( &c64Bus, SCPU_CORE_65816, SCPU_SIMM_NONE ) );
+		CHECK( !c64SCPU.registers().scpu128Mode() );
+	}
+
+	{
+		static CHostBus forcedBus;
+		static CSuperCPU forcedSCPU;
+		forcedBus.m_Signals.machine = MACHINE_C128;
+		// Even a native-looking bus signature must not override the explicit
+		// bring-up selection used by the real-hardware C64-mode test.
+		forcedBus.m_Memory[ 0xFF01 ] = 0x3F;
+		forcedBus.m_Memory[ 0xFF02 ] = 0x7F;
+		forcedBus.m_Memory[ 0xFF03 ] = 0x01;
+		forcedBus.m_Memory[ 0xFF04 ] = 0x41;
+		forcedSCPU.setC128Mode( SCPU_C128_MODE_C64 );
+		forcedSCPU.memoryMap().setROM( scpuROM, sizeof scpuROM );
+		forcedSCPU.setBasicROM( basic );
+		forcedSCPU.setKernalROM( kernal );
+		forcedSCPU.setCharROM( chargen );
+		CHECK( forcedSCPU.init( &forcedBus, SCPU_CORE_65816, SCPU_SIMM_NONE ) );
+		CHECK( !forcedSCPU.registers().scpu128Mode() );
+	}
+}
 
 TEST( nmi_retime_delivery_is_punctual_through_the_run_loop )
 {

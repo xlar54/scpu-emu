@@ -62,6 +62,13 @@ void radResetMachine();
 // mid-cycle and still driving, risks contention between two drivers.
 bool radHijackCPU();
 
+// Reset through an emulated Ultimax cartridge and take the bus while the host
+// CPU is executing a known stream of read-only NOPs.  Unlike the C64-only
+// badline handoff above, this also gives the C128's reset-time Z80 cartridge
+// probe the GAME assertion it needs to select C64 mode before starting the
+// 8502.  This is the takeover used by current upstream RAD on both machines.
+bool radHijackCPUWithUltimax();
+
 // Release /DMA and hand the machine back to its own CPU.
 void radReleaseCPU();
 

@@ -26,6 +26,7 @@
 #define SCPU_DRIVE          "SD:"
 #define SCPU_CONFIG_FILE    "SD:SCPU/scpu.cfg"
 #define SCPU_ROM_DIR        "SD:SCPU/"
+#define SCPU_BUS_DIAG_FILE  "SD:SCPU/busdiag-e18.txt"
 
 // Read the RAD timing configuration and snapshot it into the bus timing block.
 // Must run before any bus access.

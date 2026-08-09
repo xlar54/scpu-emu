@@ -22,6 +22,7 @@
 
 CSuperCPURegisters::CSuperCPURegisters()
 	: m_RegWrites( 0 ), m_WriteBuffer( 0 ), m_Version( SCPU_V2 ),
+	  m_SCPU128Mode( false ),
 	  m_Sys1MHz( false ), m_Soft1MHz( false ),
 	  m_SwitchSlow( false ), m_SwitchJiffy( true ),
 	  m_HWRegsEnabled( false ), m_Bootmap( true ), m_BootmapFlag( 0 ),
@@ -35,11 +36,14 @@ CSuperCPURegisters::CSuperCPURegisters()
 
 void CSuperCPURegisters::reset()
 {
-	// Nothing requesting 1MHz, register bank closed. A program that happens to
-	// touch $D074 must not silently change the mirroring policy.
+	// Nothing requests 1MHz. SCPU64 resets with the register bank closed. DOS
+	// 2.04's $FE00 entry tests $D0B2 bit 7 before doing anything else: this is
+	// the hardware-register gate, not the C64/C128 identity bit.  The native
+	// reset path requires the gate open; hardware probes observe it closed only
+	// later, after startup has completed.
 	m_Sys1MHz       = false;
 	m_Soft1MHz      = false;
-	m_HWRegsEnabled = false;
+	m_HWRegsEnabled = m_SCPU128Mode;
 	// A real SuperCPU comes out of reset with its own ROM mapped in --
 	// VICE's scpu64_hardware_reset() sets mem_reg_bootmap = 1. Whether it
 	// takes effect depends on an image being loaded; see CSuperCPU::reset().
@@ -48,9 +52,9 @@ void CSuperCPURegisters::reset()
 	m_RAMLink       = false;
 	m_SpeedChanged  = true;
 	m_RegWrites     = 0;
-	// VICE and the v2 hardware reset to $C7: no-optimisation mode with the
-	// B/Z flags selecting $0200-$FFFF (zero page and stack excluded).
-	m_Optim         = 0xC7;
+	// SCPU64 v2 resets to $C7. The real SCPU128 capture consistently reports
+	// $C1 in native C128 mode: no optimisation, bank selector clear, Z set.
+	m_Optim         = m_SCPU128Mode ? 0xC1 : 0xC7;
 	m_SIMMConfig    = 4;
 	if ( m_FastRAM ) m_FastRAM->setConfig( m_SIMMConfig );
 
@@ -175,7 +179,11 @@ bool CSuperCPURegisters::ioRead( u16 addr, u8 &value )
 	switch ( addr )
 	{
 	case SCPU_REG_VERSION:
-		v = ( m_Version == SCPU_V2 ) ? SCPU_VERSION_V2 : SCPU_VERSION_V1;
+		// Real SCPU128 v2: 00 in native C128 mode, 01 in C64 mode after the
+		// common optimisation low bit is added below. SCPU64 retains 40/C0.
+		v = m_SCPU128Mode ? 0x00
+		                  : ( ( m_Version == SCPU_V2 ) ? SCPU_VERSION_V2
+		                                                : SCPU_VERSION_V1 );
 		break;
 
 	case SCPU_REG_STATUS:

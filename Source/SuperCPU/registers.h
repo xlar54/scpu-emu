@@ -130,6 +130,13 @@ public:
 	void attachFastRAM( CFastRAM *ram ) { m_FastRAM = ram; if ( ram ) ram->setConfig( m_SIMMConfig ); }
 
 	void setHardwareVersion( SCPUHardwareVersion v ) { m_Version = v; }
+	// The SCPU128 v2 presents a distinct personality in native C128 mode:
+	// hardware captures establish $D0B0 bits 7-6 = 00 and $D0B3 = $C1. DOS
+	// 2.04's $FE00 reset entry additionally requires the register gate open to
+	// enter its C128 path; that reset-time state is inferred from the ROM rather
+	// than from the later software probe. Call before reset().
+	void setSCPU128Mode( bool on ) { m_SCPU128Mode = on; }
+	bool scpu128Mode() const { return m_SCPU128Mode; }
 
 	// Switch positions: speed comes from the cartridge/configuration; JiffyDOS
 	// is virtual in this build and can also be changed through $D0B5 bit 7.
@@ -236,6 +243,7 @@ private:
 	CWriteBuffer *m_WriteBuffer;
 
 	SCPUHardwareVersion m_Version;
+	bool m_SCPU128Mode;
 
 	// The three independent 1MHz requests, plus the physical switches.
 	bool m_Sys1MHz;			// $D072 / $D073 / $D0B2

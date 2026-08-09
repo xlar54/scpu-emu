@@ -32,6 +32,12 @@
 
 #include "lowlevel_dma.h"
 
+// Keep the complete physical read in one known-good out-of-line code body.
+// The C128 positional diagnostics proved that expanding p1/p2/p3 into large
+// callers changes the result even though the source sequence is identical.
+u8 radDirectRead( u16 addr );
+void radDirectWrite( u16 addr, u8 value );
+
 // Align to the start of a fresh C64 cycle: wait out the CPU half-cycle, then
 // the VIC half-cycle, then re-anchor the ARM cycle counter.
 #define BUS_RESYNC {			\
@@ -69,16 +75,25 @@
 // knows it is at a cycle boundary.
 #define RAD_POKE( a, v ) { busWriteByte_p1( g2, a, v ); busWriteByte_p2( g2, false ); }
 // The SID ($D400-$D7FF) drives the data bus later than every other chip, so
-// its reads sample at their own configured point. See busReadByte_p3.
-#define RAD_READ_SAMPLE_AT( a ) 	( ( ( (a) & 0xFC00 ) == 0xD400 ) ? (u32)busTiming.WAIT_CYCLE_READ_SID 	                                 : (u32)( WAIT_CYCLE_WRITEDATA + 20 ) )
-#define RAD_PEEK( a, v ) { busReadByte_p1( g2, a ); busReadByte_p2( g2 ); busReadByte_p3( g2, v, false, RAD_READ_SAMPLE_AT( a ) ); }
+// its reads sample at their own configured point. All other reads must use
+// WAIT_CYCLE_READ: coupling them to WAIT_CYCLE_WRITEDATA made the documented
+// read-timing control a no-op and sampled a real C64 later than RAD's tuned
+// Pi-3 point. See busReadByte_p3.
+#define RAD_READ_SAMPLE_AT( a ) \
+	( ( ( (a) & 0xFC00 ) == 0xD400 ) ? (u32)busTiming.WAIT_CYCLE_READ_SID \
+	                                         : (u32)busTiming.WAIT_CYCLE_READ )
+#define RAD_PEEK( a, v ) {                                                      \
+	busReadByte_p1( g2, a );                                                    \
+	busReadByte_p2( g2 );                                                       \
+	busReadByte_p3( g2, v, false, RAD_READ_SAMPLE_AT( a ) );                    \
+}
 
 // Burst access, valid only between busBeginBurstWrites()/busEndBurstWrites().
 #define RAD_BURST_POKE( a, v ) { busWriteByteBurst_p1( g2, a, v ); busWriteByteBurst_p2( g2, false ); }
 
 // Self-synchronising access. Costs an extra cycle of alignment; use the
 // unsynchronised forms inside tight loops that already track the phase.
-#define RAD_SPOKE( a, v ) { BUS_RESYNC; RAD_POKE( a, v ); }
-#define RAD_SPEEK( a, v ) { BUS_RESYNC; RAD_PEEK( a, v ); }
+#define RAD_SPOKE( a, v ) { radDirectWrite( (u16)(a), (u8)(v) ); }
+#define RAD_SPEEK( a, v ) { (v) = radDirectRead( (u16)(a) ); }
 
 #endif

@@ -50,6 +50,16 @@ enum SCPUCoreType
 	SCPU_CORE_65816
 };
 
+// Physical C128 and current operating-system mode are separate facts.  AUTO
+// uses the post-handoff MMU/KERNAL signature; the explicit values are useful
+// for bring-up and avoid pretending an internal 8502 port can be read by DMA.
+enum SCPUC128Mode
+{
+	SCPU_C128_MODE_AUTO = 0,
+	SCPU_C128_MODE_C64,
+	SCPU_C128_MODE_NATIVE
+};
+
 // Mirrored bytes allowed per drain call while the beam is inside the picture.
 // Effectively the mirror's write-through throughput; see
 // CSuperCPU::setMirrorDisplayBudget for the reasoning.
@@ -86,6 +96,7 @@ public:
 	// without one this is ignored and the machine boots its own KERNAL.
 	void setBootmapEnabled( bool on ) { m_BootmapEnabled = on; }
 	bool bootmapEnabled() const       { return m_BootmapEnabled; }
+	void setC128Mode( SCPUC128Mode mode ) { m_C128Mode = mode; }
 
 	// How many mirrored bytes may be pushed per drain call while the beam is
 	// INSIDE the visible display -- effectively the mirror's write-through
@@ -184,6 +195,9 @@ public:
 	CWriteBuffer       &writeBuffer() { return m_WriteBuffer; }
 	CSuperCPURegisters &registers()   { return m_Registers; }
 	ICpu               *cpu()         { return m_CPU; }
+	// Diagnostics sometimes need to paint a failure report directly into the
+	// host's VIC-visible RAM after the emulated CPU has been stopped.
+	IC64Bus            *hostBus()     { return m_Bus; }
 	// Null unless the 65816 core is driving. For diagnostics only.
 	CW65C816           *core65816()   { return ( m_CPU == &m_Core65816 ) ? &m_Core65816 : 0; }
 
@@ -205,6 +219,7 @@ private:
 	IC64Bus *m_Bus;
 	bool     m_Running;
 	bool     m_BootmapEnabled;
+	SCPUC128Mode m_C128Mode;
 	u32      m_MirrorDisplayBudget;
 	bool     m_MirrorHalted = false;
 	// runFrame() may advance the CPU to reach the physical VIC border before

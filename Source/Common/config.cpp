@@ -93,6 +93,9 @@ int cfgVectorReroute = 1;
 int cfgIOStretch = 1;
 int cfgNMINativeDefer = 1;
 int cfgMirrorStretch = 0;
+int cfgC128Mode = 0;
+int cfgBusHaltAfterS = 0;
+int cfgC64ULegacyTakeover = 0;
 
 char cfg[ 65536 ];
 
@@ -118,6 +121,9 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	cfgIOStretch = 1;
 	cfgNMINativeDefer = 1;
 	cfgMirrorStretch = 0;
+	cfgC128Mode = 0;
+	cfgBusHaltAfterS = 0;
+	cfgC64ULegacyTakeover = 0;
 
 	// Leave a byte spare so cfg is always NUL-terminated for the line scanner.
 	if ( !readFile( logger, DRIVE, FILENAME, (u8*)cfg, &cfgBytes, sizeof( cfg ) - 1 ) )
@@ -137,6 +143,9 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	bool ioStretchSeen = false;
 	bool nmiDeferSeen = false;
 	bool mirrorStretchSeen = false;
+	bool c128ModeSeen = false;
+	bool busHaltSeen = false;
+	bool c64uLegacySeen = false;
 
 	while ( *cfgPos != 0 )
 	{
@@ -168,6 +177,9 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 						if ( i == 32 ) ioStretchSeen = true;
 						if ( i == 33 ) nmiDeferSeen = true;
 						if ( i == 34 ) mirrorStretchSeen = true;
+						if ( i == 35 ) c128ModeSeen = true;
+						if ( i == 36 ) busHaltSeen = true;
+						if ( i == 37 ) c64uLegacySeen = true;
 						while ( *ptr == '\t' || *ptr == ' ' ) ptr++;
 					#ifdef DEBUG_OUT
 						logger->Write( "RaspiMenu", LogNotice, "  %s >%d< (%s)", timingNames[ i ], timingValues[ i ], ptr );
@@ -255,6 +267,18 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 
 	if ( mirrorStretchSeen )
 		cfgMirrorStretch = ( timingValues[ 34 ] != 0 ) ? 1 : 0;
+
+	if ( c128ModeSeen )
+	{
+		cfgC128Mode = timingValues[ 35 ];
+		if ( cfgC128Mode < 0 || cfgC128Mode > 2 ) cfgC128Mode = 0;
+	}
+
+	if ( busHaltSeen && timingValues[ 36 ] > 0 )
+		cfgBusHaltAfterS = timingValues[ 36 ];
+
+	if ( c64uLegacySeen )
+		cfgC64ULegacyTakeover = timingValues[ 37 ] != 0 ? 1 : 0;
 
 	return 1;
 }

@@ -32,6 +32,7 @@ OBJS = \
 	SuperCPU/fast_ram.o \
 	SuperCPU/memory_map.o \
 	Bus/RAD/rad_bus.o \
+	Bus/RAD/c128_refresh.o \
 	Bus/RAD/cpu_hijack.o \
 	Bus/RAD/bus_timing.o \
 	Bus/RAD/lowlevel_dma.o \

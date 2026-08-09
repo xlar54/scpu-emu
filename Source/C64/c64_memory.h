@@ -128,8 +128,13 @@ public:
 	//
 	// 'rom' must point at at least 64K and stay alive for the life of the
 	// object -- it is not copied.
-	void setBootmapROM( const u8 *rom ) { m_BootmapROM = rom; }
+	void setBootmapROM( const u8 *rom, u32 length = 0x10000 )
+	{
+		m_BootmapROM = rom;
+		m_BootmapROMLength = rom ? length : 0;
+	}
 	bool hasBootmapROM() const          { return m_BootmapROM != 0; }
+	void setSCPU128Mode( bool on )      { m_SCPU128Mode = on; }
 
 	// --- ROM shadow -------------------------------------------------------
 	// On a SuperCPU there is NO C64 BASIC or KERNAL ROM in the map. Those
@@ -808,7 +813,9 @@ private:
 	IIOInterceptor *m_IO;
 	const bool *m_DOSExtState = 0;
 	const u8       *m_BootmapROM;
+	u32             m_BootmapROMLength;
 	u8             *m_ROMShadow;
+	bool            m_SCPU128Mode;
 	bool            m_HasBasic, m_HasKernal, m_HasChar;
 
 	// Pacing state. m_HostPerEmuQ16 is host cycles per emulated cycle in 16.16

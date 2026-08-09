@@ -26,6 +26,8 @@
 
 */
 
+#include "c128_refresh.h"
+
 //#define DOUBLE_GPIO_WRITES
 
 #define DELAY(rounds) \
@@ -192,7 +194,7 @@ extern volatile u32 radPHIWaitTimeouts;
 
 __attribute__( ( always_inline ) ) inline 
 void busReadByte_p1( register u32 &g2, u16 addr )
-{ 
+{
 	register u32 DD = flipByte( ( addr ) & 255 ) << D0;
 	SET_GPIO( bLATCH_A0 | bLATCH_A8 | DD | bOE_Dx | bDIR_Dx );
 	CLR_GPIO( ( D_FLAG & ( ~DD ) ) );
@@ -261,6 +263,13 @@ void busReadByte_p2( register u32 &g2 )
 // half-cycle -- a 6510 samples on the falling edge -- and reading it at the
 // shared point returns open-bus $FF for every register. Callers pass the
 // SID-specific point for $D400-$D7FF and the shared one for everything else.
+// C128 expansion-bus buffering needs a complete idle bus phase when changing
+// from a read to a write. The delay is paid only on that transition.
+static u8 busWriteTurnaroundNeeded = 0;
+// One idle phase is sufficient on a C64.  The physical C128's buffered port
+// passed the burst test reliably only with two phases (kernel147 onward).
+// Machine detection sets this to two before the loaded calibration and runtime.
+static u8 busWriteTurnaroundPasses = 1;
 __attribute__( ( always_inline ) ) inline  
 void busReadByte_p3( register u32 &g2, register u8 &x, bool releaseDMA,
                      u32 sampleAt )
@@ -271,23 +280,33 @@ void busReadByte_p3( register u32 &g2, register u8 &x, bool releaseDMA,
 	WAIT_FOR_VIC_HALFCYCLE
 	RESTART_CYCLE_COUNTER
 	DISABLE_ADDRESS_LATCH_AND_BUSTRANSCEIVER( releaseDMA );
+	busWriteTurnaroundNeeded = 1;
 } 
-
-static u32 lastGPIOValue = 0;
 
 __attribute__( ( always_inline ) ) inline  
 void busBeginBurstWrites( register u32 &g2 )
 {
+	c128TrafficBegin();
 	CLR_GPIO( bDIR_Dx );
 	SET_GPIO( bGAME_OUT );
 	SET_GPIO( bRW_OUT );
 	OUT_GPIO( RW_OUT );
-	SET_BANK2_OUTPUT 
+	SET_BANK2_OUTPUT
+	if ( busWriteTurnaroundNeeded )
+	{
+		for ( u32 turnPass__ = 0; turnPass__ < busWriteTurnaroundPasses;
+		      turnPass__++ )
+		{
+			WAIT_FOR_CPU_HALFCYCLE
+			WAIT_FOR_VIC_HALFCYCLE
+			RESTART_CYCLE_COUNTER
+		}
+		busWriteTurnaroundNeeded = 0;
+	}
 
 	register u32 DD = 0;
 	SET_GPIO( bLATCH_A0 | bLATCH_A8 | DD );
 	CLR_GPIO( ( D_FLAG & ( ~DD ) ) );
-	lastGPIOValue = 0;
 }
 
 __attribute__( ( always_inline ) ) inline  
@@ -304,6 +323,7 @@ void busEndBurstWrites( register u32 &g2 )
 	// flushes, which happen constantly: the VIC-II's fetches get redirected and
 	// the display cannot stabilise. /GAME stays released.
 	SET_GPIO( bGAME_OUT );
+	c128TrafficEnd();
 }
 
 __attribute__( ( always_inline ) ) inline  
@@ -311,10 +331,9 @@ void busWriteByteBurst_p1( register u32 &g2, u16 addr, u8 data )
 {
 	register u32 DD = flipByte( ( addr ) & 255 ) << D0;
 	SET_GPIO( DD );
-
-	if ( ( g2 & bBA ) )
-		{CLR_GPIO( ( D_FLAG & ( ~DD ) ) | bLATCH_A_OE );} else	// no badline => write
-		{CLR_GPIO( ( D_FLAG & ( ~DD ) ) ); }
+	// Do not expose the low byte through both address latches before the high
+	// byte has been clocked; the C128 reacts to that transient address.
+	CLR_GPIO( ( D_FLAG & ( ~DD ) ) );
 
 	DD = flipByte( ( ( addr ) >> 8 ) & 255 ) << D0;
 	CLR_GPIO( bLATCH_A0 );
@@ -325,12 +344,9 @@ void busWriteByteBurst_p1( register u32 &g2, u16 addr, u8 data )
 	CLR_GPIO( ( D_FLAG & ( ~DD ) ) );
 	SET_GPIO( DD );
 
-	// A cached BA-low is already conservative. If cached BA says the bus is
-	// available, verify it at the configured in-cycle sampling point before the
-	// write is allowed to proceed; BA may have fallen since the phase wait.
 	if ( ( g2 & bBA ) )
 	{
-		WAIT_UP_TO_CYCLE( busTiming.TIMING_READ_BA_WRITING );			
+		WAIT_UP_TO_CYCLE( busTiming.TIMING_READ_BA_WRITING );
 		g2 = read32( ARM_GPIO_GPLEV0 );
 	}
 	u8 resync = 0;
@@ -347,32 +363,17 @@ void busWriteByteBurst_p1( register u32 &g2, u16 addr, u8 data )
 		WAIT_UP_TO_CYCLE( busTiming.TIMING_READ_BA_WRITING );
 		g2 = read32( ARM_GPIO_GPLEV0 );
 	}
-
 	if ( baSpins > RAD_BA_WAIT_LIMIT ) radBAWaitTimeouts++;
-
 	if ( resync )
 	{
 		OUT_GPIO( RW_OUT );
-		CLR_GPIO( bLATCH_A_OE | bRW_OUT );
-		//WAIT_FOR_CPU_HALFCYCLE								
-		//WAIT_FOR_VIC_HALFCYCLE								
-		//RESTART_CYCLE_COUNTER								
+		CLR_GPIO( bRW_OUT );
 	}
 
-	// this RW_OUT a bit before A_OE and DIR_Dx is important for old VICs,
-	// and took me quite a while to figure out...
-	// diese Zeile war zuletzt immer auskommentiert:
-	WAIT_UP_TO_CYCLE(busTiming.TIMING_ENABLE_RWOUT_ADDR_LATCH_WRITING - 40 ); // new VIC works without this wait
-//	OUT_GPIO( RW_OUT );
+	WAIT_UP_TO_CYCLE( busTiming.TIMING_ENABLE_RWOUT_ADDR_LATCH_WRITING - 40 );
 	CLR_GPIO( bRW_OUT );
-	WAIT_UP_TO_CYCLE( busTiming.TIMING_ENABLE_RWOUT_ADDR_LATCH_WRITING - 0 );
-//	CLR_GPIO( bRW_OUT | bLATCH_A_OE | bDIR_Dx );
-	//CLR_GPIO( bLATCH_A_OE );
-	//CLR_GPIO( bRW_OUT );
-	//OUT_GPIO( RW_OUT );
-	//bool pullGAMEforIO = ( addr >= 0xd000 && addr < 0xe000 ) ? true : false;
-	//CLR_GPIO( bLATCH_A_OE | bDIR_Dx | ( pullGAMEforIO ? bGAME_OUT : 0 ));
-
+	WAIT_UP_TO_CYCLE( busTiming.TIMING_ENABLE_RWOUT_ADDR_LATCH_WRITING );
+	CLR_GPIO( bLATCH_A_OE | bDIR_Dx );
 	WAIT_UP_TO_CYCLE( busTiming.TIMING_ENABLE_DATA_WRITING );
 	CLR_GPIO( bOE_Dx );
 }
@@ -399,6 +400,20 @@ void busWriteByteBurst_p2( register u32 &g2, bool releaseDMA )
 __attribute__( ( always_inline ) ) inline  
 void busWriteByte_p1( register u32 &g2, u16 addr, u8 data )
 {
+	if ( busWriteTurnaroundNeeded )
+	{
+		CLR_GPIO( bDIR_Dx );
+		SET_BANK2_OUTPUT
+		for ( u32 turnPass__ = 0; turnPass__ < busWriteTurnaroundPasses;
+		      turnPass__++ )
+		{
+			WAIT_FOR_CPU_HALFCYCLE
+			WAIT_FOR_VIC_HALFCYCLE
+			RESTART_CYCLE_COUNTER
+		}
+		busWriteTurnaroundNeeded = 0;
+	}
+
 	register u32 DD = flipByte( ( addr ) & 255 ) << D0;
 	SET_GPIO( bLATCH_A0 | bLATCH_A8 | DD );
 	CLR_GPIO( bDMA_OUT | ( D_FLAG & ( ~DD ) ) );
@@ -412,17 +427,9 @@ void busWriteByte_p1( register u32 &g2, u16 addr, u8 data )
 	CLR_GPIO( ( D_FLAG & ( ~DD ) ) );
 
 	HANDLE_BUS_AVAILABLE
-
-	// this RW_OUT a bit before A_OE and DIR_Dx is important for old VICs,
-	// and took me quite a while to figure out...
-	WAIT_UP_TO_CYCLE(busTiming.TIMING_ENABLE_RWOUT_ADDR_LATCH_WRITING - 40 );
+	WAIT_UP_TO_CYCLE( busTiming.TIMING_ENABLE_RWOUT_ADDR_LATCH_WRITING - 40 );
 	OUT_GPIO( RW_OUT );
-	//WAIT_UP_TO_CYCLE( busTiming.TIMING_ENABLE_RWOUT_ADDR_LATCH_WRITING + 0 );
 	CLR_GPIO( bLATCH_A_OE | bDIR_Dx );
-	//bool pullGAMEforIO = ( addr >= 0xd000 && addr < 0xe000 ) ? true : false;
-	//CLR_GPIO( bLATCH_A_OE | bDIR_Dx | ( pullGAMEforIO ? bGAME_OUT : 0 ));
-	CLR_GPIO( bLATCH_A_OE | bDIR_Dx/* | bGAME_OUT*/ );
-
 	WAIT_UP_TO_CYCLE( busTiming.TIMING_ENABLE_DATA_WRITING );
 	CLR_GPIO( bOE_Dx );
 }

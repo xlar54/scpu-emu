@@ -44,6 +44,7 @@
 
 #include "../Bus/RAD/lowlevel_arm64.h"
 #include "../Bus/RAD/gpio_defs.h"
+#include "../Bus/RAD/c128_refresh.h"
 #include "../Common/helpers.h"
 #include "boot.h"
 
@@ -57,7 +58,8 @@ public:
 		  m_Screen( m_Options.GetWidth(), m_Options.GetHeight() ),
 		  m_Timer( &m_Interrupt ),
 		  m_Logger( 5, &m_Timer ),
-		  m_EMMC( &m_Interrupt, &m_Timer, 0 )
+		  m_EMMC( &m_Interrupt, &m_Timer, 0 ),
+		  m_C128Refresh( &m_Memory )
 	{
 	}
 
@@ -65,6 +67,9 @@ public:
 	{
 		logger = &m_Logger;
 		STANDARD_SETUP_TIMER_INTERRUPT_CYCLECOUNTER_GPIO
+		// Circle requires multi-core support to be initialized last. Core 3 then
+		// waits dormant until a physical C128 has actually been acquired.
+		if ( bOK ) bOK = m_C128Refresh.Initialize();
 		return bOK;
 	}
 
@@ -81,6 +86,7 @@ private:
 	CLogger				m_Logger;
 	CScheduler			m_Scheduler;
 	CEMMCDevice			m_EMMC;
+	CC128RefreshService m_C128Refresh;
 };
 
 static FATFS mFileSystem;

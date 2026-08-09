@@ -138,14 +138,35 @@ PREFIX64 = aarch64-none-elf-
 CFG
 
 # --- build Circle libraries ------------------------------------------------
-if [ ! -f "$CIRCLE/lib/libcircle.a" ]; then
-	say "Building Circle libraries (slow, once)"
+
+# Circle compiles options from sysconfig.h into libcircle itself.  Do not keep
+# an old single-core library after changing those options: the application can
+# compile against the new header and then fail at link time (or, worse, retain
+# an ABI-incompatible library).  Hash the complete build settings and rebuild
+# all linked Circle libraries whenever they change.
+CIRCLE_SETTINGS_SHA="$(sha256sum "$CIRCLE/include/circle/sysconfig.h" \
+	"$CIRCLE/Config.mk" | sha256sum | cut -d' ' -f1)"
+CIRCLE_SETTINGS_STAMP="$CIRCLE/.scpu-circle-settings.sha256"
+OLD_CIRCLE_SETTINGS_SHA="$(cat "$CIRCLE_SETTINGS_STAMP" 2>/dev/null || true)"
+
+if [ ! -f "$CIRCLE/lib/libcircle.a" ] \
+   || [ "$CIRCLE_SETTINGS_SHA" != "$OLD_CIRCLE_SETTINGS_SHA" ]; then
+	say "Building Circle libraries (settings changed or first build)"
+	if [ -f "$CIRCLE/lib/libcircle.a" ]; then
+		( cd "$CIRCLE/addon/linux"  && make clean )
+		( cd "$CIRCLE/addon/fatfs"  && make clean )
+		( cd "$CIRCLE/addon/SDCard" && make clean )
+		( cd "$CIRCLE/lib/sched"    && make clean )
+		( cd "$CIRCLE/lib/fs"       && make clean )
+		( cd "$CIRCLE/lib"          && make clean )
+	fi
 	( cd "$CIRCLE/lib"          && make -j"$(nproc)" )
 	( cd "$CIRCLE/lib/fs"       && make -j"$(nproc)" )
 	( cd "$CIRCLE/lib/sched"    && make -j"$(nproc)" )
 	( cd "$CIRCLE/addon/SDCard" && make -j"$(nproc)" )
 	( cd "$CIRCLE/addon/fatfs"  && make -j"$(nproc)" )
 	( cd "$CIRCLE/addon/linux"  && make -j"$(nproc)" )
+	echo "$CIRCLE_SETTINGS_SHA" > "$CIRCLE_SETTINGS_STAMP"
 else
 	say "Circle libraries already built"
 fi

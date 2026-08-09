@@ -41,6 +41,7 @@
 #include "../Bus/RAD/lowlevel_arm64.h"
 #include "../Bus/RAD/bus_timing.h"
 #include "../Bus/RAD/rad_bus.h"
+#include "../Bus/RAD/c128_refresh.h"
 #include "../SuperCPU/supercpu.h"
 
 // Defined in main.cpp, which owns the FAT filesystem object.
@@ -66,15 +67,27 @@ extern volatile u32 radPHIWaitTimeouts;
 // Heartbeat: proves the frame loop is still running, and reports what the
 // emulated machine is doing while it does so.
 static u32 s_HeartbeatFrames = 0;
-static u32 s_MirrorHaltFrames = 0;
+static u64 s_MirrorHaltStartCycles = 0;
+static u32 s_BusHaltFrames = 0;
 static u32 s_HeartbeatPCLow = 0xFFFFFFFF;
 static u32 s_HeartbeatPCHigh = 0;
 static u32 s_HeartbeatStalledRuns = 0;
 static bool s_HeartbeatDumped = false;
+// Native-C128 bring-up may execute garbage continuously rather than settling
+// into a tight loop, so the ordinary stall detector never fires. Keep a small
+// sampled PC history and force one bounded capture early in startup.
+static u32 s_C128DiagnosticFrames = 0;
+static u32 s_C128PCTrace[ 8 ] = {};
+static u32 s_C128PCTracePos = 0;
 
 static bool radBusButtonPressed();
 static bool radBusHardwareResetPressed();
 static void radBusSampleInterrupts( bool &irq, bool &nmi );
+static bool radBusTrafficHalted();
+static bool scpuSaveRuntimeBusDiag();
+static void radBusHaltAndProbe( u32 &eligiblePhases, u32 &addrChanges,
+	                           u32 &distinctAddrs, u32 &sequentialAddrs,
+	                           u32 &writePhases, u8 &firstAddr, u8 &lastAddr );
 
 // Bare metal: no snprintf. Keep every freeze-dump append explicitly bounded:
 // a CIA timing row can be about 240 characters, substantially more than the
@@ -452,10 +465,106 @@ static void scpuEmitResetDiagnostic()
 	}
 }
 
+// Put the real C128's VIC into a predictable 40-column configuration without
+// touching screen, character, or colour RAM.  An earlier diagnostic stamped a
+// report into every possible screen matrix because the adapter's private MMU
+// signals are unavailable to RAD.  That also overwrote character data and made
+// the resulting video useless.  The border code below is map-independent, so
+// preserving all display RAM is both safer and more informative.
+static void scpuShowC128FreezeDiagnostic( CSuperCPU *scpu )
+{
+	if ( !scpu || !scpu->registers().scpu128Mode() || !scpu->hostBus() )
+		return;
+
+	IC64Bus *bus = scpu->hostBus();
+
+	// Configuration zero is the captured native-C128 startup map: RAM bank 0,
+	// I/O and system ROM visible. Put the VIC in its ordinary 40-column text
+	// layout with screen RAM at $0400 and the character generator at $1000.
+	bus->write( 0xFF00, 0x00 );
+	u8 ddra = bus->read( 0xDD02 );
+	u8 pra  = bus->read( 0xDD00 );
+	bus->write( 0xDD02, (u8)( ddra | 0x03 ) );
+	bus->write( 0xDD00, (u8)( pra  | 0x03 ) );
+	bus->write( 0xD011, 0x1B );
+	bus->write( 0xD016, 0x08 );
+	bus->write( 0xD018, 0x14 );
+	bus->write( 0xD020, 0x06 );
+	bus->write( 0xD021, 0x06 );
+}
+
+static bool scpuC128DiagnosticWait( IC64Bus *bus, u32 hostCycles )
+{
+	const u64 until = bus->hostCycles() + hostCycles;
+	while ( bus->hostCycles() < until )
+	{
+		if ( radBusButtonPressed() ) return false;
+		asm volatile( "yield" );
+	}
+	return true;
+}
+
+// Screen RAM may be unreachable without the real SCPU128 adapter cable. As a
+// map-independent fallback, continuously send the captured 24-bit PC through
+// the VIC border: GREEN marker, then 24 bits MSB-first (WHITE=1, BLACK=0),
+// with RED separators, followed by a YELLOW end marker.  The complete sequence
+// is about 9.5 seconds so a short phone video is sufficient.
+static void scpuHoldC128FreezeDiagnostic( CSuperCPU *scpu )
+{
+	IC64Bus *bus = scpu ? scpu->hostBus() : 0;
+	if ( !bus ) return;
+	const u32 oneSecond = bus->hostCyclesPerSec();
+	const u32 bitTime = oneSecond / 5;       // 200 ms
+	const u32 separatorTime = oneSecond / 10; // 100 ms
+	const u32 pc = s_ResetDiagnostic.pc & 0xFFFFFF;
+
+	while ( !radBusButtonPressed() )
+	{
+		bus->write( 0xD020, 0x05 );       // green: sequence begins
+		if ( !scpuC128DiagnosticWait( bus, oneSecond ) ) break;
+		bus->write( 0xD020, 0x02 );       // red: separator
+		if ( !scpuC128DiagnosticWait( bus, bitTime ) ) break;
+		for ( int bit = 23; bit >= 0; bit-- )
+		{
+			bus->write( 0xD020, ( pc & ( 1u << bit ) ) ? 0x01 : 0x00 );
+			if ( !scpuC128DiagnosticWait( bus, bitTime ) ) return;
+			bus->write( 0xD020, 0x02 );
+			if ( !scpuC128DiagnosticWait( bus, separatorTime ) ) return;
+		}
+		bus->write( 0xD020, 0x07 );       // yellow: sequence ends
+		if ( !scpuC128DiagnosticWait( bus, oneSecond ) ) break;
+	}
+}
+
 static bool scpuCheckButton( void *ctx )
 {
 	CSuperCPU *scpu = (CSuperCPU *)ctx;
 	const bool hardwareResetPressed = radBusHardwareResetPressed();
+
+	// Do not wait for a formal stall during initial native-C128 bring-up. A bad
+	// MMU map commonly makes the processor roam through changing garbage, which
+	// corrupts the display but never satisfies the narrow-PC-span detector.
+	// Sample every ten frames and force the report at about 1.5 seconds.
+	if ( scpu && scpu->cpu() && scpu->registers().scpu128Mode() )
+	{
+		if ( ( s_C128DiagnosticFrames % 10 ) == 0 )
+			s_C128PCTrace[ s_C128PCTracePos++ & 7 ] = (u32)scpu->cpu()->pc();
+		if ( ++s_C128DiagnosticFrames == 90 )
+		{
+			scpuSnapshotResetDiagnostic( scpu );
+			{
+				CScopedLoggingIRQs dumpIRQs;
+				s_Logger->Write( "SCPU", LogNotice,
+				               "C128 STARTUP CAPTURE at PC=$%06X (forced, no stall required)",
+				               (unsigned)scpu->cpu()->pc() );
+				scpuEmitResetDiagnostic();
+			}
+			scpuShowC128FreezeDiagnostic( scpu );
+			scpuHoldC128FreezeDiagnostic( scpu );
+			s_RebootRequested = true;
+			return true;
+		}
+	}
 
 	// Say so the FIRST time a bus wait ever hits its ceiling. Before those
 	// ceilings existed this was the freeze that took the whole firmware down
@@ -513,6 +622,9 @@ static bool scpuCheckButton( void *ctx )
 
 		if ( scpu ) scpu->reset();
 		s_HardwareResetGeneration++;
+		s_C128DiagnosticFrames = 0;
+		s_C128PCTracePos = 0;
+		for ( u32 i = 0; i < 8; i++ ) s_C128PCTrace[ i ] = 0;
 		s_PreResetSampleFrame = 0;
 		s_PreResetSampleValid = false;
 		return false;
@@ -526,12 +638,83 @@ static bool scpuCheckButton( void *ctx )
 	// itself is wrong -- our writes must be landing somewhere they should not.
 	if ( cfgMirrorHaltAfterS > 0 && scpu && !scpu->mirrorHalted() )
 	{
-		if ( ++s_MirrorHaltFrames >= (u32)cfgMirrorHaltAfterS * 60 )
+		IC64Bus *host = scpu->hostBus();
+		const u64 now = host ? host->hostCycles() : 0;
+		const u32 hz = host ? host->hostCyclesPerSec() : 0;
+		if ( hz && !s_MirrorHaltStartCycles ) s_MirrorHaltStartCycles = now;
+		if ( hz && now - s_MirrorHaltStartCycles
+		          >= (u64)cfgMirrorHaltAfterS * hz )
 		{
-			scpu->setMirrorHalted( true );
 			CScopedLoggingIRQs irqs;
 			s_Logger->Write( "SCPU", LogNotice,
-			               "MIRROR HALTED (diagnostic): all mirror bus traffic stopped" );
+				               "C128 K204 permutation: line=%u step=%u visited=%u opens-min/max=%u/%u",
+			               (unsigned)c128RefreshLineCyclesUsed(),
+			               (unsigned)c128RefreshPermutationStep(),
+			               (unsigned)c128RefreshPhasesVisited(),
+			               (unsigned)c128RefreshPhaseMinOpens(),
+			               (unsigned)c128RefreshPhaseMaxOpens() );
+			s_Logger->Write( "SCPU", LogNotice,
+				               "C128 K204 overrun: count=%u total=%u max=%u worst-phase/max=%u/%u deadline/recovery/lines=%u/%u/%u",
+			               (unsigned)c128RefreshLineOverrunCount(),
+			               (unsigned)c128RefreshLineTotalOverrunCycles(),
+			               (unsigned)c128RefreshLineMaxLateCycles(),
+			               (unsigned)c128RefreshWorstOverrunPhase(),
+			               (unsigned)c128RefreshWorstPhaseOverrunCycles(),
+			               (unsigned)c128RefreshLineDeadlineMisses(),
+			               (unsigned)c128RefreshLineDeadlineRecoveries(),
+			               (unsigned)c128RefreshLineRecoveryLines() );
+
+			// The historical pulse-scan section can consume the old diagnostic
+			// formatter before its later topology report. Persist the live runtime
+			// counters at the moment traffic stops, after the requested workload,
+			// rather than asking the user to transcribe transient HDMI output.
+			if ( !scpuSaveRuntimeBusDiag() )
+			{
+				s_Logger->Write( "SCPU", LogError,
+				               "K204 could not save live counters to %s; retrying",
+				               SCPU_BUS_DIAG_FILE );
+				return false;
+			}
+
+			// Make the visible freeze the acknowledgement: f_close and unmount
+			// have completed, so power can now be removed without losing the
+			// counters that explain this run.
+			s_Logger->Write( "SCPU", LogNotice,
+			               "K204 saved live counters to %s", SCPU_BUS_DIAG_FILE );
+			scpu->setMirrorHalted( true );
+			s_Logger->Write( "SCPU", LogNotice,
+			               "MIRROR HALTED (diagnostic): log is safely on SD" );
+		}
+	}
+
+	// Stronger companion diagnostic: stop every physical expansion-bus access,
+	// including immediate VIC/CIA reads and writes that bypass the mirror queue.
+	// The emulator keeps executing against $FF reads, so its behaviour may no
+	// longer be useful; the only observation sought is whether physical-screen
+	// corruption stops when the RAD becomes electrically quiet.
+	if ( cfgBusHaltAfterS > 0 && !radBusTrafficHalted() )
+	{
+		if ( ++s_BusHaltFrames >= (u32)cfgBusHaltAfterS * 60 )
+		{
+			if ( scpu ) scpu->setMirrorHalted( true );
+			u32 eligiblePhases = 0, addrChanges = 0, distinctAddrs = 0;
+			u32 sequentialAddrs = 0, writePhases = 0;
+			u8 firstAddr = 0, lastAddr = 0;
+			radBusHaltAndProbe( eligiblePhases, addrChanges, distinctAddrs,
+			                    sequentialAddrs, writePhases, firstAddr, lastAddr );
+			CScopedLoggingIRQs irqs;
+			s_Logger->Write( "SCPU", LogNotice,
+			               "ALL PHYSICAL BUS TRAFFIC HALTED (diagnostic)" );
+			s_Logger->Write( "SCPU", LogNotice,
+			               "idle host: eligible=%u distinct=%u changes=%u sequential=%u",
+			               (unsigned)eligiblePhases, (unsigned)distinctAddrs,
+			               (unsigned)addrChanges, (unsigned)sequentialAddrs );
+			s_Logger->Write( "SCPU", LogNotice,
+			               "idle host: first=%02X last=%02X", firstAddr, lastAddr );
+			s_Logger->Write( "SCPU", writePhases ? LogError : LogNotice,
+			               "idle host: R/W-low=%u/%u%s", (unsigned)writePhases,
+			               (unsigned)eligiblePhases,
+			               writePhases ? " -- ANOTHER BUS MASTER IS WRITING" : "" );
 		}
 	}
 
@@ -602,14 +785,28 @@ static bool scpuCheckButton( void *ctx )
 				{
 					s_HeartbeatDumped = true;
 					scpuSnapshotResetDiagnostic( scpu );
-					CScopedLoggingIRQs dumpIRQs;
-					// Self-contained: with HEARTBEAT off there were no hb
-					// lines before this, so name the loop here.
-					s_Logger->Write( "SCPU", LogNotice,
-					               "STALL DETECTED at PC=$%06X..$%06X -- dumping state (no reset pressed)",
-					               (unsigned)s_HeartbeatPCLow,
-					               (unsigned)s_HeartbeatPCHigh );
-					scpuEmitResetDiagnostic();
+					{
+						CScopedLoggingIRQs dumpIRQs;
+						// Self-contained: with HEARTBEAT off there were no hb
+						// lines before this, so name the loop here.
+						s_Logger->Write( "SCPU", LogNotice,
+						               "STALL DETECTED at PC=$%06X..$%06X -- dumping state (no reset pressed)",
+						               (unsigned)s_HeartbeatPCLow,
+						               (unsigned)s_HeartbeatPCHigh );
+						scpuEmitResetDiagnostic();
+					}
+
+					// Native C128 startup has no trustworthy KERNAL display yet.
+					// Paint the captured state through the physical VIC and hold it
+					// until the user has photographed it. The left RAD button then
+					// follows the ordinary clean reboot path.
+					if ( scpu->registers().scpu128Mode() )
+					{
+						scpuShowC128FreezeDiagnostic( scpu );
+						scpuHoldC128FreezeDiagnostic( scpu );
+						s_RebootRequested = true;
+						return true;
+					}
 				}
 			}
 			else
@@ -656,6 +853,15 @@ static CRADBus   radBus;
 static CActLED   actLED;
 static CSuperCPU superCPU;
 
+static bool scpuSaveRuntimeBusDiag()
+{
+	static char haltBusDiag[ 16384 ];
+	const u32 size =
+		radBus.formatSelfTestResults( haltBusDiag, sizeof haltBusDiag );
+	return size && writeFile( s_Logger, SCPU_DRIVE, SCPU_BUS_DIAG_FILE,
+	                          (u8 *)haltBusDiag, size );
+}
+
 // Shared scratch for the three C64 images, safe to reuse because CC64Memory
 // COPIES what it is given.
 static u8 romBuffer[ C64_BASIC_SIZE ];
@@ -669,6 +875,15 @@ static u8 scpuROMBuffer[ SCPU_ROM_MAXSIZE ];
 static bool radBusButtonPressed() { return radBus.buttonPressed(); }
 static bool radBusHardwareResetPressed() { return radBus.hardwareResetPressed(); }
 static void radBusSampleInterrupts( bool &irq, bool &nmi ) { radBus.sampleInterrupts( irq, nmi ); }
+static bool radBusTrafficHalted() { return radBus.trafficHalted(); }
+static void radBusHaltAndProbe( u32 &eligiblePhases, u32 &addrChanges,
+	                           u32 &distinctAddrs, u32 &sequentialAddrs,
+	                           u32 &writePhases, u8 &firstAddr, u8 &lastAddr )
+{
+	radBus.setTrafficHalted( true );
+	radBus.probeIdleMaster( eligiblePhases, addrChanges, distinctAddrs,
+	                       sequentialAddrs, writePhases, firstAddr, lastAddr );
+}
 
 // Park here on any failure. Without this a failed start-up never reaches the
 // run loop, so nothing ever polls the button and the only way out is a power
@@ -970,6 +1185,11 @@ void scpuBootRun( CLogger *logger )
 
 	s_Logger = logger;
 	radBus.setLogger( logger );
+	radBus.setC64ULegacyTakeover( cfgC64ULegacyTakeover != 0 );
+	logger->Write( "SCPU", LogNotice, "takeover: %s",
+	               cfgC64ULegacyTakeover
+	                   ? "C64U legacy reset/settle/badline"
+	                   : "C128-safe Ultimax/GAME" );
 
 	// Which core: the 65816 is the real accelerator, the 6502 is milestone-1
 	// scaffolding kept as a fallback. CPU_CORE in scpu.cfg decides, so a bad run
@@ -994,6 +1214,12 @@ void scpuBootRun( CLogger *logger )
 	// Pi, well before any emulation starts -- so BOOTMAP 0 on the SD card is
 	// always effective, however badly the emulated machine behaves with it on.
 	superCPU.setBootmapEnabled( cfgBootmap != 0 );
+	superCPU.setC128Mode( cfgC128Mode == 1 ? SCPU_C128_MODE_C64
+	                    : cfgC128Mode == 2 ? SCPU_C128_MODE_NATIVE
+	                                      : SCPU_C128_MODE_AUTO );
+	logger->Write( "SCPU", LogNotice, "C128 mode: %s (scpu.cfg)",
+	               cfgC128Mode == 1 ? "forced C64"
+	             : cfgC128Mode == 2 ? "forced native" : "auto" );
 	superCPU.registers().setBootAnimationHack( cfgBootAnimation != 0 );
 	if ( cfgBootAnimation )
 		logger->Write( "SCPU", LogNotice,
@@ -1109,23 +1335,139 @@ void scpuBootRun( CLogger *logger )
 	logger->Write( "SCPU", LogNotice, "running bus self-test..." );
 	}	// remask: the self-test is real, timed bus traffic
 
-	if ( !radBus.selfTest() )
+	const bool busSelfTestPassed = radBus.selfTest();
+	const bool c128KnownFirstTransferOnly =
+		radBus.c128KnownFirstTransferOnly();
+	// Kernel154 established the physical retention bound: perfect through 2 ms,
+	// first stable decay at 4 ms. Production epochs are conservatively sized
+	// from that result, so do not repeat the minute-long ladder on every boot.
+	{
+		// Always replace the previous run's file, whether this run passes or
+		// fails. The SD write happens between bus operations with /DMA held and
+		// IRQs temporarily enabled; it cannot alter the C128-side measurement.
+		static char busDiag[ 65536 ];
+		const u32 busDiagSize = radBus.formatSelfTestResults( busDiag, sizeof busDiag );
+		CScopedLoggingIRQs diagFileIRQs;
+		if ( busDiagSize && writeFile( logger, SCPU_DRIVE, SCPU_BUS_DIAG_FILE,
+		                               (u8 *)busDiag, busDiagSize ) )
+			logger->Write( "SCPU", LogNotice, "saved %s", SCPU_BUS_DIAG_FILE );
+		else
+			logger->Write( "SCPU", LogError, "could not save %s", SCPU_BUS_DIAG_FILE );
+	}
+
+	// On the physical C128 the first transfer after a direction change is still
+	// occasionally lost, but the saved kernel144 result was narrowly bounded:
+	// only element zero of the first-transfer series and single-write series,
+	// zero failures in all 20 repeated runs, and a perfect burst. Permit exactly
+	// that known C128 signature for this boot trial; every broader error remains
+	// a hard stop and the raw failure is retained in busdiag.txt.
+	if ( !busSelfTestPassed && !c128KnownFirstTransferOnly )
 	{
 		// Do not start the core over a bus we know is unreliable. It produces a
 		// dramatic display and no information, and it leaves the machine
 		// unusable. Hand the C64 back instead: it returns to its own CPU and
 		// the log above stays on screen to be read.
 		CScopedLoggingIRQs failIRQs;
+		radBus.logSelfTestResults( logger );
+		if ( cfgBusHaltAfterS > 0 )
+		{
+			u32 eligiblePhases = 0, addrChanges = 0, distinctAddrs = 0;
+			u32 sequentialAddrs = 0, writePhases = 0;
+			u8 firstAddr = 0, lastAddr = 0;
+			radBusHaltAndProbe( eligiblePhases, addrChanges, distinctAddrs,
+			                    sequentialAddrs, writePhases, firstAddr, lastAddr );
+			logger->Write( "SCPU", LogNotice,
+			               "idle host: eligible=%u distinct=%u changes=%u sequential=%u",
+			               (unsigned)eligiblePhases, (unsigned)distinctAddrs,
+			               (unsigned)addrChanges, (unsigned)sequentialAddrs );
+			logger->Write( "SCPU", LogNotice,
+			               "idle host: first=%02X last=%02X", firstAddr, lastAddr );
+			logger->Write( "SCPU", writePhases ? LogError : LogNotice,
+			               "idle host: R/W-low=%u/%u%s", (unsigned)writePhases,
+			               (unsigned)eligiblePhases,
+			               writePhases ? " -- ANOTHER BUS MASTER IS WRITING" : "" );
+		}
 		logger->Write( "SCPU", LogError,
 		               "BUS SELF-TEST FAILED -- not starting the CPU core." );
 		logger->Write( "SCPU", LogError,
 		               "Releasing /DMA; the C64 gets its own CPU back and should "
 		               "behave normally. Fix the failing operation above first." );
 		radBus.release();
-		actLED.Blink( 5 );		// distinct from the 1-4 milestone blinks
+		// Final diagnostic group:
+		//   6 blinks = single R/W failed only
+		//   7 blinks = burst write failed only
+		//   8 blinks = both failed
+		// The earlier startup groups are 1, 2 and 3 blinks, so a user counting
+		// every flash sees totals of 12, 13 or 14 respectively.
+		const u8 busFailure = radBus.selfTestFailure();
+		actLED.Blink( busFailure == 1 ? 6 : busFailure == 2 ? 7 : 8 );
 		logger->Write( "SCPU", LogNotice,
 		               "press the RAD button to reboot and retry." );
 		scpuWaitForButtonThenReboot();
+	}
+	if ( c128KnownFirstTransferOnly )
+	{
+		CScopedLoggingIRQs toleratedIRQs;
+		logger->Write( "SCPU", LogNotice,
+		               "C128: tolerating isolated first-transfer self-test signature;"
+		               " repeated single and burst paths passed" );
+	}
+
+	// E18N is a diagnostic-only C128 image. It deliberately stops before the
+	// SuperCPU boot animation: starting the emulator would mix mirror traffic,
+	// guest timing and further DRAM damage into a test whose sole question is
+	// which protected PHI slots preserve the physical RAM.
+	static const bool C128_REFRESH_DIAGNOSTIC_IMAGE = false;
+	if ( C128_REFRESH_DIAGNOSTIC_IMAGE
+	     && radBus.signals().machine == MACHINE_C128 )
+	{
+		{
+		CScopedLoggingIRQs scanIRQs;
+			logger->Write( "SCPU", LogNotice,
+			               "E18N: core3 DMA release-width scan (280..560 ARM cycles)" );
+			logger->Write( "SCPU", LogNotice,
+			               "E18N: read0 is decision; later reads audit observation decay" );
+		}
+		const bool scanCompleted = radBus.runRefreshPhaseScan();
+		const bool scanTrusted = radBus.refreshPhaseScanTrusted();
+
+		// Persist raw vectors before drawing the completion screen. The renderer
+		// is ordinary physical bus traffic; even if it exposes a new hardware
+		// problem, the expensive scan result is already recoverable from SD.
+		static char phaseDiag[ 65536 ];
+		const u32 phaseDiagSize =
+			radBus.formatSelfTestResults( phaseDiag, sizeof phaseDiag );
+		{
+		CScopedLoggingIRQs phaseFileIRQs;
+		if ( phaseDiagSize
+		     && writeFile( logger, SCPU_DRIVE, SCPU_BUS_DIAG_FILE,
+		                   (u8 *)phaseDiag, phaseDiagSize ) )
+				logger->Write( "SCPU", LogNotice,
+				               "E18N: saved diagnostic data to %s",
+			               SCPU_BUS_DIAG_FILE );
+		else
+				logger->Write( "SCPU", LogError,
+				               "E18N: could not save pulse scan to %s",
+			               SCPU_BUS_DIAG_FILE );
+		radBus.logSelfTestResults( logger );
+		if ( !scanCompleted )
+			logger->Write( "SCPU", LogError,
+			               "E18N mechanical abort -- return the SD card for the partial log" );
+		else if ( scanTrusted )
+			logger->Write( "SCPU", LogNotice,
+			               "E18N complete -- return the SD card" );
+		else
+			logger->Write( "SCPU", LogWarning,
+			               "E18N incomplete -- partial pulse scan saved; return the SD card" );
+		}
+
+		radBus.renderRefreshPhaseScanSummary();
+		// No ordinary physical access is allowed after this point. Core 3 changes
+		// to continuous VIC-half /DMA release and preserves the displayed result
+		// until the user powers down and returns the card.
+		radBus.setTrafficHalted( true );
+		actLED.Blink( scanTrusted ? 5 : 8 );
+		for ( ;; ) asm volatile( "wfe" );
 	}
 
 	actLED.Blink( 4 );		// milestone: handing over to the CPU core
@@ -1153,6 +1495,35 @@ void scpuBootRun( CLogger *logger )
 
 	if ( !startupInterrupted && scpuWaitForDiagnosticWindow( superCPU ) )
 		scpuDumpEmulatedScreen( logger, superCPU );
+
+	// Calibration runs before the successful boot and its original log lines
+	// have scrolled away by now. Repeat the retained results last so hardware
+	// testing does not require photographing a transient early boot screen.
+	if ( !startupInterrupted )
+	{
+		CScopedLoggingIRQs resultIRQs;
+		radBus.logSelfTestResults( logger );
+		// The first diagnostic snapshot predates the CPU-core startup. Refresh
+		// phase/deadline faults tend to appear under animation traffic, so replace
+		// it after the bounded 120-frame run with the live counters. This remains
+		// outside any timed physical access and makes runtime fallback diagnosable
+		// from the returned card rather than from a transient HDMI log.
+		static char runtimeBusDiag[ 16384 ];
+		const u32 runtimeBusDiagSize =
+			radBus.formatSelfTestResults( runtimeBusDiag, sizeof runtimeBusDiag );
+		if ( runtimeBusDiagSize
+		     && writeFile( logger, SCPU_DRIVE, SCPU_BUS_DIAG_FILE,
+		                   (u8 *)runtimeBusDiag, runtimeBusDiagSize ) )
+			logger->Write( "SCPU", LogNotice,
+			               "updated %s with runtime refresh counters",
+			               SCPU_BUS_DIAG_FILE );
+		else
+			logger->Write( "SCPU", LogError,
+			               "could not update %s after startup",
+			               SCPU_BUS_DIAG_FILE );
+		logger->Write( "SCPU", LogNotice,
+		               "calibration results retained above for hardware testing" );
+	}
 
 	// A short LEFT press can happen inside one of the startup wrappers above.
 	// Preserve that request instead of consuming it merely as "stop this

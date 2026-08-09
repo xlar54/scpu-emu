@@ -37,7 +37,8 @@ CC64Memory::CC64Memory()
 	  m_IECThrottleEvents( 0 ),
 	  m_PacingDebtCycles( 0 ), m_PacingCheckCycles( 1 ),
 	  m_PacerWaitHostCycles( 0 ), m_SlowPacedCycles( 0 ), m_IECThrottledCycles( 0 ),
-	  m_C64( 0 ), m_Mirror( 0 ), m_IO( 0 ), m_BootmapROM( 0 ), m_ROMShadow( 0 ),
+	  m_C64( 0 ), m_Mirror( 0 ), m_IO( 0 ), m_BootmapROM( 0 ),
+	  m_BootmapROMLength( 0 ), m_ROMShadow( 0 ), m_SCPU128Mode( false ),
 	  m_HasBasic( false ), m_HasKernal( false ), m_HasChar( false ),
 	  m_HostPerEmuQ16( 0 ), m_HostPerEmuQ16Slow( 0 ), m_PacingAnchor( 0 ),
 	  m_SelectedEmulatedHz( 0 ),
@@ -533,6 +534,31 @@ u8 CC64Memory::read8( scpu_addr_t addr )
 	if ( dosExtensionMapsBank1( a ) )
 		return m_ROMShadow[ a ];
 
+	// In native C128 mode these are decoded by the host independently of the
+	// 6510-style $0001 PLA state. In particular $FF00 is the 8722's
+	// always-visible configuration register, even while the SCPU boot ROM is
+	// mapped. Let the real MMU/VDC answer until their shadow model exists.
+	if ( m_SCPU128Mode
+	     && ( ( a >= 0xD500 && a <= 0xD50B )
+	       || ( a >= 0xD600 && a <= 0xD601 )
+	       || ( a >= 0xFF00 && a <= 0xFF04 ) ) )
+	{
+		m_IOReads++;
+		noteBusAccess( a, false );
+		return m_C64 ? m_C64->read( a ) : 0xFF;
+	}
+
+	// DOS 2.04's native-C128 reset stub lives in the low 64K half, but its
+	// first BRL transfers from $FE40 to $5E45. The bytes at low-half $5E45
+	// are zero; the executable target is image offset $15E45 in the upper
+	// half. This is the SCPU128 boot extension window, not ordinary C128 RAM.
+	if ( m_BootmapActive && m_SCPU128Mode && m_BootmapROMLength >= 0x20000
+	     && a >= 0x1000 && a <= 0x5FFF )
+	{
+		noteFastHalfCycles( 6 );
+		return m_BootmapROM[ 0x10000u + a ];
+	}
+
 	// Bootmap sits ABOVE the PLA: while it is active the $01 banking bits do
 	// not matter for these ranges. I/O is deliberately left alone -- the boot
 	// code needs the VIC-II and the CIAs, and $D000-$DFFF stays I/O in VICE's
@@ -692,6 +718,17 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 	if ( dosExtensionMapsBank1( a ) )
 	{
 		m_ROMShadow[ a ] = value;
+		return;
+	}
+
+	if ( m_SCPU128Mode
+	     && ( ( a >= 0xD500 && a <= 0xD50B )
+	       || ( a >= 0xD600 && a <= 0xD601 )
+	       || ( a >= 0xFF00 && a <= 0xFF04 ) ) )
+	{
+		m_IOWrites++;
+		noteBusAccess( a, true );
+		if ( m_C64 ) m_C64->write( a, value );
 		return;
 	}
 

@@ -21,6 +21,7 @@
 
 CSuperCPU::CSuperCPU()
 	: m_CPU( 0 ), m_Bus( 0 ), m_Running( false ), m_BootmapEnabled( false ),
+	  m_C128Mode( SCPU_C128_MODE_AUTO ),
 	  m_MirrorDisplayBudget( SCPU_MIRROR_DISPLAY_BYTES_DEFAULT ),
 	  m_FrameHook( 0 ), m_FrameHookCtx( 0 )
 {
@@ -51,11 +52,35 @@ bool CSuperCPU::init( IC64Bus *bus, SCPUCoreType core, u32 simmMB )
 	m_Registers.attach( &m_WriteBuffer );
 	m_Registers.attachBank1( m_MemoryMap.m_Bank1 );
 	m_Registers.attachFastRAM( &m_FastRAM );
-	// $D0B0 on an SCPU64 reports only the hardware revision; the 64-vs-128
-	// distinction belongs to the SuperCPU 128's own register set, which we do
-	// not emulate yet. The detected machine type is still used elsewhere for
-	// video timing.
+	// $D0B0 on an SCPU64 reports only the hardware revision.  Native SCPU128
+	// mode has its own identity below; C64 mode on a physical C128 deliberately
+	// keeps using the proven SCPU64-compatible path for now.
 	m_Registers.setHardwareVersion( SCPU_V2 );
+	// A physical C128 remains MACHINE_C128 after the Commodore key has selected
+	// C64 mode, so machine type alone is not a mode discriminator.  Nor can a
+	// DMA master read the 8502's internal $0001 port -- that was the source of
+	// nondeterministic C64/native selection in kernel117.  AUTO instead checks
+	// the stable $FF01-$FF04 view after the Z80 handoff: native mode exposes the
+	// 8722 presets captured on real hardware (3F 7F 01 41), while C64 mode
+	// exposes ordinary KERNAL bytes.  Bring-up can override this explicitly.
+	bool scpu128Mode = false;
+	if ( m_Bus->signals().machine == MACHINE_C128
+	     && m_MemoryMap.romLength() >= 0x20000 )
+	{
+		if ( m_C128Mode == SCPU_C128_MODE_NATIVE )
+			scpu128Mode = true;
+		else if ( m_C128Mode == SCPU_C128_MODE_AUTO )
+		{
+			const u8 p1 = m_Bus->read( 0xFF01 );
+			const u8 p2 = m_Bus->read( 0xFF02 );
+			const u8 p3 = m_Bus->read( 0xFF03 );
+			const u8 p4 = m_Bus->read( 0xFF04 );
+			scpu128Mode = p1 == 0x3F && p2 == 0x7F
+			           && p3 == 0x01 && p4 == 0x41;
+		}
+	}
+	m_Registers.setSCPU128Mode( scpu128Mode );
+	m_Memory.setSCPU128Mode( scpu128Mode );
 
 	// Fill in whichever ROM images the caller did not supply by reading them off
 	// the live machine. This is the zero-configuration path: no files needed,
@@ -166,7 +191,8 @@ void CSuperCPU::reset()
 	                        && m_MemoryMap.romImage() != 0
 	                        && m_MemoryMap.romLength() >= 0x10000;
 
-	m_Memory.setBootmapROM( bootmapUsable ? m_MemoryMap.romImage() : 0 );
+	m_Memory.setBootmapROM( bootmapUsable ? m_MemoryMap.romImage() : 0,
+	                       bootmapUsable ? m_MemoryMap.romLength() : 0 );
 	m_Registers.trackBootmap( bootmapUsable ? &m_Memory.m_BootmapActive : 0 );
 	if ( !bootmapUsable )
 		m_Memory.m_BootmapActive = false;
@@ -668,8 +694,16 @@ u64 CSuperCPU::runFrame()
 			// a glitched burst). Keep this to one normal installment too: the old
 			// 512-byte sweep was an otherwise unexplained half-millisecond CPU
 			// pause whenever the ordinary queue happened to empty.
-			if ( m_WriteBuffer.empty() )
+			if ( m_WriteBuffer.empty()
+			     && m_Bus->signals().machine != MACHINE_C128 )
 			{
+				// On a physical C128 the background sweep is not benign: once
+				// the ordinary queue drains it adds otherwise unnecessary DRAM
+				// writes. The K198 no-repair test left
+				// the same static A-Z screen unchanged for ten minutes after
+				// MIRROR_HALT stopped this traffic. Suppress only the sweep on a
+				// C128; dirty writes still use the normal queue, while C64 sprite
+				// relocation healing keeps its established behaviour.
 				const u16 line = m_Bus->rasterLine();
 				if ( c64RasterIsSafeForBulkTransfer( sig.video, line ) )
 				{

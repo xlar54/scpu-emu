@@ -29,7 +29,7 @@
 #define _config_h
 
 
-#define TIMING_NAMES 35
+#define TIMING_NAMES 38
 const char timingNames[TIMING_NAMES][32] = {
 	"WAIT_FOR_SIGNALS", 
 	"WAIT_CYCLE_READ", 
@@ -109,7 +109,15 @@ const char timingNames[TIMING_NAMES][32] = {
 	// Model the real card's one-deep mirrored-write buffer in emulated time.
 	// Off by default on RAD because physical deferred delivery already consumes
 	// that time and charging it here too causes visible scheduler starvation.
-	"MIRROR_STRETCH"
+	"MIRROR_STRETCH",
+	// Physical C128 operating-mode selection: 0 auto, 1 force C64, 2 native.
+	"C128_MODE",
+	// Diagnostic: stop every physical expansion-bus read and write after N
+	// seconds while leaving the emulated CPU alive. 0 disables it.
+	"BUS_HALT_AFTER_S",
+	// The FPGA C64U was validated with RAD's original reset/KERNAL-settle/
+	// badline takeover. Keep the C128-safe Ultimax takeover as the default.
+	"C64U_LEGACY_TAKEOVER"
 };
 
 // Which CPU core boot.cpp should install. Set from CPU_CORE in the config file;
@@ -166,6 +174,9 @@ extern int cfgVectorReroute;
 extern int cfgIOStretch;
 extern int cfgNMINativeDefer;
 extern int cfgMirrorStretch;
+extern int cfgC128Mode;
+extern int cfgBusHaltAfterS;
+extern int cfgC64ULegacyTakeover;
 
 #define SCPU_CFG_MIRROR_DISPLAY_DEFAULT 1024
 

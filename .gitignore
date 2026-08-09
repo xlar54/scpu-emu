@@ -116,6 +116,7 @@ Source/kernel8.img
 
 # Local collaborator worktrees and copyrighted game/debug captures.
 /.claude/
+/CHT
 /C64Tests/WINTER GAMES.D64
 /C64Tests/*.vsf
 /C64Tests/wg_*.prg
