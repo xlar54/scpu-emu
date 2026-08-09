@@ -113,6 +113,7 @@ Source/kernel8.img
 
 # Local reference checkout of VICE, for its SCPU64 emulation.
 /_vice/
+/.tools/
 
 # Local collaborator worktrees and copyrighted game/debug captures.
 /.claude/

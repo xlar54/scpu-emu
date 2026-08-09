@@ -1185,11 +1185,8 @@ void scpuBootRun( CLogger *logger )
 
 	s_Logger = logger;
 	radBus.setLogger( logger );
-	radBus.setC64ULegacyTakeover( cfgC64ULegacyTakeover != 0 );
-	logger->Write( "SCPU", LogNotice, "takeover: %s",
-	               cfgC64ULegacyTakeover
-	                   ? "C64U legacy reset/settle/badline"
-	                   : "C128-safe Ultimax/GAME" );
+	logger->Write( "SCPU", LogNotice,
+	               "takeover: automatic legacy-first with C128 Ultimax fallback" );
 
 	// Which core: the 65816 is the real accelerator, the 6502 is milestone-1
 	// scaffolding kept as a fallback. CPU_CORE in scpu.cfg decides, so a bad run

@@ -279,9 +279,9 @@ old_d01c: .byte 0
 old_d01d: .byte 0
 old_d020: .byte 0
 old_d021: .byte 0
-old_positions: .res 16
-old_ptrs:   .res 8
-old_colors: .res 8
+old_positions: .fill 16,0
+old_ptrs:   .fill 8,0
+old_colors: .fill 8,0
 
 ; 21 rows x 3 bytes. The 64th sprite byte is unused.
 ball_bitmap:

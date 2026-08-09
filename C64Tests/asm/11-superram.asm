@@ -1,24 +1,24 @@
 .include "common.inc"
 
 start:
-    print_string title
+    #print_string title
     sei
     clc
     xce
     rep #$10
-    .i16
+    .xl
     ldx #0
 probe_loop:
     sep #$20
-    .a8
+    .as
     lda addresses+2,x
     sta bank_text
     lda addresses+1,x
-    sta z:pointer+1
+    sta pointer+1
     lda addresses,x
-    sta z:pointer
+    sta pointer
     lda addresses+2,x
-    sta z:pointer+2
+    sta pointer+2
     lda [<pointer]
     sta saved
     eor #$a5
@@ -41,7 +41,7 @@ probe_next:
     cpx #12
     bne probe_loop
     sep #$30
-    .i8
+    .xs
     sec
     xce
     cli
@@ -53,35 +53,35 @@ pointer = $fb
 saved:    .byte 0
 expected: .byte 0
 addresses:
-    .byte <$011234, >$011234, ^$011234
-    .byte <$022345, >$022345, ^$022345
-    .byte <$7f3456, >$7f3456, ^$7f3456
-    .byte <$f54567, >$f54567, ^$f54567
+    .byte <$011234, >$011234, ($011234 >> 16) & $ff
+    .byte <$022345, >$022345, ($022345 >> 16) & $ff
+    .byte <$7f3456, >$7f3456, ($7f3456 >> 16) & $ff
+    .byte <$f54567, >$f54567, ($f54567 >> 16) & $ff
 
 print_bank_pass:
     phx
     jsr leave_native
-    print_string bank_prefix
+    #print_string bank_prefix
     lda bank_text
     jsr print_hex
-    print_string pass_suffix
+    #print_string pass_suffix
     jsr enter_native
     plx
     rts
 print_bank_fail:
     phx
     jsr leave_native
-    print_string bank_prefix
+    #print_string bank_prefix
     lda bank_text
     jsr print_hex
-    print_string fail_suffix
+    #print_string fail_suffix
     jsr enter_native
     plx
     rts
 leave_native:
     sep #$30
-    .a8
-    .i8
+    .as
+    .xs
     sec
     xce
     cli
@@ -91,7 +91,7 @@ enter_native:
     clc
     xce
     rep #$10
-    .i16
+    .xl
     rts
 print_hex:
     pha
@@ -104,14 +104,19 @@ print_hex:
     and #$0f
 nibble:
     cmp #10
-    bcc :+
+    bcc nibble_digit
     adc #6
-:
+nibble_digit:
     adc #'0'
     jmp $ffd2
 
-title:       .byte 13,"24-BIT RAM PROBES",13,0
-bank_prefix: .byte "BANK $",0
+title:       .byte 13
+             .text "24-BIT RAM PROBES"
+             .byte 13,0
+bank_prefix: .text "BANK $"
+             .byte 0
 bank_text:   .byte 0
-pass_suffix: .byte ": PASS",13,0
-fail_suffix: .byte ": FAIL/NOT FITTED",13,0
+pass_suffix: .text ": PASS"
+             .byte 13,0
+fail_suffix: .text ": FAIL/NOT FITTED"
+             .byte 13,0

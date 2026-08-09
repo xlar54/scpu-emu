@@ -3,13 +3,13 @@
 SID = $d400
 
 start:
-    print_string title_msg
+    #print_string title_msg
     jsr silence_sid
     sta aborted
     lda #$0f
     sta SID+$18
 
-    print_string voice1_msg
+    #print_string voice1_msg
     ldx #0
 voice1_scale:
     lda note_lo,x
@@ -34,7 +34,7 @@ voice1_continue:
     lda #$10
     sta SID+$04
 
-    print_string voice2_msg
+    #print_string voice2_msg
     ldx #0
 voice2_scale:
     lda note_lo,x
@@ -59,7 +59,7 @@ voice2_continue:
     lda #$20
     sta SID+$0b
 
-    print_string noise_msg
+    #print_string noise_msg
     lda #$00
     sta SID+$0e
     lda #$18
@@ -79,7 +79,7 @@ noise_complete:
     lda #$80
     sta SID+$12
 
-    print_string chord_msg
+    #print_string chord_msg
     lda #<$1167           ; C4, triangle
     sta SID+$00
     lda #>$1167
@@ -107,7 +107,7 @@ noise_complete:
     lda aborted
     bne test_done
 
-    print_string filter_msg
+    #print_string filter_msg
     lda #$f7              ; high resonance, route voices 1-3
     sta SID+$17
     lda #$1f              ; low-pass filter, full volume
@@ -132,7 +132,7 @@ test_done:
     jsr silence_sid
     lda aborted
     bne early_exit
-    print_string complete_msg
+    #print_string complete_msg
 early_exit:
     rts
 
@@ -179,11 +179,20 @@ aborted:    .byte 0
 note_lo: .byte <$08b4,<$0af7,<$0d0a,<$1167,<$15ee,<$1a14,<$22ce
 note_hi: .byte >$08b4,>$0af7,>$0d0a,>$1167,>$15ee,>$1a14,>$22ce
 
-title_msg:    .byte 147,"SID SOUND TEST",13
-              .byte "SPACE STOPS AND RETURNS TO BASIC",13,0
-voice1_msg:   .byte "VOICE 1: TRIANGLE SCALE",13,0
-voice2_msg:   .byte "VOICE 2: SAWTOOTH SCALE",13,0
-noise_msg:    .byte "VOICE 3: NOISE",13,0
-chord_msg:    .byte "THREE-VOICE CHORD",13,0
-filter_msg:   .byte "LOW-PASS FILTER SWEEP",13,0
-complete_msg: .byte "SOUND TEST COMPLETE",13,0
+title_msg:    .byte 147
+              .text "SID SOUND TEST"
+              .byte 13
+              .text "SPACE STOPS AND RETURNS TO BASIC"
+              .byte 13,0
+voice1_msg:   .text "VOICE 1: TRIANGLE SCALE"
+              .byte 13,0
+voice2_msg:   .text "VOICE 2: SAWTOOTH SCALE"
+              .byte 13,0
+noise_msg:    .text "VOICE 3: NOISE"
+              .byte 13,0
+chord_msg:    .text "THREE-VOICE CHORD"
+              .byte 13,0
+filter_msg:   .text "LOW-PASS FILTER SWEEP"
+              .byte 13,0
+complete_msg: .text "SOUND TEST COMPLETE"
+              .byte 13,0

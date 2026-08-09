@@ -20,8 +20,6 @@
 extern volatile u32 g_C128EpochEnabled;
 extern volatile u32 g_C128EpochState;
 extern volatile u32 g_C128TrafficBusy;
-extern volatile u64 g_C128TrafficDeadline;
-extern volatile u32 g_C128TrafficPhiCycles;
 
 // Non-blocking half of c128TrafficBegin(). Callers which must first align to
 // PHI and inspect BA can do that without owning the refresh interlock, then

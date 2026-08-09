@@ -66,8 +66,6 @@ static volatile u32 s_WindowScanExposureLinesCompleted = 0;
 volatile u32 g_C128EpochEnabled = 0;
 volatile u32 g_C128EpochState = 0;
 volatile u32 g_C128TrafficBusy = 0;
-volatile u64 g_C128TrafficDeadline = 0;
-volatile u32 g_C128TrafficPhiCycles = 0;
 
 static const u32 C128_REFRESH_CORE = 3;
 // Kernel194 proved that even a four-half-cycle traffic island can lose sparse
@@ -155,7 +153,6 @@ static void c128CloseTraffic( u64 &now )
 	                            __ATOMIC_ACQUIRE ) != 0 )
 		asm volatile( "yield" );
 	READ_CYCLE_COUNTER( now );
-	__atomic_store_n( &g_C128TrafficDeadline, 0u, __ATOMIC_RELEASE );
 	if ( now - waitStart > s_MaxTrafficBusyCycles )
 		s_MaxTrafficBusyCycles = now - waitStart;
 }
@@ -310,13 +307,6 @@ static void c128RunLineScheduler()
 		// would contend for the GPIO peripheral with core 0's timed accesses.
 		const u64 closeTarget = openEdge
 		                        + (u64)phiCycles * C128_LINE_TRAFFIC_CYCLES;
-		// Publish the hard close before opening the epoch. Core 0 uses it with
-		// the measured PHI period to reject a transaction which cannot finish
-		// before refresh must resume.
-		__atomic_store_n( &g_C128TrafficPhiCycles, phiCycles,
-		                  __ATOMIC_RELAXED );
-		__atomic_store_n( &g_C128TrafficDeadline, closeTarget,
-		                  __ATOMIC_RELEASE );
 		__atomic_store_n( &g_C128EpochState, 1, __ATOMIC_RELEASE );
 		s_TrafficEpochs++;
 		s_LinePhaseOpenCount[ permutationPhase ]++;
@@ -559,8 +549,6 @@ bool c128RefreshStart()
 	if ( !s_RefreshReady ) return false;
 
 	__atomic_store_n( &g_C128TrafficBusy, 0, __ATOMIC_RELAXED );
-	__atomic_store_n( &g_C128TrafficDeadline, 0u, __ATOMIC_RELAXED );
-	__atomic_store_n( &g_C128TrafficPhiCycles, 0u, __ATOMIC_RELAXED );
 	s_LineSyncRequested = 0;
 	s_LineSyncReady = 0;
 	s_LineSyncCommitted = 0;
@@ -592,8 +580,6 @@ void c128RefreshStop()
 	__atomic_store_n( &g_C128EpochEnabled, 0, __ATOMIC_RELEASE );
 	__atomic_store_n( &g_C128EpochState, 0, __ATOMIC_RELEASE );
 	__atomic_store_n( &g_C128TrafficBusy, 0, __ATOMIC_RELEASE );
-	__atomic_store_n( &g_C128TrafficDeadline, 0u, __ATOMIC_RELEASE );
-	__atomic_store_n( &g_C128TrafficPhiCycles, 0u, __ATOMIC_RELEASE );
 	s_LineSyncReady = 0;
 	s_LineActive = 0;
 	DataSyncBarrier();

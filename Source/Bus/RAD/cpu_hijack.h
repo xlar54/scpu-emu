@@ -62,6 +62,10 @@ void radResetMachine();
 // mid-cycle and still driving, risks contention between two drivers.
 bool radHijackCPU();
 
+// Materialise and cache the Ultimax takeover table while the host still owns
+// its bus. This must run before a legacy probe can leave a C128 under /DMA.
+void radPrepareUltimaxTakeover();
+
 // Reset through an emulated Ultimax cartridge and take the bus while the host
 // CPU is executing a known stream of read-only NOPs.  Unlike the C64-only
 // badline handoff above, this also gives the C128's reset-time Z80 cartridge

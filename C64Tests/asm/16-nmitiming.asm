@@ -19,13 +19,13 @@ SWEEP_RUNS = 32
 NATIVE_RUNS = 64
 
 start:
-    print_string title_msg
+    #print_string title_msg
     lda SCPU_DETECT
     bpl scpu_present
-    print_string no_scpu_msg
+    #print_string no_scpu_msg
     rts
 scpu_present:
-    print_string mode_msg
+    #print_string mode_msg
 mode_wait:
     jsr $ffe4
     cmp #'1'
@@ -40,17 +40,17 @@ choose_fast:
     lda #0
     sta FAST_REG
     sta selected_slow
-    print_string turbo_msg
+    #print_string turbo_msg
     bra begin_test
 choose_slow:
     lda #0
     sta SLOW_REG
     lda #1
     sta selected_slow
-    print_string slow_msg
+    #print_string slow_msg
 
 begin_test:
-    print_string running_msg
+    #print_string running_msg
     sei
     lda $01
     sta old_port
@@ -102,7 +102,7 @@ save_c003:
     sta $c004
     lda #>native_nmi
     sta $c005
-    lda #^native_nmi
+    lda #((native_nmi >> 16) & $ff)
     sta $c006
 
     ; Direct Space scan: row 7, column 4. IRQs stay masked for clean timing.
@@ -183,14 +183,14 @@ sweep_trial:
     sta captured_temp
     ldx sweep_index
     cmp sweep_min,x
-    bcs :+
+    bcs sweep_min_done
     sta sweep_min,x
-:
+sweep_min_done:
     lda captured_temp
     cmp sweep_max,x
-    bcc :+
+    bcc sweep_max_done
     sta sweep_max,x
-:
+sweep_max_done:
     lda captured_temp
     clc
     adc sweep_sum_lo,x
@@ -268,9 +268,9 @@ stress_loop:
     bcs stress_missed
     pha
     inc stress_ok_lo
-    bne :+
+    bne stress_ok_done
     inc stress_ok_hi
-:
+stress_ok_done:
     pla
     clc
     adc stress_sum_lo
@@ -288,9 +288,9 @@ stress_continue:
     jsr space_pressed
     bcs stress_abort
     lda remaining_lo
-    bne :+
+    bne stress_low_nonzero
     dec remaining_hi
-:
+stress_low_nonzero:
     dec remaining_lo
     lda remaining_lo
     ora remaining_hi
@@ -322,10 +322,10 @@ emu_trial:
     sta CIA2_CRA
 emu_wait:
     inx
-    bne :+
+    bne emu_wait_continue
     inc timeout_hi
     beq emu_timeout
-:
+emu_wait_continue:
     lda hit_kind
     beq emu_wait
     lda captured_x
@@ -353,8 +353,8 @@ native_trial:
     sta CIA2_CRA
     clc
     xce
-    .a8
-    .i8
+    .as
+    .xs
 native_wait:
     inx
     lda hit_kind
@@ -364,8 +364,8 @@ native_wait:
 native_leave:
     sec
     xce
-    .a8
-    .i8
+    .as
+    .xs
     ldx #0
 native_emu_wait:
     lda hit_kind
@@ -400,24 +400,24 @@ native_nmi:
 space_pressed:
     lda CIA1_PRB
     and #$10
-    bne :+
+    bne space_not_pressed
     sec
     rts
-:
+space_not_pressed:
     clc
     rts
 
 print_results:
-    print_string result_title
-    print_string mode_label
+    #print_string result_title
+    #print_string mode_label
     lda selected_slow
-    beq :+
-    print_string slow_name
-    bra :++
-:
-    print_string turbo_name
-:
-    print_string sweep_header
+    beq print_turbo_mode
+    #print_string slow_name
+    bra print_mode_done
+print_turbo_mode:
+    #print_string turbo_name
+print_mode_done:
+    #print_string sweep_header
     stz sweep_index
 print_sweep_loop:
     ldx sweep_index
@@ -452,28 +452,28 @@ print_sweep_loop:
     lda sweep_index
     cmp #SWEEP_COUNT
     bne print_sweep_loop
-    print_string native_label
+    #print_string native_label
     lda native_taken
     jsr print_hex8
-    print_string deferred_label
+    #print_string deferred_label
     lda native_deferred
     jsr print_hex8
-    print_string miss_label
+    #print_string miss_label
     lda native_missed
     jsr print_hex8
     lda #13
     jsr $ffd2
-    print_string stress_label
+    #print_string stress_label
     lda stress_ok_hi
     jsr print_hex8
     lda stress_ok_lo
     jsr print_hex8
-    print_string miss_label
+    #print_string miss_label
     lda stress_miss_hi
     jsr print_hex8
     lda stress_miss_lo
     jsr print_hex8
-    print_string sum_label
+    #print_string sum_label
     lda stress_sum_hi
     jsr print_hex8
     lda stress_sum_lo
@@ -481,11 +481,11 @@ print_sweep_loop:
     lda #13
     jsr $ffd2
     lda aborted
-    beq :+
-    print_string aborted_msg
+    beq print_done_message
+    #print_string aborted_msg
     rts
-:
-    print_string done_msg
+print_done_message:
+    #print_string done_msg
     rts
 
 print_hex8:
@@ -499,9 +499,9 @@ print_hex8:
     and #$0f
 print_nibble:
     cmp #10
-    bcc :+
+    bcc print_nibble_digit
     adc #6
-:
+print_nibble_digit:
     adc #'0'
     jmp $ffd2
 
@@ -511,9 +511,9 @@ old_dc02: .byte 0
 old_dd04: .byte 0
 old_dd05: .byte 0
 old_dd0e: .byte 0
-old_c003: .res 4
-old_ffea: .res 2
-old_fffa: .res 2
+old_c003: .fill 4,0
+old_ffea: .fill 2,0
+old_fffa: .fill 2,0
 selected_slow: .byte 0
 aborted: .byte 0
 hit_kind: .byte 0
@@ -524,11 +524,11 @@ timeout_hi: .byte 0
 repeat_count: .byte 0
 sweep_index: .byte 0
 sweep_delays: .byte 2,4,8,16,32
-sweep_min: .res SWEEP_COUNT
-sweep_max: .res SWEEP_COUNT
-sweep_sum_lo: .res SWEEP_COUNT
-sweep_sum_hi: .res SWEEP_COUNT
-sweep_miss: .res SWEEP_COUNT
+sweep_min: .fill SWEEP_COUNT,0
+sweep_max: .fill SWEEP_COUNT,0
+sweep_sum_lo: .fill SWEEP_COUNT,0
+sweep_sum_hi: .fill SWEEP_COUNT,0
+sweep_miss: .fill SWEEP_COUNT,0
 native_taken: .byte 0
 native_deferred: .byte 0
 native_missed: .byte 0
@@ -542,21 +542,41 @@ stress_seq: .byte 0
 remaining_lo: .byte 0
 remaining_hi: .byte 0
 
-title_msg: .byte 147,"CIA2 NMI TIMING/STRESS",13,0
-no_scpu_msg: .byte "NO SUPERCPU DETECTED",13,0
-mode_msg: .byte "1=1MHZ  2/T=TURBO",13,0
-turbo_msg: .byte "TURBO SELECTED",13,0
-slow_msg: .byte "1MHZ SELECTED",13,0
-running_msg: .byte "RUNNING - SPACE ABORTS BETWEEN TRIALS",13,0
-result_title: .byte 147,"CIA2 NMI RESULTS",13,0
-mode_label: .byte "MODE: ",0
-slow_name: .byte "1MHZ",13,0
-turbo_name: .byte "TURBO",13,0
-sweep_header: .byte "LATCH MIN MAX SUM  MISS",13,0
-native_label: .byte "NATIVE: ",0
-deferred_label: .byte " DEFER: ",0
-miss_label: .byte " MISS: ",0
-stress_label: .byte "STRESS OK: ",0
-sum_label: .byte " SUM: ",0
-aborted_msg: .byte "ABORTED - PARTIAL RESULTS",13,0
-done_msg: .byte "DONE - PHOTOGRAPH THIS SCREEN",13,0
+title_msg: .byte 147
+           .text "CIA2 NMI TIMING/STRESS"
+           .byte 13,0
+no_scpu_msg: .text "NO SUPERCPU DETECTED"
+             .byte 13,0
+mode_msg: .text "1=1MHZ  2/T=TURBO"
+          .byte 13,0
+turbo_msg: .text "TURBO SELECTED"
+           .byte 13,0
+slow_msg: .text "1MHZ SELECTED"
+          .byte 13,0
+running_msg: .text "RUNNING - SPACE ABORTS BETWEEN TRIALS"
+             .byte 13,0
+result_title: .byte 147
+              .text "CIA2 NMI RESULTS"
+              .byte 13,0
+mode_label: .text "MODE: "
+            .byte 0
+slow_name: .text "1MHZ"
+           .byte 13,0
+turbo_name: .text "TURBO"
+            .byte 13,0
+sweep_header: .text "LATCH MIN MAX SUM  MISS"
+              .byte 13,0
+native_label: .text "NATIVE: "
+              .byte 0
+deferred_label: .text " DEFER: "
+                .byte 0
+miss_label: .text " MISS: "
+            .byte 0
+stress_label: .text "STRESS OK: "
+              .byte 0
+sum_label: .text " SUM: "
+           .byte 0
+aborted_msg: .text "ABORTED - PARTIAL RESULTS"
+             .byte 13,0
+done_msg: .text "DONE - PHOTOGRAPH THIS SCREEN"
+          .byte 13,0

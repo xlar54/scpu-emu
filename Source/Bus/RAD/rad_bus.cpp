@@ -38,7 +38,6 @@ static u64 armCycleCounter;
 
 CRADBus::CRADBus()
 	: m_Reads( 0 ), m_Writes( 0 ), m_BurstWrites( 0 ), m_Acquired( false ),
-	  m_C64ULegacyTakeover( false ),
 	  m_TrafficHalted( false ),
 	  m_SelfTestFailure( 0 ),
 	  m_ReadTimingConfigured( 0 ), m_ReadTimingStart( 0 ), m_ReadTimingEnd( 0 ),
@@ -263,55 +262,15 @@ static bool busDiagEndLine( char *dst, u32 capacity, u32 &length )
 // These helpers bypass RAD_PEEK/RAD_SPEEK so the diagnostic can compare a
 // minimal direct transfer with the ordinary wrapper. E7 intentionally makes
 // the normal read primitive itself the same direct p1/p2/p3 sequence.
-static __attribute__((always_inline)) inline void
-radPrepareGuardedTraffic( register u32 &g2, u32 baSampleAt )
-{
-	if ( !__atomic_load_n( &g_C128EpochEnabled, __ATOMIC_RELAXED )
-	     || !c128RefreshLineActive() )
-	{
-		// Acquisition, calibration and line-phase handoff do not yet have a
-		// published per-line deadline. Keep their repeatedly proven access path;
-		// the BA/deadline admission rule is a runtime scheduler policy only.
-		c128TrafficBegin();
-		BUS_RESYNC
-		return;
-	}
-
-	for ( ;; )
-	{
-		// Align and inspect BA without owning g_C128TrafficBusy. If the VIC is
-		// announcing a badline or sprite fetch, core 3 remains free to close the
-		// traffic epoch and resume refresh while we wait for another opportunity.
-		while ( __atomic_load_n( &g_C128EpochState, __ATOMIC_ACQUIRE ) != 1 )
-			asm volatile( "yield" );
-		BUS_RESYNC
-		WAIT_UP_TO_CYCLE( baSampleAt );
-		g2 = read32( ARM_GPIO_GPLEV0 );
-		if ( !( g2 & bBA ) ) continue;
-
-		if ( !c128TrafficTryBegin() ) continue;
-
-		// BA gives three cycles of notice before the VIC takes AEC. Reserve that
-		// same interval before the published close so the complete access and
-		// its bus release finish before core 3 must pulse /DMA for refresh.
-		const u64 deadline =
-			__atomic_load_n( &g_C128TrafficDeadline, __ATOMIC_ACQUIRE );
-		const u32 phi =
-			__atomic_load_n( &g_C128TrafficPhiCycles, __ATOMIC_RELAXED );
-		u64 now;
-		READ_CYCLE_COUNTER( now );
-		if ( !deadline || !phi || now + (u64)phi * 3u < deadline )
-			return;
-
-		c128TrafficEnd();
-	}
-}
-
 __attribute__((noinline)) u8 radDirectRead( u16 addr )
 {
 	register u32 g2;
 	u8 v = 0;
-	radPrepareGuardedTraffic( g2, busTiming.TIMING_BA_SIGNAL_AVAIL );
+	// K202's hardware-validated blocking path. A transaction claims the open
+	// C128 traffic epoch before it aligns to the physical bus; C64-class hosts
+	// return immediately because the refresh interlock is disabled.
+	c128TrafficBegin();
+	BUS_RESYNC
 	busReadByte_p1( g2, addr );
 	busReadByte_p2( g2 );
 	const u32 sampleAt = ( ( addr & 0xFC00 ) == 0xD400 )
@@ -330,7 +289,8 @@ static inline u8 busDiagRawRead( u16 addr )
 __attribute__((noinline)) void radDirectWrite( u16 addr, u8 value )
 {
 	register u32 g2;
-	radPrepareGuardedTraffic( g2, busTiming.TIMING_READ_BA_WRITING );
+	c128TrafficBegin();
+	BUS_RESYNC
 	busWriteByte_p1( g2, addr, value );
 	busWriteByte_p2( g2, false );
 	c128TrafficEnd();
@@ -377,57 +337,64 @@ bool CRADBus::acquire()
 		return false;
 	}
 
-	if ( m_C64ULegacyTakeover )
+	RADLOG( "2/6 resetting for a clean start..." );
+	radResetMachine();
+
+	RADLOG( "3/6 waiting for restart..." );
+	if ( !radWaitForMachineRunning() )
 	{
-		// The 64U is an FPGA C64, not a C128. It passed every physical bus
-		// discriminator under the ordinary C64 policy, but the later universal
-		// Ultimax/GAME takeover regressed both its cold display and its formerly
-		// reliable warm RAD restart. Restore the exact sequence used by the last
-		// known-good 64U-era firmware: reset, let the KERNAL establish the normal
-		// C64 map, then take /DMA on a VIC badline. Real C64/C128 profiles retain
-		// the C128-safe Ultimax path below.
-		RADLOG( "2/6 C64U legacy: resetting for a clean start..." );
-		radResetMachine();
-
-		RADLOG( "3/6 C64U legacy: waiting for restart..." );
-		if ( !radWaitForMachineRunning() )
-		{
-			RADLOG( "    FAILED: no clock after C64U reset." );
-			return false;
-		}
-
-		RADLOG( "4/6 C64U legacy: letting the KERNAL boot (3s)..." );
-		idleHold( 3 );
-
-		RADLOG( "5/6 C64U legacy: taking /DMA on a badline..." );
-		if ( !radHijackCPU() )
-		{
-			RADLOG( "    FAILED: no badline; /DMA was not asserted." );
-			return false;
-		}
-
-		RADLOG( "6/6 C64U legacy: probing and calibrating..." );
-		m_Signals.machine = radDetectMachine();
-		if ( m_Signals.machine != MACHINE_C64 )
-		{
-			RADLOG( "    FAILED: C64U legacy mode detected a C128; releasing /DMA." );
-			radReleaseCPU();
-			return false;
-		}
-		busWriteTurnaroundPasses = 1;
-		busWriteTurnaroundNeeded = 0;
-		m_Acquired = true;
-		calibrateReadTiming();
-		calibrateWriteTiming();
-		m_Signals.video = radDetectVideoStandard();
-
-		RADLOG( "    %s, %s -- C64U legacy bus acquired",
-		        "C64",
-		        m_Signals.video == VIDEO_PAL ? "PAL" : "NTSC" );
-		return true;
+		RADLOG( "    FAILED: no clock after reset." );
+		return false;
 	}
 
-	RADLOG( "2/4 starting the GAME/Ultimax reset takeover..." );
+	RADLOG( "4/6 letting the host KERNAL boot (3s)..." );
+	idleHold( 3 );
+
+	// Prepare the fallback while the host is still running freely. If the
+	// badline probe identifies a C128, /DMA is already held and the measured
+	// refresh margin is only a few milliseconds; no cache warm-up or table
+	// construction may be deferred into that interval.
+	radPrepareUltimaxTakeover();
+
+	RADLOG( "5/6 taking /DMA on a VIC badline..." );
+	if ( radHijackCPU() )
+	{
+		RADLOG( "    badline takeover complete; detecting host..." );
+		m_Signals.machine = radDetectMachine();
+		if ( m_Signals.machine == MACHINE_C64 )
+		{
+			// The original RAD ordering, now proven on both a physical C64 and
+			// the FPGA 64U: keep this acquisition and never expose those hosts to
+			// the GAME/Ultimax reset sequence.
+			busWriteTurnaroundPasses = 1;
+			busWriteTurnaroundNeeded = 0;
+			m_Acquired = true;
+			calibrateReadTiming();
+			calibrateWriteTiming();
+			m_Signals.video = radDetectVideoStandard();
+
+			RADLOG( "6/6 C64, %s -- legacy bus acquired",
+			        m_Signals.video == VIDEO_PAL ? "PAL" : "NTSC" );
+			return true;
+		}
+
+		// Enter with /DMA still asserted. radHijackCPUWithUltimax() asserts
+		// RESET before it ever releases /DMA, so the physical 8502/Z80 cannot
+		// execute in the transition. This ordering is load-bearing.
+		RADLOG( "    C128 detected; escalating without releasing /DMA..." );
+	}
+	else
+	{
+		// A native C128 may have its VIC-IIe display blanked and provide no
+		// badline. radHijackCPU() is bounded and has not asserted /DMA here, so
+		// fall back to the reset-time Ultimax handoff instead of failing startup.
+		// The bounded attempts may have displaced cached takeover code, and the
+		// host still owns the bus, so it is safe to warm the fallback once more.
+		radPrepareUltimaxTakeover();
+		RADLOG( "    no badline; trying the bounded C128 Ultimax fallback..." );
+	}
+
+	RADLOG( "6/6 starting the GAME/Ultimax reset takeover..." );
 	if ( !radHijackCPUWithUltimax() )
 	{
 		RADLOG( "    FAILED: the host CPU did not fetch the Ultimax NOP stream;"
@@ -435,7 +402,7 @@ bool CRADBus::acquire()
 		return false;
 	}
 
-	RADLOG( "3/4 /DMA asserted on a known read cycle; detecting the machine..." );
+	RADLOG( "    /DMA asserted on a known read cycle; detecting the machine..." );
 	// Detect first using repeated reads at the configured baseline. On a C128,
 	// the former order spent the entire read scan and 513-point write grid with
 	// /DMA continuously low before the refresh core even started. Kernel154's
@@ -492,7 +459,7 @@ bool CRADBus::acquire()
 		        (unsigned)c128RefreshMeasuredPhiCycles() );
 	}
 
-	RADLOG( "4/4 %s, %s -- bus acquired",
+	RADLOG( "    %s, %s -- Ultimax bus acquired",
 	        m_Signals.machine == MACHINE_C128 ? "C128" : "C64",
 	        m_Signals.video == VIDEO_PAL ? "PAL" : "NTSC" );
 

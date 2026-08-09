@@ -1,7 +1,7 @@
 .include "common.inc"
 
 start:
-    print_string title_msg
+    #print_string title_msg
     sei
     lda $0314
     sta old_irq
@@ -92,7 +92,7 @@ show_hex:
     pha
     lda #19
     jsr $ffd2
-    print_string label
+    #print_string label
     pla
     pha
     lsr
@@ -104,9 +104,9 @@ show_hex:
     and #$0f
 nibble:
     cmp #10
-    bcc :+
+    bcc nibble_digit
     adc #6
-:
+nibble_digit:
     adc #'0'
     jmp $ffd2
 
@@ -120,5 +120,8 @@ last_count:.byte 0
 irq_phase: .byte 0
 colors:    .byte 2,6
 raster_lines: .byte 60,200
-title_msg: .byte 147,"RASTER IRQ TEST - PRESS A KEY TO EXIT",13,0
-label:     .byte "RASTER IRQ COUNT $",0
+title_msg: .byte 147
+           .text "RASTER IRQ TEST - PRESS A KEY TO EXIT"
+           .byte 13,0
+label:     .text "RASTER IRQ COUNT $"
+           .byte 0

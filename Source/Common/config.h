@@ -29,7 +29,7 @@
 #define _config_h
 
 
-#define TIMING_NAMES 38
+#define TIMING_NAMES 37
 const char timingNames[TIMING_NAMES][32] = {
 	"WAIT_FOR_SIGNALS", 
 	"WAIT_CYCLE_READ", 
@@ -114,10 +114,7 @@ const char timingNames[TIMING_NAMES][32] = {
 	"C128_MODE",
 	// Diagnostic: stop every physical expansion-bus read and write after N
 	// seconds while leaving the emulated CPU alive. 0 disables it.
-	"BUS_HALT_AFTER_S",
-	// The FPGA C64U was validated with RAD's original reset/KERNAL-settle/
-	// badline takeover. Keep the C128-safe Ultimax takeover as the default.
-	"C64U_LEGACY_TAKEOVER"
+	"BUS_HALT_AFTER_S"
 };
 
 // Which CPU core boot.cpp should install. Set from CPU_CORE in the config file;
@@ -170,13 +167,12 @@ extern int cfgNMIRetime;
 // Interrupt vector reroute; see VECTOR_REROUTE in the names table.
 extern int cfgVectorReroute;
 
-// C64-bus access cost; see IO_STRETCH in the names table. Default on.
+// C64-bus access cost; see IO_STRETCH in the names table. Default off on RAD.
 extern int cfgIOStretch;
 extern int cfgNMINativeDefer;
 extern int cfgMirrorStretch;
 extern int cfgC128Mode;
 extern int cfgBusHaltAfterS;
-extern int cfgC64ULegacyTakeover;
 
 #define SCPU_CFG_MIRROR_DISPLAY_DEFAULT 1024
 

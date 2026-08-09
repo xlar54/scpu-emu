@@ -7,7 +7,7 @@ SYS_RAM      = $d200
 USER_RAM     = $d300
 
 start:
-    print_string title_msg
+    #print_string title_msg
     lda SCPU_DETECT
     bpl scpu_present
     jmp no_scpu
@@ -100,13 +100,13 @@ user_restore:
 
     plp
 
-    print_string gate_msg
+    #print_string gate_msg
     lda gate_fail
     jsr print_result
-    print_string sys_msg
+    #print_string sys_msg
     lda sys_fail
     jsr print_result
-    print_string user_msg
+    #print_string user_msg
     lda user_fail
     jsr print_result
 
@@ -114,23 +114,23 @@ user_restore:
     ora sys_fail
     ora user_fail
     bne overall_fail
-    print_string all_pass_msg
+    #print_string all_pass_msg
     rts
 
 overall_fail:
-    print_string failed_msg
+    #print_string failed_msg
     rts
 
 no_scpu:
-    print_string no_scpu_msg
+    #print_string no_scpu_msg
     rts
 
 print_result:
     beq result_pass
-    print_string fail_msg
+    #print_string fail_msg
     rts
 result_pass:
-    print_string pass_msg
+    #print_string pass_msg
     rts
 
 old_byte:  .byte 0
@@ -139,12 +139,24 @@ gate_fail: .byte 0
 sys_fail:  .byte 0
 user_fail: .byte 0
 
-title_msg:    .byte 147,"SCPU PRIVATE RAM",13,0
-gate_msg:     .byte "$D300 CLOSED-WRITE GATE: ",0
-sys_msg:      .byte "$D200 SYSTEM PAGE:       ",0
-user_msg:     .byte "$D300 USER PAGE:         ",0
-pass_msg:     .byte "PASS",13,0
-fail_msg:     .byte "FAIL",13,0
-all_pass_msg: .byte 13,"ALL PRIVATE RAM TESTS PASS",13,0
-failed_msg:   .byte 13,"PRIVATE RAM TEST FAILED",13,0
-no_scpu_msg:  .byte "NO SUPERCPU DETECTED",13,0
+title_msg:    .byte 147
+              .text "SCPU PRIVATE RAM"
+              .byte 13,0
+gate_msg:     .text "$D300 CLOSED-WRITE GATE: "
+              .byte 0
+sys_msg:      .text "$D200 SYSTEM PAGE:       "
+              .byte 0
+user_msg:     .text "$D300 USER PAGE:         "
+              .byte 0
+pass_msg:     .text "PASS"
+              .byte 13,0
+fail_msg:     .text "FAIL"
+              .byte 13,0
+all_pass_msg: .byte 13
+              .text "ALL PRIVATE RAM TESTS PASS"
+              .byte 13,0
+failed_msg:   .byte 13
+              .text "PRIVATE RAM TEST FAILED"
+              .byte 13,0
+no_scpu_msg:  .text "NO SUPERCPU DETECTED"
+              .byte 13,0

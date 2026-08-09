@@ -90,12 +90,11 @@ int cfgMirrorD000Relocate = 1;
 int cfgHeartbeat = 0;
 int cfgNMIRetime = 1;
 int cfgVectorReroute = 1;
-int cfgIOStretch = 1;
+int cfgIOStretch = 0;
 int cfgNMINativeDefer = 1;
 int cfgMirrorStretch = 0;
 int cfgC128Mode = 0;
 int cfgBusHaltAfterS = 0;
-int cfgC64ULegacyTakeover = 0;
 
 char cfg[ 65536 ];
 
@@ -118,12 +117,11 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	cfgHeartbeat = 0;
 	cfgNMIRetime = 1;
 	cfgVectorReroute = 1;
-	cfgIOStretch = 1;
+	cfgIOStretch = 0;
 	cfgNMINativeDefer = 1;
 	cfgMirrorStretch = 0;
 	cfgC128Mode = 0;
 	cfgBusHaltAfterS = 0;
-	cfgC64ULegacyTakeover = 0;
 
 	// Leave a byte spare so cfg is always NUL-terminated for the line scanner.
 	if ( !readFile( logger, DRIVE, FILENAME, (u8*)cfg, &cfgBytes, sizeof( cfg ) - 1 ) )
@@ -145,7 +143,6 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	bool mirrorStretchSeen = false;
 	bool c128ModeSeen = false;
 	bool busHaltSeen = false;
-	bool c64uLegacySeen = false;
 
 	while ( *cfgPos != 0 )
 	{
@@ -179,7 +176,6 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 						if ( i == 34 ) mirrorStretchSeen = true;
 						if ( i == 35 ) c128ModeSeen = true;
 						if ( i == 36 ) busHaltSeen = true;
-						if ( i == 37 ) c64uLegacySeen = true;
 						while ( *ptr == '\t' || *ptr == ' ' ) ptr++;
 					#ifdef DEBUG_OUT
 						logger->Write( "RaspiMenu", LogNotice, "  %s >%d< (%s)", timingNames[ i ], timingValues[ i ], ptr );
@@ -257,8 +253,9 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	if ( rerouteSeen )
 		cfgVectorReroute = ( timingValues[ 31 ] != 0 ) ? 1 : 0;
 
-	// A flag, default on: IO_STRETCH 0 charges bus accesses nothing, as
-	// before the access-cost model existed.
+	// A flag, default off on RAD: the physical access already consumes its bus
+	// time in wall-clock cycles, so charging the full delay again double-bills
+	// I/O-heavy software. IO_STRETCH 1 remains available for model comparison.
 	if ( ioStretchSeen )
 		cfgIOStretch = ( timingValues[ 32 ] != 0 ) ? 1 : 0;
 
@@ -276,9 +273,6 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 
 	if ( busHaltSeen && timingValues[ 36 ] > 0 )
 		cfgBusHaltAfterS = timingValues[ 36 ];
-
-	if ( c64uLegacySeen )
-		cfgC64ULegacyTakeover = timingValues[ 37 ] != 0 ? 1 : 0;
 
 	return 1;
 }

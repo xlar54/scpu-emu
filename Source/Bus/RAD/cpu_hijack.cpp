@@ -97,10 +97,8 @@ static const u8 takeoverROMPrefix[] = {
 	0xA9, 0x2F, 0x85, 0x00        // LDA #$2F / STA $00
 };
 
-bool radHijackCPUWithUltimax()
+void radPrepareUltimaxTakeover()
 {
-	register u32 g2, g3;
-
 	// Materialise the exact 256-byte image generated from upstream RAD's
 	// C64Side/ultimax_memcfg.a.  Keeping a complete table also keeps the timed
 	// response loop identical to startWithUltimax(): one indexed byte load.
@@ -116,6 +114,11 @@ bool radHijackCPUWithUltimax()
 	CACHE_PRELOAD_DATA_CACHE( &takeoverROM[ 0 ], 256, CACHE_PRELOADL2KEEP )
 	FORCE_READ_LINEARa( (void *)radHijackCPUWithUltimax, 4096, 65536 );
 	FORCE_READ_LINEAR32a( &takeoverROM, 256, 256 * 32 );
+}
+
+bool radHijackCPUWithUltimax()
+{
+	register u32 g2, g3;
 
 	for ( u32 attempt = 0; attempt < 8; attempt++ )
 	{

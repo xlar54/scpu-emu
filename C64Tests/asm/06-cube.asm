@@ -6,7 +6,7 @@ FRAME_COUNT  = 16
 BITMAP_PTR   = $fb
 
 start:
-    print_string intro_msg
+    #print_string intro_msg
     lda $d0bc
     bpl scpu_present
     jmp no_scpu
@@ -35,17 +35,17 @@ superram_present:
     and #$c0
     sta old_optimization
 
-    print_string cache_msg
+    #print_string cache_msg
     sei
     clc
     xce
     rep #$30
-    .a16
-    .i16
+    .al
+    .xl
     jsr render_all_frames
     sep #$30
-    .a8
-    .i8
+    .as
+    .xs
     sec
     xce
 
@@ -99,12 +99,12 @@ play_frame:
     clc
     xce
     rep #$30
-    .a16
-    .i16
+    .al
+    .xl
     jsr copy_cached_frame
     sep #$30
-    .a8
-    .i8
+    .as
+    .xs
     sec
     xce
     cli
@@ -150,10 +150,10 @@ exit_demo:
     rts
 
 no_scpu:
-    print_string no_scpu_msg
+    #print_string no_scpu_msg
     rts
 no_superram:
-    print_string no_superram_msg
+    #print_string no_superram_msg
     rts
 
 ; Verify that two full 64 KB SuperRAM banks are present before caching.
@@ -162,9 +162,9 @@ probe_superram:
     clc
     xce
     rep #$10
-    .i16
+    .xl
     sep #$20
-    .a8
+    .as
     lda $021234
     sta probe_saved
     eor #$a5
@@ -197,7 +197,7 @@ probe_failed_done:
     stz cache_ok
 probe_done:
     sep #$30
-    .i8
+    .xs
     sec
     xce
     cli
@@ -208,8 +208,8 @@ probe_done:
 ; completed 8 KB bitmap in banks $02/$03 (eight frames per bank).
 ; -------------------------------------------------------------------------
 
-.a16
-.i16
+.al
+.xl
 render_all_frames:
     stz frame_no
 render_frame_loop:
@@ -250,17 +250,17 @@ edge_loop:
     stz y1
     ldx edge_pos
     sep #$20
-    .a8
+    .as
     lda edges,x
     rep #$20
-    .a16
+    .al
     and #$00ff
     asl
     clc
     adc coord_base
     tax
     sep #$20
-    .a8
+    .as
     lda $0000,x
     sta x0
     lda $0001,x
@@ -269,20 +269,20 @@ edge_loop:
     ldx edge_pos
     lda edges+1,x
     rep #$20
-    .a16
+    .al
     and #$00ff
     asl
     clc
     adc coord_base
     tax
     sep #$20
-    .a8
+    .as
     lda $0000,x
     sta x1
     lda $0001,x
     sta y1
     rep #$20
-    .a16
+    .al
     jsr draw_line
     inc edge_pos
     inc edge_pos
@@ -298,7 +298,7 @@ draw_line:
     sbc x0
     bpl dx_positive
     eor #$ffff
-    inc
+    inc a
     sta dx
     lda #$ffff
     sta sx
@@ -318,7 +318,7 @@ dx_done:
     bra dy_done
 dy_positive:
     eor #$ffff
-    inc
+    inc a
     sta dy
     lda #1
     sta sy
@@ -344,9 +344,9 @@ line_continue:
     lda error2
     sec
     sbc dy
-    bvc :+
+    bvc signed_x_ready
     eor #$8000
-:
+signed_x_ready:
     bmi skip_x_step
     lda line_error
     clc
@@ -361,9 +361,9 @@ skip_x_step:
     lda dx
     sec
     sbc error2
-    bvc :+
+    bvc signed_y_ready
     eor #$8000
-:
+signed_y_ready:
     bmi skip_y_step
     lda line_error
     clc
@@ -411,12 +411,12 @@ plot_pixel:
     and #7
     tax
     sep #$20
-    .a8
+    .as
     lda bit_masks,x
     ora (BITMAP_PTR)
     sta (BITMAP_PTR)
     rep #$20
-    .a16
+    .al
     rts
 
 cache_bitmap:
@@ -473,8 +473,8 @@ copy_bank2:
     rts
 
 ; Called only in emulation mode with IRQs masked.
-.a8
-.i8
+.as
+.xs
 restore_optimization:
     lda #0
     sta $d07e
@@ -549,7 +549,12 @@ frame_vertices:
     .byte 160,54,190,85,203,121,160,87,130,85,160,105,160,140,117,121
     .byte 143,55,194,71,202,123,138,118,133,85,170,92,171,130,128,127
 
-intro_msg:       .byte 147,"3D HIRES CUBE - ML/SUPERRAM",13,0
-cache_msg:       .byte "CACHING 16 FRAMES...",13,0
-no_scpu_msg:     .byte "NO SUPERCPU DETECTED",13,0
-no_superram_msg: .byte "REQUIRES SUPERRAM BANKS $02-$03",13,0
+intro_msg:       .byte 147
+                 .text "3D HIRES CUBE - ML/SUPERRAM"
+                 .byte 13,0
+cache_msg:       .text "CACHING 16 FRAMES..."
+                 .byte 13,0
+no_scpu_msg:     .text "NO SUPERCPU DETECTED"
+                 .byte 13,0
+no_superram_msg: .text "REQUIRES SUPERRAM BANKS $02-$03"
+                 .byte 13,0

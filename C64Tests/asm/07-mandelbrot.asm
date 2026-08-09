@@ -6,16 +6,16 @@ BITMAP_PTR  = $fb
 MAX_ITER    = 40
 
 start:
-    print_string title_msg
+    #print_string title_msg
     lda $d0bc
     bpl scpu_present
-    print_string no_scpu_msg
+    #print_string no_scpu_msg
     rts
 scpu_present:
     lda $d0b8
     and #$80
     sta old_soft_speed
-    print_string mode_msg
+    #print_string mode_msg
 choose_mode:
     jsr $ffe4
     cmp #' '
@@ -50,12 +50,12 @@ mode_selected:
     clc
     xce
     rep #$30
-    .a16
-    .i16
+    .al
+    .xl
     jsr render_mandelbrot
     sep #$30
-    .a8
-    .i8
+    .as
+    .xs
     sec
     xce
 
@@ -181,8 +181,8 @@ restore_turbo:
 ; bands while points still inside after MAX_ITER iterations are solid white.
 ; -------------------------------------------------------------------------
 
-.a16
-.i16
+.al
+.xl
 render_mandelbrot:
     phb
     phk
@@ -254,16 +254,16 @@ escaped:
 sample_done:
     ; Scan Space directly on every sample, independent of KERNAL IRQ service.
     sep #$20
-    .a8
+    .as
     lda $dc01
     and #$10
     bne space_not_pressed
     rep #$20
-    .a16
+    .al
     jmp render_abort
 space_not_pressed:
     rep #$20
-    .a16
+    .al
 
     inc column_no
     lda column_no
@@ -307,12 +307,12 @@ store_row_fraction:
 render_finished:
 wait_for_space:
     sep #$20
-    .a8
+    .as
     lda $dc01
     and #$10
     bne wait_for_space
     rep #$20
-    .a16
+    .al
     bra render_abort
 render_abort:
     pld
@@ -344,20 +344,20 @@ square_build_loop:
     and #$00ff
     sta square_value
     sep #$20
-    .a8
+    .as
     lda square_raw_high
     sta square_value+1
     rep #$20
-    .a16
+    .al
     lda square_value
     sta square_table,x
     lda square_raw_low
     clc
     adc square_delta
     sta square_raw_low
-    bcc :+
+    bcc square_no_carry
     inc square_raw_high
-:
+square_no_carry:
     lda square_delta
     clc
     adc #2
@@ -372,7 +372,7 @@ square_build_loop:
 square_q8:
     bpl square_positive
     eor #$ffff
-    inc
+    inc a
 square_positive:
     cmp #$0400
     bcc square_lookup
@@ -433,16 +433,16 @@ plot_pixel:
     and #7
     tax
     sep #$20
-    .a8
+    .as
     lda bit_masks,x
     ora (BITMAP_PTR)
     sta (BITMAP_PTR)
     rep #$20
-    .a16
+    .al
     rts
 
-.a8
-.i8
+.as
+.xs
 old_soft_speed:   .byte 0
 old_dd00:         .byte 0
 old_d011:         .byte 0
@@ -480,13 +480,21 @@ square_value:    .word 0
 
 bit_masks: .byte $80,$40,$20,$10,$08,$04,$02,$01
 
-title_msg:   .byte 147,"65816 MANDELBROT",13,0
-mode_msg:    .byte "PRESS 1 FOR 1 MHZ",13
-             .byte "PRESS 2 FOR 20 MHZ",13
-             .byte "SPACE RETURNS TO BASIC",13,0
-no_scpu_msg: .byte "NO SUPERCPU DETECTED",13,0
+title_msg:   .byte 147
+             .text "65816 MANDELBROT"
+             .byte 13,0
+mode_msg:    .text "PRESS 1 FOR 1 MHZ"
+             .byte 13
+             .text "PRESS 2 FOR 20 MHZ"
+             .byte 13
+             .text "SPACE RETURNS TO BASIC"
+             .byte 13,0
+no_scpu_msg: .text "NO SUPERCPU DETECTED"
+             .byte 13,0
 
 ; 1025 words, generated before rendering.
-square_table: .res 2050,0
+square_table: .fill 2050,0
 
-.assert * < BITMAP, lderror, "07-MANDELBROT overlaps the $2000 bitmap"
+.if * >= BITMAP
+    .error "07-MANDELBROT overlaps the $2000 bitmap"
+.endif

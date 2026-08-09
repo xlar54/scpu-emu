@@ -41,10 +41,6 @@ public:
 	// from the outside: a C64 that just sits there. Only phase boundaries are
 	// logged, never anything inside a timed loop.
 	void setLogger( CLogger *logger ) { m_Logger = logger; }
-	// FPGA C64U compatibility: use RAD's original reset, three-second KERNAL
-	// settle and badline takeover instead of the C128-safe Ultimax sequence.
-	void setC64ULegacyTakeover( bool enabled )
-		{ m_C64ULegacyTakeover = enabled; }
 
 	// --- IC64Bus ----------------------------------------------------------
 	bool acquire() override;
@@ -190,7 +186,6 @@ private:
 
 	C64Signals m_Signals;
 	bool       m_Acquired;
-	bool       m_C64ULegacyTakeover;
 	bool       m_TrafficHalted;
 	u8         m_SelfTestFailure; // bit 0: single R/W, bit 1: burst, bit 2: first-transfer series
 	u16        m_ReadTimingConfigured, m_ReadTimingStart, m_ReadTimingEnd,

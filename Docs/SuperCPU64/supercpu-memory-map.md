@@ -50,20 +50,28 @@ The 65816 addresses 16MB as 256 banks of 64KB.
 
 | Range | Contents | Confidence |
 |---|---|---|
-| `$000000-$00FFFF` | Bank 0 — the C64-visible 64KB, shadowed in fast RAM | **confirmed** |
-| `$010000-$01FFFF` | Bank 1 — SuperCPU internal | **confirmed** |
-| `$020000-$F5FFFF` | SuperRAM (SIMM) | **inferred** |
-| `$F60000-$F7FFFF` | user-accessible SIMM banks below system ROM | **inferred** |
+| `$000000-$00FFFF` | Bank 0 — active computer RAM image; C64-visible and shadowed | **documented** |
+| `$010000-$01FFFF` | Bank 1 — writable PseudoROM/RAM image | **documented** |
+| `$020000-$F5FFFF` | User SuperRAM (SIMM) | **documented** |
+| `$F60000-$F7FFFF` | System RAM: physical SIMM banks 0 and 1, relocated and reserved | **documented** |
 | `$F80000-$FFFFFF` | SuperCPU ROM | **inferred** |
 
-The V2 manual states expansion RAM maps to banks `$02-$F5` with user-accessible
-SIMM banks `$F6-$F7` "reserved below system ROM". The wording is garbled in the
-OCR'd scan and the exact top-of-map layout should be confirmed against VICE's
-implementation before `Source/SuperCPU/memory_map.cpp` is finalised.
+The [CMD SuperRAM manual](../SuperRam.md) documents the expansion layout. The
+SIMM starts physically at offset zero, but the SuperCPU's SRAM occupies logical
+banks `$00-$01`. The corresponding first 128 KB of the SIMM is therefore
+relocated to logical banks `$F6-$F7` and reserved for future system use. Bank
+`$F5` is the highest user bank on a 16 MB installation.
+
+| Installed SIMM | User expansion banks |
+|---:|---:|
+| 1 MB | `$02-$0F` |
+| 4 MB | `$02-$3F` |
+| 8 MB | `$02-$7F` |
+| 16 MB | `$02-$F5` |
 
 ### Detecting and using SuperRAM
 
-From the V2 manual:
+From the CMD SuperRAM manual:
 
 - Check the ROM version at `$00E487` (64 mode) or `$00F6DD` (128 mode) for
   "1.40" or higher.
@@ -131,4 +139,5 @@ genuine SuperCPU too:
 
 ## Sources
 
-See [supercpu-registers.md](supercpu-registers.md).
+- [CMD SuperRAM Installation Guide and User's Reference](../SuperRam.md)
+- [SuperCPU register map](supercpu-registers.md)

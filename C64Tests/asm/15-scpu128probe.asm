@@ -1,12 +1,12 @@
-.setcpu "65816"
-.segment "CODE"
-
 ; C128 BASIC 7 loader at $1c01: 10 SYS7181 ($1c0d).
-.word $1c01
+; 64tass adds the two-byte PRG load address with --cbm-prg.
+* = $1c01
+
 .word basic_end
 .word 10
 .byte $9e
-.byte "7181", 0
+.text "7181"
+.byte 0
 basic_end:
 .word 0
 
@@ -72,9 +72,9 @@ file_failed:
     ldx #0
 file_failed_loop:
     lda file_error_msg,x
-    bne :+
+    bne file_error_char
     jmp output_report
-:
+file_error_char:
     phx
     jsr CHROUT
     plx
@@ -173,15 +173,18 @@ done:
 write_report:
     ldx #0
     jsr put_string
-    .byte "SCPU128 PROBE V1",13,0
+    .text "SCPU128 PROBE V1"
+    .byte 13,0
 
     ldx #0
     jsr put_string
-    .byte "READ-ONLY SNAPSHOT; PROGRAM-START STATE",13,13,0
+    .text "READ-ONLY SNAPSHOT; PROGRAM-START STATE"
+    .byte 13,13,0
 
     ldx #0
     jsr put_string
-    .byte "CPU PORT 00/01: ",0
+    .text "CPU PORT 00/01: "
+    .byte 0
     lda port_regs
     jsr put_hex
     lda #' '
@@ -192,7 +195,8 @@ write_report:
 
     ldx #0
     jsr put_string
-    .byte "VIC D02F/D030: ",0
+    .text "VIC D02F/D030: "
+    .byte 0
     lda d02f_value
     jsr put_hex
     lda #' '
@@ -204,7 +208,8 @@ write_report:
 
     ldx #0
     jsr put_string
-    .byte "SCPU D0B0-D0BF CLOSED",13,0
+    .text "SCPU D0B0-D0BF CLOSED"
+    .byte 13,0
     lda #<scpu_closed
     sta ptr
     lda #>scpu_closed
@@ -216,7 +221,8 @@ write_report:
 
     ldx #0
     jsr put_string
-    .byte "SCPU D0B0-D0BF OPEN",13,0
+    .text "SCPU D0B0-D0BF OPEN"
+    .byte 13,0
     lda #<scpu_open
     sta ptr
     lda #>scpu_open
@@ -228,7 +234,8 @@ write_report:
 
     ldx #0
     jsr put_string
-    .byte "MMU D500-D50B",13,0
+    .text "MMU D500-D50B"
+    .byte 13,0
     lda #<mmu_d5
     sta ptr
     lda #>mmu_d5
@@ -240,7 +247,8 @@ write_report:
 
     ldx #0
     jsr put_string
-    .byte "MMU FF00-FF04",13,0
+    .text "MMU FF00-FF04"
+    .byte 13,0
     lda #<mmu_ff
     sta ptr
     lda #>mmu_ff
@@ -252,10 +260,12 @@ write_report:
 
     ldx #0
     jsr put_string
-    .byte "VISIBLE WINDOW CRC16-CCITT",13,0
+    .text "VISIBLE WINDOW CRC16-CCITT"
+    .byte 13,0
     ldx #0
     jsr put_string
-    .byte "A000-BFFF: ",0
+    .text "A000-BFFF: "
+    .byte 0
     lda window_crc
     jsr put_hex
     lda window_crc+1
@@ -263,7 +273,8 @@ write_report:
     jsr put_cr
     ldx #0
     jsr put_string
-    .byte "C000-CFFF: ",0
+    .text "C000-CFFF: "
+    .byte 0
     lda window_crc+2
     jsr put_hex
     lda window_crc+3
@@ -271,7 +282,8 @@ write_report:
     jsr put_cr
     ldx #0
     jsr put_string
-    .byte "E000-FFFF: ",0
+    .text "E000-FFFF: "
+    .byte 0
     lda window_crc+4
     jsr put_hex
     lda window_crc+5
@@ -281,7 +293,8 @@ write_report:
 
     ldx #0
     jsr put_string
-    .byte "256-BYTE LONG-ADDRESS CRC16",13,0
+    .text "256-BYTE LONG-ADDRESS CRC16"
+    .byte 13,0
     lda #$00
     ldx #0
     jsr report_saved_long_set
@@ -292,9 +305,12 @@ write_report:
 
     ldx #0
     jsr put_string
-    .byte "NOTES: RUN AFTER COLD BOOT IN EACH MODE.",13
-    .byte "RECORD 40/80 COLUMN, PAL/NTSC, SWITCH",13
-    .byte "POSITION, ROM REVISION, AND SIMM SIZE.",13,0
+    .text "NOTES: RUN AFTER COLD BOOT IN EACH MODE."
+    .byte 13
+    .text "RECORD 40/80 COLUMN, PAL/NTSC, SWITCH"
+    .byte 13
+    .text "POSITION, ROM REVISION, AND SIMM SIZE."
+    .byte 13,0
     rts
 
 collect_checksums:
@@ -535,14 +551,24 @@ string_done:
     rts
 
 report_name:
-    .byte "@0:SCPU128 LOG,S,W"
+    .text "@0:SCPU128 LOG,S,W"
 report_name_end:
 
 long_pages: .byte $00,$04,$1c,$a0,$c0,$e0
-screen_title: .byte "SCPU128 READ-ONLY PROBE",13,"WRITING SCPU128 LOG TO DEVICE 8...",13,0
-file_error_msg: .byte "DEVICE 8 LOG OPEN FAILED",13,"REPORT WILL BE PRINTED TO SCREEN",13,13,0
-done_msg: .byte 13,"PROBE COMPLETE - SCPU128 LOG SAVED",13,0
-screen_only_msg: .byte 13,"PROBE COMPLETE - SCREEN OUTPUT ONLY",13,0
+screen_title: .text "SCPU128 READ-ONLY PROBE"
+              .byte 13
+              .text "WRITING SCPU128 LOG TO DEVICE 8..."
+              .byte 13,0
+file_error_msg: .text "DEVICE 8 LOG OPEN FAILED"
+                .byte 13
+                .text "REPORT WILL BE PRINTED TO SCREEN"
+                .byte 13,13,0
+done_msg: .byte 13
+          .text "PROBE COMPLETE - SCPU128 LOG SAVED"
+          .byte 13,0
+screen_only_msg: .byte 13
+                 .text "PROBE COMPLETE - SCREEN OUTPUT ONLY"
+                 .byte 13,0
 
 file_open:   .byte 0
 buffer_count:.byte 0
@@ -557,12 +583,12 @@ collect_result:.byte 0
 report_bank:.byte 0
 report_page_index:.byte 0
 report_crc_index:.byte 0
-port_regs:   .res 2
+port_regs:   .fill 2,0
 d02f_value:  .byte 0
 d030_value:  .byte 0
-scpu_closed: .res 16
-scpu_open:   .res 16
-mmu_d5:      .res 12
-mmu_ff:      .res 5
-window_crc:  .res 6
-long_crc:    .res 24
+scpu_closed: .fill 16,0
+scpu_open:   .fill 16,0
+mmu_d5:      .fill 12,0
+mmu_ff:      .fill 5,0
+window_crc:  .fill 6,0
+long_crc:    .fill 24,0

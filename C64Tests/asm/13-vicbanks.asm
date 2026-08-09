@@ -31,9 +31,9 @@ bank_loop:
     asl
     clc
     adc #$04
-    sta z:screen_hi
+    sta screen_hi
     lda #0
-    sta z:screen_lo
+    sta screen_lo
     ldy #0
 fill_page:
     lda bank_no
@@ -45,8 +45,8 @@ fill_page:
     sta (screen_lo),y
     iny
     bne fill_page
-    inc z:screen_hi
-    lda z:screen_hi
+    inc screen_hi
+    lda screen_hi
     and #3
     bne fill_page
     ; Install one solid glyph in RAM at character-set offset $2000. Unlike VIC
@@ -57,7 +57,7 @@ fill_page:
     asl
     asl
     asl
-    sta z:screen_lo
+    sta screen_lo
     lda bank_no
     asl
     asl
@@ -67,7 +67,7 @@ fill_page:
     asl
     clc
     adc #$20
-    sta z:screen_hi
+    sta screen_hi
     ldy #7
     lda #$ff
 glyph_loop:
@@ -76,9 +76,9 @@ glyph_loop:
     bpl glyph_loop
     ; Give each bank a distinct foreground colour.
     lda #0
-    sta z:screen_lo
+    sta screen_lo
     lda #$d8
-    sta z:screen_hi
+    sta screen_hi
     lda bank_no
     clc
     adc #2
@@ -89,7 +89,7 @@ color_byte:
     sta (screen_lo),y
     iny
     bne color_byte
-    inc z:screen_hi
+    inc screen_hi
     dex
     bne color_page
     lda #$18
