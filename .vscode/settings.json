@@ -1,0 +1,18 @@
+{
+  // _radclone and _radmain are upstream reference clones (frntc/RAD-Doom and
+  // frntc/RAD). They are gitignored by this repository, but each carries its
+  // own .git, so VS Code's Source Control panel lists them as separate
+  // repositories and offers to commit to them. Nothing here should ever be
+  // committed upstream from this workspace.
+  //
+  // This setting REPLACES the default rather than extending it, so
+  // node_modules has to be repeated.
+  //
+  // _toolchain and _vice are fetched too but have no .git, so they never
+  // appeared and do not need listing.
+  "git.repositoryScanIgnoredFolders": [
+    "node_modules",
+    "_radclone",
+    "_radmain"
+  ]
+}

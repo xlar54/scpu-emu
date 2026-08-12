@@ -20,6 +20,9 @@ Makefile text eol=lf
 .gitattributes text eol=lf
 .gitignore     text eol=lf
 
+# Editor/tooling config, read cross-platform. LF, like the sources.
+*.json text eol=lf
+
 # The SD card config is read by our own parser, which handles either, and by
 # the Raspberry Pi firmware, which expects DOS-style. Keep CRLF.
 *.cfg text eol=crlf

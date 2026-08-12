@@ -67,8 +67,11 @@ kernel*.img
 .env.*
 !.env.example
 
-# Editor and IDE state
-.vscode/
+# Editor and IDE state. Shared VS Code settings are tracked so workspace fixes
+# follow the repository; personal state under .vscode/ is not.
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
 .idea/
 .vs/
 *.code-workspace
