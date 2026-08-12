@@ -1,0 +1,40 @@
+{
+  // IntelliSense for a bare-metal AArch64 cross-build. Without this VS Code
+  // falls back to the host compiler, cannot find <circle/...>, and reports
+  // hundreds of phantom errors in files that compile cleanly -- rad_bus.cpp
+  // worst of all, because it includes the most Circle headers.
+  //
+  // Nothing here affects the build. `make firmware` is the authority; these
+  // values mirror _toolchain/circle/Config.mk and Rules.mk so the editor sees
+  // what the compiler sees.
+  //
+  // Paths are ${workspaceFolder}-relative so this file is portable. It depends
+  // on `make firmware` having populated _toolchain/ at least once.
+  "version": 4,
+  "configurations": [
+    {
+      "name": "SCPU-EMU firmware (AArch64 bare metal)",
+      "compilerPath": "${workspaceFolder}/_toolchain/gcc-aarch64/bin/aarch64-none-elf-g++.exe",
+      "compilerArgs": ["-march=armv8-a", "-mtune=cortex-a53"],
+      "intelliSenseMode": "gcc-arm64",
+      "cStandard": "gnu99",
+      "cppStandard": "c++14",
+      "includePath": [
+        "${workspaceFolder}/Source/**",
+        "${workspaceFolder}/_toolchain/circle/include",
+        "${workspaceFolder}/_toolchain/circle/addon",
+        "${workspaceFolder}/_toolchain/circle/addon/fatfs",
+        "${workspaceFolder}/_toolchain/circle/addon/SDCard",
+        "${workspaceFolder}/_toolchain/circle/addon/linux"
+      ],
+      "defines": [
+        "AARCH=64",
+        "__aarch64__",
+        "RASPPI=3",
+        "STDLIB_SUPPORT=1",
+        "NDEBUG",
+        "__VCCOREVER__=0"
+      ]
+    }
+  ]
+}
