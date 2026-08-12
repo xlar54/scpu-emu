@@ -121,3 +121,7 @@ Source/kernel8.img
 /C64Tests/WINTER GAMES.D64
 /C64Tests/*.vsf
 /C64Tests/wg_*.prg
+
+# Test disk images are commercial software. Supply your own copies locally;
+# same rule as /ROMs -- see ROMs/README.md.
+/C64Tests/diskimages/
