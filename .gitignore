@@ -124,7 +124,14 @@ Source/kernel8.img
 
 # Test disk images are commercial software. Supply your own copies locally;
 # same rule as /ROMs -- see ROMs/README.md.
-/C64Tests/diskimages/
+#
+# Excluding the contents rather than the directory itself: git cannot re-include
+# a file whose parent directory is excluded, and the line below needs to work.
+/C64Tests/diskimages/*
+
+# Ours, not commercial -- the test disk built from C64Tests/asm by build.bat.
+# Tracked so a fresh clone can run the suite without assembling it first.
+!/C64Tests/diskimages/SCPU-TESTS.d81
 
 # Profiling dumps. Regenerate them rather than tracking them; the histogram
 # that justified the bank-0 inlining is preserved in commit 15cd5b7.
