@@ -168,11 +168,26 @@ In TURBO it does not accelerate anything by itself — software still has to ask
 Detection is independent of speed: "simply having the thing turned on is all
 that's required".
 
-### Not yet modelled
+### The KERNAL window moves when the registers open
 
-Enabling the hardware registers is documented to also change the KERNAL ROM
-memory map at `$E000-$FFFF`, which is why software is told not to leave them
-enabled longer than necessary. SCPU-EMU does not do this.
+Enabling the hardware registers also moves where the bank-1 KERNAL image is
+served from, which is why software is told not to leave them enabled longer than
+necessary.
+
+An earlier version of this section said "SCPU-EMU does not do this". That was
+wrong — `applyKernalShadow()` sets `m_KernalShadowBase` to `$6000` or `$E000` as
+the register bank opens and closes
+([registers.h:267](../../Source/SuperCPU/registers.h#L267)).
+
+The mechanism is worth stating precisely, because it is easy to describe
+backwards. **Bank-0 `$E000-$FFFF` always serves the KERNAL.** What the register
+bank changes is *which bank-1 image* is mirrored there: with the registers
+closed, bank 1 `$E000-$FFFF`; with them open, a different image held at bank 1
+`$6000-$7FFF`, which CMD's own table labels **ALT. KERNAL**. So `$D07E` changes
+the code running at the KERNAL entry points, not merely which addresses decode.
+
+See [programming-the-scpu.md](programming-the-scpu.md#9-two-different-things-both-called-mirroring)
+for the full bank-1 shadow table.
 
 ## Private RAM windows
 

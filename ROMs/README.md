@@ -38,9 +38,22 @@ everything still works.
 | `scpu-dos-1.4.bin` | **SuperCPU 64** | first 64KB populated, rest `$FF`. No C128 content. |
 | `scpu-dos-2.04.bin` | **SuperCPU 128** | all 128KB, and carries a C128 KERNAL and BASIC — the strings `(C)1986 COMMODORE ELECTRONICS, LTD.` and `(C)1977 MICROSOFT CORP.` are in there. |
 
-Staging 2.04 on a C64 gets you as far as the SuperCPU's own boot screen and then
-`SUPERCPU INITIALIZATION ERROR: 06`, because its boot code is checking for a
-machine that is not there.
+**Correction — an earlier version of this file was wrong here.** It said that
+staging 2.04 on a C64 gets you to the SuperCPU boot screen and then
+`SUPERCPU INITIALIZATION ERROR: 06` "because its boot code is checking for a
+machine that is not there." Both halves are wrong:
+
+- **2.04 works.** That attribution was made during an early debugging round and
+  was retracted on 2026-08-04; the real causes were emulation bugs since fixed
+  (KERNAL shadow, `$D0B2` window moves). `make sdcard` stages 2.04, and that is
+  deliberate — do not "helpfully" revert it to 1.4.
+- **Error 06 is not a machine-detection failure.** On real hardware it is the
+  documented symptom of an **inadequate power supply** (CMD SuperCPU FAQ). The
+  accelerator already exceeds the nominal cartridge-port current specification
+  on its own. It has nothing to say about which DOS image is installed.
+
+Both corrections point the same way: if error 06 appears, suspect power on
+hardware and the emulation elsewhere — not the ROM version.
 
 1.4's boot chain, for reference: reset reads `$FFFC` under bootmap and gets
 `$FC90`, which is `JML $F800FC`, which is `JML $F80100`, which is the real

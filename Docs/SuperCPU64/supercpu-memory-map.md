@@ -141,3 +141,5 @@ genuine SuperCPU too:
 
 - [CMD SuperRAM Installation Guide and User's Reference](../SuperRam.md)
 - [SuperCPU register map](supercpu-registers.md)
+- [Software compatibility rules and conformance audit](software-compatibility.md)
+- [Programming the SuperCPU — 65816 reference and conformance audit](programming-the-scpu.md)
