@@ -15,6 +15,11 @@
 *.md   text eol=lf
 Makefile text eol=lf
 
+# Git's own metadata is consumed cross-platform by git itself. LF, like the
+# sources -- and declaring them stops these two files warning about themselves.
+.gitattributes text eol=lf
+.gitignore     text eol=lf
+
 # The SD card config is read by our own parser, which handles either, and by
 # the Raspberry Pi firmware, which expects DOS-style. Keep CRLF.
 *.cfg text eol=crlf
@@ -28,3 +33,7 @@ Makefile text eol=lf
 *.img  binary
 *.png  binary
 *.jpg  binary
+*.gif  binary
+*.pdf  binary
+*.d64  binary
+*.d81  binary
