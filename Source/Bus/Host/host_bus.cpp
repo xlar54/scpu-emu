@@ -101,6 +101,14 @@ void CHostBus::write( u16 addr, u8 value )
 	logAccess( HOSTOP_WRITE, addr, value );
 }
 
+bool CHostBus::verifyC64CIA2DDRA( u8 expected )
+{
+	// The host backend has no marginal expansion bus, but use the ordinary
+	// read path so tests retain exact access accounting and can override this
+	// hook to exercise a failed hardware verification.
+	return read( 0xDD02 ) == expected;
+}
+
 void CHostBus::writeBurst( const C64BusWrite *writes, u32 count )
 {
 	for ( u32 i = 0; i < count; i++ )

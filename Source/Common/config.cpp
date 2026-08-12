@@ -95,6 +95,10 @@ int cfgNMINativeDefer = 1;
 int cfgMirrorStretch = 0;
 int cfgC128Mode = 0;
 int cfgBusHaltAfterS = 0;
+int cfgBusAccessSentinel = 0;
+int cfgDisplayScrub = 0;
+int cfgDisplayScrubMask = 1;
+int cfgDisplayScrubPeriodS = 0;
 
 char cfg[ 65536 ];
 
@@ -122,6 +126,10 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	cfgMirrorStretch = 0;
 	cfgC128Mode = 0;
 	cfgBusHaltAfterS = 0;
+	cfgBusAccessSentinel = 0;
+	cfgDisplayScrub = 0;
+	cfgDisplayScrubMask = 1;
+	cfgDisplayScrubPeriodS = 0;
 
 	// Leave a byte spare so cfg is always NUL-terminated for the line scanner.
 	if ( !readFile( logger, DRIVE, FILENAME, (u8*)cfg, &cfgBytes, sizeof( cfg ) - 1 ) )
@@ -143,6 +151,10 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	bool mirrorStretchSeen = false;
 	bool c128ModeSeen = false;
 	bool busHaltSeen = false;
+	bool busAccessSentinelSeen = false;
+	bool displayScrubSeen = false;
+	bool displayScrubMaskSeen = false;
+	bool displayScrubPeriodSeen = false;
 
 	while ( *cfgPos != 0 )
 	{
@@ -176,6 +188,10 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 						if ( i == 34 ) mirrorStretchSeen = true;
 						if ( i == 35 ) c128ModeSeen = true;
 						if ( i == 36 ) busHaltSeen = true;
+						if ( i == 37 ) busAccessSentinelSeen = true;
+						if ( i == 38 ) displayScrubSeen = true;
+						if ( i == 39 ) displayScrubMaskSeen = true;
+						if ( i == 40 ) displayScrubPeriodSeen = true;
 						while ( *ptr == '\t' || *ptr == ' ' ) ptr++;
 					#ifdef DEBUG_OUT
 						logger->Write( "RaspiMenu", LogNotice, "  %s >%d< (%s)", timingNames[ i ], timingValues[ i ], ptr );
@@ -273,6 +289,20 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 
 	if ( busHaltSeen && timingValues[ 36 ] > 0 )
 		cfgBusHaltAfterS = timingValues[ 36 ];
+
+	if ( busAccessSentinelSeen )
+	{
+		cfgBusAccessSentinel = timingValues[ 37 ];
+		if ( cfgBusAccessSentinel < 0 || cfgBusAccessSentinel > 13 )
+			cfgBusAccessSentinel = 0;
+	}
+
+	if ( displayScrubSeen )
+		cfgDisplayScrub = timingValues[ 38 ] != 0 ? 1 : 0;
+	if ( displayScrubMaskSeen )
+		cfgDisplayScrubMask = timingValues[ 39 ] != 0 ? 1 : 0;
+	if ( displayScrubPeriodSeen && timingValues[ 40 ] > 0 )
+		cfgDisplayScrubPeriodS = timingValues[ 40 ];
 
 	return 1;
 }

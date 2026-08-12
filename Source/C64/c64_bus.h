@@ -64,6 +64,13 @@ public:
 	virtual u8   read( u16 addr ) = 0;
 	virtual void write( u16 addr, u8 value ) = 0;
 
+	// Verify the C64-personality CIA2 direction-register seed after the caller
+	// has written it. The RAD backend samples several points inside the
+	// calibrated read eye and discards bus-turnaround reads before accepting
+	// the value; a single expansion-bus read is not authoritative on every
+	// physical machine. This hook must not write any register itself.
+	virtual bool verifyC64CIA2DDRA( u8 expected ) = 0;
+
 	// --- burst writes ----------------------------------------------------
 	// Amortises the per-access setup by keeping the address latch and bus
 	// transceiver configured across the whole run. This is the path used to

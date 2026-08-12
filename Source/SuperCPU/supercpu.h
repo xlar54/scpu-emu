@@ -114,6 +114,19 @@ public:
 	// restores border-only mirroring. Sprite pointers of the active screen
 	// bypass this queue entirely -- see CC64Memory::writeFast.
 	void setMirrorDisplayBudget( u32 bytes ) { m_MirrorDisplayBudget = bytes; }
+	void setDisplayScrub( bool enabled, bool masked, u32 periodSeconds = 0 )
+	{
+		m_DisplayScrubEnabled = enabled;
+		m_DisplayScrubMasked = masked;
+		m_DisplayScrubPeriodSeconds = periodSeconds;
+		m_DisplayScrubPhaseOn = enabled && periodSeconds == 0;
+		m_DisplayScrubPhaseStart = 0;
+		m_DisplayScrubPhaseGeneration = 0;
+		m_DisplayScrubBitmapSeen = false;
+	}
+	bool displayScrubPhaseOn() const { return m_DisplayScrubPhaseOn; }
+	u32 displayScrubPhaseGeneration() const { return m_DisplayScrubPhaseGeneration; }
+	u32 displayScrubPeriodSeconds() const { return m_DisplayScrubPeriodSeconds; }
 
 	// Diagnostic kill switch: when set, runFrame stops ALL mirror bus traffic
 	// -- flushes and the resync sweep -- leaving real DRAM untouched so the
@@ -222,6 +235,13 @@ private:
 	SCPUC128Mode m_C128Mode;
 	u32      m_MirrorDisplayBudget;
 	bool     m_MirrorHalted = false;
+	bool     m_DisplayScrubEnabled = false;
+	bool     m_DisplayScrubMasked = true;
+	u32      m_DisplayScrubPeriodSeconds = 0;
+	bool     m_DisplayScrubPhaseOn = false;
+	u64      m_DisplayScrubPhaseStart = 0;
+	u32      m_DisplayScrubPhaseGeneration = 0;
+	bool     m_DisplayScrubBitmapSeen = false;
 	// runFrame() may advance the CPU to reach the physical VIC border before
 	// draining mirrors. Those cycles belong to the following frame; carrying
 	// them here prevents the border phase from becoming a variable turbo boost.
@@ -229,6 +249,7 @@ private:
 	u32      m_BenchArmPerEmuCycle = 0;
 
 	void benchmark65816();
+	void updateDisplayScrubPhase( bool bitmapActive );
 	FrameHook m_FrameHook;
 	void     *m_FrameHookCtx;
 };

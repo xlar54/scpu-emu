@@ -35,18 +35,41 @@ static u64 armCycleCounter;
 #include "rad_bus.h"
 #include "cpu_hijack.h"
 #include "c128_refresh.h"
+#include "../../SuperCPU/write_buffer.h"
 
 CRADBus::CRADBus()
 	: m_Reads( 0 ), m_Writes( 0 ), m_BurstWrites( 0 ), m_Acquired( false ),
 	  m_TrafficHalted( false ),
 	  m_SelfTestFailure( 0 ),
 	  m_ReadTimingConfigured( 0 ), m_ReadTimingStart( 0 ), m_ReadTimingEnd( 0 ),
-	  m_ReadTimingSelected( 0 ),
+	  m_ReadTimingSelected( 0 ), m_ReadTimingBestError( 0 ),
+	  m_ReadTimingBestErrorSample( 0 ), m_ReadTimingRAMBestError( 0 ),
+	  m_ReadTimingRAMBestSample( 0 ), m_ReadTimingRAMOnlyBestError( 0 ),
+	  m_ReadTimingRAMOnlyBestSample( 0 ),
+	  m_SnapshotKernalFirst( 0 ), m_SnapshotKernalReread( 0 ),
+	  m_SnapshotKernalCopied( 0 ), m_SnapshotBasicFirst( 0 ),
+	  m_SnapshotBasicReread( 0 ), m_SnapshotBasicCopied( 0 ),
+	  m_SnapshotKernalObserved( 0 ), m_SnapshotBasicObserved( 0 ),
 	  m_WriteTimingConfiguredAddr( 0 ), m_WriteTimingConfiguredData( 0 ),
 	  m_WriteTimingSelectedAddr( 0 ), m_WriteTimingSelectedData( 0 ),
-	  m_WriteTimingPassingPoints( 0 ), m_TestBankA( 0 ), m_TestBankE( 0 ),
+	  m_WriteTimingPassingPoints( 0 ),
+	  m_SIDTimingConfigured( 0 ), m_SIDTimingStart( 0 ), m_SIDTimingEnd( 0 ),
+	  m_SIDTimingSelected( 0 ), m_SIDTimingBestSample( 0 ), m_SIDTimingDistinct( 0 ),
+	  m_SIDTimingDominant( 0 ), m_SIDTimingRamp( 0 ), m_SIDTimingEdge( 0 ),
+	  m_SIDPhysicalReliable( false ), m_SIDModelFreq( 0 ), m_SIDModelControl( 0 ),
+	  m_SIDModelPhase( 0 ), m_SIDModelLastHost( 0 ), m_SIDModelRemainder( 0 ),
+	  m_TestBankA( 0 ), m_TestBankE( 0 ),
 	  m_TestRasterChanged( 0 ), m_TestAddrErrors( 0 ), m_TestSingleErrors( 0 ),
-	  m_TestBurstErrors( 0 ), m_TestRepeatedFailures( 0 ), m_Logger( 0 )
+	  m_TestBurstErrors( 0 ), m_TestRepeatedFailures( 0 ),
+	  m_AccessSentinelRan( false ), m_AccessSentinelTrafficCount( 0 ),
+	  m_DisplaySentinelRan( false ), m_DisplayAddressRan( false ),
+	  m_DisplayRowRan( false ), m_DisplayFetchRan( false ),
+	  m_DisplayPersistenceRan( false ), m_DisplayTimingRan( false ),
+	  m_DisplayBoundaryRan( false ),
+	  m_DisplayRefreshRan( false ),
+	  m_DisplayDiagnosticVariant( 0 ),
+	  m_DisplayBAGuardRan( false ),
+	  m_Logger( 0 )
 {
 	m_Signals.machine       = MACHINE_UNKNOWN;
 	m_Signals.video         = VIDEO_PAL;
@@ -57,6 +80,289 @@ CRADBus::CRADBus()
 		                  = m_TestBurst[ i ] = 0;
 	m_TestAddrFirstReread = m_TestSingleFirstReread =
 		m_TestBurstFirstReread = 0;
+	for ( u32 i = 0; i < READ_TIMING_SCORE_COUNT; i++ )
+	{
+		m_ReadTimingErrors[ i ] = 0;
+		m_ReadTimingRAMErrors[ i ] = 0;
+		m_ReadTimingRAMOnlyErrors[ i ] = 0;
+		m_ReadTimingMixedVICErrors[ i ] = 0;
+		m_ReadTimingIsolatedVICErrors[ i ] = 0;
+		m_ReadTimingMixedVICDistinct[ i ] = 0;
+		m_ReadTimingMixedVICDominantValue[ i ] = 0;
+		m_ReadTimingMixedVICDominantCount[ i ] = 0;
+		m_ReadTimingIsolatedVICDistinct[ i ] = 0;
+		m_ReadTimingIsolatedVICDominantValue[ i ] = 0;
+		m_ReadTimingIsolatedVICDominantCount[ i ] = 0;
+		for ( u32 r = 0; r < READ_TIMING_REPETITIONS; r++ )
+		{
+			m_ReadTimingMixedVICActual[ i ][ r ] = 0;
+			m_ReadTimingIsolatedVICActual[ i ][ r ] = 0;
+		}
+		for ( u32 p = 0; p < 6; p++ )
+		{
+			m_ReadTimingMixedRAMPositionErrors[ i ][ p ] = 0;
+			m_ReadTimingMixedRAMAddressErrors[ i ][ p ] = 0;
+		}
+	}
+	for ( u32 arm = 0; arm < 3; arm++ )
+	{
+		m_AccessSentinelBaselineRetainedErrors[ arm ] = 0;
+		m_AccessSentinelArmAddedErrors[ arm ] = 0;
+		m_AccessSentinelArmRemovedErrors[ arm ] = 0;
+		m_AccessSentinelSameErrors[ arm ] = 0;
+		m_AccessSentinelNewErrors[ arm ] = 0;
+		m_AccessSentinelClearedErrors[ arm ] = 0;
+		m_AccessSentinelElapsedUsec[ arm ] = 0;
+		for ( u32 pass = 0; pass < 2; pass++ )
+		{
+			m_AccessSentinelBaselineErrors[ arm ][ pass ] = 0;
+			m_AccessSentinelExposureErrors[ arm ][ pass ] = 0;
+			m_AccessSentinelFirstAddr[ arm ][ pass ] = 0;
+			m_AccessSentinelFirstExpected[ arm ][ pass ] = 0;
+			m_AccessSentinelFirstActual[ arm ][ pass ] = 0;
+		}
+	}
+	for ( u32 arm = 0; arm < 9; arm++ )
+	{
+		m_DisplaySentinelDisplayOn[ arm ] = 0;
+		m_DisplaySentinelOperation[ arm ] = 0;
+		m_DisplaySentinelRate[ arm ] = 0;
+		m_DisplaySentinelTrafficCount[ arm ] = 0;
+		m_DisplaySentinelElapsedUsec[ arm ] = 0;
+		m_DisplaySentinelBaselineRetainedErrors[ arm ] = 0;
+		m_DisplaySentinelArmAddedErrors[ arm ] = 0;
+		m_DisplaySentinelArmRemovedErrors[ arm ] = 0;
+		for ( u32 pass = 0; pass < 2; pass++ )
+		{
+			m_DisplaySentinelBaselineErrors[ arm ][ pass ] = 0;
+			m_DisplaySentinelVerifySameErrors[ arm ][ pass ] = 0;
+			m_DisplaySentinelVerifyNewErrors[ arm ][ pass ] = 0;
+			m_DisplaySentinelVerifyClearedErrors[ arm ][ pass ] = 0;
+		}
+		for ( u32 pass = 0; pass < 3; pass++ )
+		{
+			m_DisplaySentinelExposureErrors[ arm ][ pass ] = 0;
+			m_DisplaySentinelFirstAddr[ arm ][ pass ] = 0;
+			m_DisplaySentinelFirstExpected[ arm ][ pass ] = 0;
+			m_DisplaySentinelFirstActual[ arm ][ pass ] = 0;
+		}
+	}
+	m_DisplayAddressLadderRan = 0;
+	for ( u32 mode = 0; mode < 2; mode++ )
+	{
+		for ( u32 style = 0; style < 2; style++ )
+		{
+			m_DisplayAddressImmediateFirstTrial[ mode ][ style ] = 0;
+			m_DisplayAddressImmediateFirstExpected[ mode ][ style ] = 0;
+			m_DisplayAddressMapErrors[ mode ][ style ] = 0;
+			m_DisplayAddressMapFirst[ mode ][ style ] = 0;
+			m_DisplayAddressMapLast[ mode ][ style ] = 0;
+			m_DisplayAddressMapAND[ mode ][ style ] = 0;
+			m_DisplayAddressMapOR[ mode ][ style ] = 0;
+			m_DisplayAddressMapRuns[ mode ][ style ] = 0;
+			m_DisplayAddressMapMaxRun[ mode ][ style ] = 0;
+			for ( u32 read = 0; read < 3; read++ )
+			{
+				m_DisplayAddressImmediateErrors[ mode ][ style ][ read ] = 0;
+				m_DisplayAddressImmediateFirstActual[ mode ][ style ][ read ] = 0;
+			}
+		}
+		for ( u32 rung = 0; rung < 9; rung++ )
+		{
+			m_DisplayAddressDelayUsec[ rung ] = 0;
+			m_DisplayAddressElapsedUsec[ mode ][ rung ] = 0;
+			m_DisplayAddressLadderExpected[ mode ][ rung ] = 0;
+			for ( u32 read = 0; read < 3; read++ )
+			{
+				m_DisplayAddressLadderInitial[ mode ][ rung ][ read ] = 0;
+				m_DisplayAddressLadderDelayed[ mode ][ rung ][ read ] = 0;
+			}
+		}
+	}
+	for ( u32 arm = 0; arm < 10; arm++ )
+	{
+		m_DisplayRowMode[ arm ] = m_DisplayRowKind[ arm ] =
+			m_DisplayRowSalt[ arm ] = 0;
+		m_DisplayRowPrefillAttempts[ arm ] = 0;
+		for ( u32 phase = 0; phase < 2; phase++ )
+		{
+			m_DisplayRowSeedUsec[ arm ][ phase ] = 0;
+			m_DisplayRowCaptureUsec[ arm ][ phase ] = 0;
+			m_DisplayRowErrors[ arm ][ phase ] = 0;
+			m_DisplayRowFirst[ arm ][ phase ] = 0;
+			m_DisplayRowLast[ arm ][ phase ] = 0;
+			m_DisplayRowAND[ arm ][ phase ] = 0;
+			m_DisplayRowOR[ arm ][ phase ] = 0;
+			m_DisplayRowRuns[ arm ][ phase ] = 0;
+			m_DisplayRowMaxRun[ arm ][ phase ] = 0;
+		}
+	}
+	for ( u32 rung = 0; rung < 6; rung++ )
+	{
+		m_DisplayRowRetentionSalt[ rung ] = 0;
+		m_DisplayRowRetentionAttempts[ rung ] = 0;
+		m_DisplayRowRetentionDelayUsec[ rung ] = 0;
+		m_DisplayRowRetentionElapsedUsec[ rung ] = 0;
+		m_DisplayRowRetentionSeedUsec[ rung ] = 0;
+		for ( u32 phase = 0; phase < 2; phase++ )
+		{
+			m_DisplayRowRetentionCaptureUsec[ rung ][ phase ] = 0;
+			m_DisplayRowRetentionErrors[ rung ][ phase ] = 0;
+			m_DisplayRowRetentionFirst[ rung ][ phase ] = 0;
+			m_DisplayRowRetentionLast[ rung ][ phase ] = 0;
+			m_DisplayRowRetentionAND[ rung ][ phase ] = 0;
+			m_DisplayRowRetentionOR[ rung ][ phase ] = 0;
+			m_DisplayRowRetentionRuns[ rung ][ phase ] = 0;
+			m_DisplayRowRetentionMaxRun[ rung ][ phase ] = 0;
+		}
+	}
+	for ( u32 arm = 0; arm < 12; arm++ )
+	{
+		m_DisplayPersistenceState[ arm ] =
+			m_DisplayPersistenceOperation[ arm ] =
+			m_DisplayPersistenceSalt[ arm ] =
+			m_DisplayPersistencePrefillAttempts[ arm ] = 0;
+		m_DisplayPersistenceTrafficCount[ arm ] =
+			m_DisplayPersistenceElapsedUsec[ arm ] = 0;
+		for ( u32 phase = 0; phase < 5; phase++ )
+		{
+			if ( phase < 2 ) m_DisplayPersistenceSeedUsec[ arm ][ phase ] = 0;
+			m_DisplayPersistenceCaptureUsec[ arm ][ phase ] = 0;
+			m_DisplayPersistenceErrors[ arm ][ phase ] = 0;
+			m_DisplayPersistenceFirst[ arm ][ phase ] = 0;
+			m_DisplayPersistenceLast[ arm ][ phase ] = 0;
+			m_DisplayPersistenceAND[ arm ][ phase ] = 0;
+			m_DisplayPersistenceOR[ arm ][ phase ] = 0;
+			m_DisplayPersistenceRuns[ arm ][ phase ] = 0;
+			m_DisplayPersistenceMaxRun[ arm ][ phase ] = 0;
+			m_DisplayPersistenceFirstExpected[ arm ][ phase ] = 0;
+			m_DisplayPersistenceFirstActual[ arm ][ phase ] = 0;
+			m_DisplayPersistenceXorAND[ arm ][ phase ] = 0;
+			m_DisplayPersistenceXorOR[ arm ][ phase ] = 0;
+		}
+		for ( u32 pair = 0; pair < 2; pair++ )
+			m_DisplayPersistenceSame[ arm ][ pair ] =
+				m_DisplayPersistenceAdded[ arm ][ pair ] =
+				m_DisplayPersistenceRemoved[ arm ][ pair ] = 0;
+	}
+	for ( u32 phase = 0; phase < 10; phase++ )
+		m_DisplayTimingSample[ phase ] = 0;
+	for ( u32 arm = 0; arm < 6; arm++ )
+	{
+		m_DisplayTimingState[ arm ] = m_DisplayTimingOperation[ arm ] =
+			m_DisplayTimingSalt[ arm ] = m_DisplayTimingPrefillAttempts[ arm ] = 0;
+		m_DisplayTimingPrefillErrors[ arm ] =
+			m_DisplayTimingBaselineErrors[ arm ] = 0;
+		m_DisplayTimingTrafficCount[ arm ] =
+			m_DisplayTimingElapsedUsec[ arm ] =
+			m_DisplayTimingRepairWrites[ arm ] = 0;
+		for ( u32 phase = 0; phase < 10; phase++ )
+		{
+			m_DisplayTimingCaptureUsec[ arm ][ phase ] = 0;
+			m_DisplayTimingErrors[ arm ][ phase ] = 0;
+			m_DisplayTimingFirst[ arm ][ phase ] = 0;
+			m_DisplayTimingLast[ arm ][ phase ] = 0;
+			m_DisplayTimingAND[ arm ][ phase ] = 0;
+			m_DisplayTimingOR[ arm ][ phase ] = 0;
+			m_DisplayTimingRuns[ arm ][ phase ] = 0;
+			m_DisplayTimingMaxRun[ arm ][ phase ] = 0;
+			m_DisplayTimingFirstExpected[ arm ][ phase ] = 0;
+			m_DisplayTimingFirstActual[ arm ][ phase ] = 0;
+			m_DisplayTimingXorAND[ arm ][ phase ] = 0;
+			m_DisplayTimingXorOR[ arm ][ phase ] = 0;
+			m_DisplayTimingSame[ arm ][ phase ] = 0;
+			m_DisplayTimingAdded[ arm ][ phase ] = 0;
+			m_DisplayTimingRemoved[ arm ][ phase ] = 0;
+		}
+	}
+	for ( u32 arm = 0; arm < 16; arm++ )
+	{
+		m_DisplayBoundaryState[ arm ] = m_DisplayBoundarySafe[ arm ] =
+			m_DisplayBoundaryDwell[ arm ] = m_DisplayBoundarySalt[ arm ] =
+			m_DisplayBoundaryPrefillAttempts[ arm ] = 0;
+		m_DisplayBoundaryPrefillErrors[ arm ] =
+			m_DisplayBoundaryElapsedUsec[ arm ] = 0;
+		m_DisplayBoundarySame[ arm ] = m_DisplayBoundaryAdded[ arm ] =
+			m_DisplayBoundaryRemoved[ arm ] = 0;
+		for ( u32 phase = 0; phase < 2; phase++ )
+		{
+			m_DisplayBoundaryWaitReads[ arm ][ phase ] = 0;
+			m_DisplayBoundaryCaptureUsec[ arm ][ phase ] = 0;
+			m_DisplayBoundaryErrors[ arm ][ phase ] = 0;
+			m_DisplayBoundaryFirst[ arm ][ phase ] = 0;
+			m_DisplayBoundaryLast[ arm ][ phase ] = 0;
+			m_DisplayBoundaryAND[ arm ][ phase ] = 0;
+			m_DisplayBoundaryOR[ arm ][ phase ] = 0;
+			m_DisplayBoundaryRuns[ arm ][ phase ] = 0;
+			m_DisplayBoundaryMaxRun[ arm ][ phase ] = 0;
+			m_DisplayBoundaryFirstExpected[ arm ][ phase ] = 0;
+			m_DisplayBoundaryFirstActual[ arm ][ phase ] = 0;
+			m_DisplayBoundaryXorAND[ arm ][ phase ] = 0;
+			m_DisplayBoundaryXorOR[ arm ][ phase ] = 0;
+		}
+	}
+	for ( u32 arm = 0; arm < 8; arm++ )
+	{
+		m_DisplayRefreshEnabled[ arm ] = 0;
+		m_DisplayRefreshStartOK[ arm ] = 0;
+		m_DisplayRefreshSlots[ arm ] = 0;
+		m_DisplayScrubOpportunities[ arm ] = 0;
+		m_DisplayScrubMaxChunkCycles[ arm ] = 0;
+	}
+	for ( u32 arm = 0; arm < DISPLAY_BA_ARM_COUNT; arm++ )
+	{
+		m_DisplayBAOperation[ arm ] = m_DisplayBABias[ arm ] =
+			m_DisplayBARotation[ arm ] = m_DisplayBAPrefillAttempts[ arm ] =
+			m_DisplayBATargetAttempts[ arm ] = 0;
+		m_DisplayBATrafficCount[ arm ] = m_DisplayBAElapsedUsec[ arm ] = 0;
+		m_DisplayBABaselinePersistent[ arm ] =
+			m_DisplayBABaselineUnion[ arm ] = m_DisplayBAPostPersistent[ arm ] =
+			m_DisplayBAPostUnion[ arm ] = m_DisplayBAAddedPersistent[ arm ] =
+			m_DisplayBAUnstableOnly[ arm ] = 0;
+		for ( u32 pass = 0; pass < 6; pass++ )
+			m_DisplayBACaptureUsec[ arm ][ pass ] = 0;
+		for ( u32 family = 0; family < DISPLAY_BA_FAMILY_COUNT; family++ )
+			m_DisplayBAFamilyAdded[ arm ][ family ] = 0;
+	}
+	for ( u32 arm = 0; arm < 9; arm++ )
+	{
+		m_DisplayFetchState[ arm ] = m_DisplayFetchOperation[ arm ] =
+			m_DisplayFetchSalt[ arm ] = m_DisplayFetchPrefillAttempts[ arm ] = 0;
+		m_DisplayFetchRate[ arm ] = m_DisplayFetchTrafficCount[ arm ] =
+			m_DisplayFetchElapsedUsec[ arm ] = 0;
+		for ( u32 phase = 0; phase < 3; phase++ )
+		{
+			if ( phase < 2 ) m_DisplayFetchSeedUsec[ arm ][ phase ] = 0;
+			m_DisplayFetchCaptureUsec[ arm ][ phase ] = 0;
+			m_DisplayFetchErrors[ arm ][ phase ] = 0;
+			m_DisplayFetchFirst[ arm ][ phase ] = 0;
+			m_DisplayFetchLast[ arm ][ phase ] = 0;
+			m_DisplayFetchAND[ arm ][ phase ] = 0;
+			m_DisplayFetchOR[ arm ][ phase ] = 0;
+			m_DisplayFetchRuns[ arm ][ phase ] = 0;
+			m_DisplayFetchMaxRun[ arm ][ phase ] = 0;
+		}
+	}
+	for ( u32 rung = 0; rung < 6; rung++ )
+	{
+		m_DisplayFetchRetentionSalt[ rung ] =
+			m_DisplayFetchRetentionPrefillAttempts[ rung ] = 0;
+		m_DisplayFetchRetentionDelayUsec[ rung ] =
+			m_DisplayFetchRetentionElapsedUsec[ rung ] = 0;
+		for ( u32 phase = 0; phase < 3; phase++ )
+		{
+			if ( phase < 2 )
+				m_DisplayFetchRetentionSeedUsec[ rung ][ phase ] = 0;
+			m_DisplayFetchRetentionCaptureUsec[ rung ][ phase ] = 0;
+			m_DisplayFetchRetentionErrors[ rung ][ phase ] = 0;
+			m_DisplayFetchRetentionFirst[ rung ][ phase ] = 0;
+			m_DisplayFetchRetentionLast[ rung ][ phase ] = 0;
+			m_DisplayFetchRetentionAND[ rung ][ phase ] = 0;
+			m_DisplayFetchRetentionOR[ rung ][ phase ] = 0;
+			m_DisplayFetchRetentionRuns[ rung ][ phase ] = 0;
+			m_DisplayFetchRetentionMaxRun[ rung ][ phase ] = 0;
+		}
+	}
 	m_PosRawBeforeSingle[ 0 ] = m_PosRawBeforeSingle[ 1 ] = 0;
 	for ( u32 p = 0; p < 3; p++ )
 	{
@@ -74,6 +380,7 @@ CRADBus::CRADBus()
 		m_TurnSingleFlush[ p ] = m_TurnDoubleFlush[ p ] = 0;
 	}
 	m_TurnDetectedMachine = 0;
+	m_SIDPotFiltered[ 0 ] = m_SIDPotFiltered[ 1 ] = 0x80;
 	for ( u32 cell = 0; cell < 256; cell++ )
 	{
 		m_RefreshMapExpected[ cell ] = 0;
@@ -262,6 +569,8 @@ static bool busDiagEndLine( char *dst, u32 capacity, u32 &length )
 // These helpers bypass RAD_PEEK/RAD_SPEEK so the diagnostic can compare a
 // minimal direct transfer with the ordinary wrapper. E7 intentionally makes
 // the normal read primitive itself the same direct p1/p2/p3 sequence.
+static bool sidReadAtFallingEdge = false;
+
 __attribute__((noinline)) u8 radDirectRead( u16 addr )
 {
 	register u32 g2;
@@ -276,7 +585,10 @@ __attribute__((noinline)) u8 radDirectRead( u16 addr )
 	const u32 sampleAt = ( ( addr & 0xFC00 ) == 0xD400 )
 	                   ? (u32)busTiming.WAIT_CYCLE_READ_SID
 	                   : (u32)busTiming.WAIT_CYCLE_READ;
-	busReadByte_p3( g2, v, false, sampleAt );
+	if ( ( addr & 0xFC00 ) == 0xD400 && sidReadAtFallingEdge )
+		busReadByte_p3FallingEdge( g2, v, false );
+	else
+		busReadByte_p3( g2, v, false, sampleAt );
 	c128TrafficEnd();
 	return v;
 }
@@ -299,6 +611,533 @@ __attribute__((noinline)) void radDirectWrite( u16 addr, u8 value )
 static inline void busDiagRawWrite( u16 addr, u8 value )
 {
 	radDirectWrite( addr, value );
+}
+
+// C64 access-induced-corruption diagnostic. Keep the oracle out of zero page,
+// the stack, the visible screen, ROM/I/O windows and the takeover workspace.
+// $0800-$9FFF plus $C000-$CFFF covers 43,008 physical RAM bytes (about two
+// thirds of the machine), making sparse stray writes much more likely to hit
+// a sentinel than a traditional one-page bus test.
+static const u32 ACCESS_SENTINEL_FIRST_LENGTH = 0x9800;
+static const u32 ACCESS_SENTINEL_SECOND_LENGTH = 0x1000;
+static const u32 ACCESS_SENTINEL_LENGTH =
+	ACCESS_SENTINEL_FIRST_LENGTH + ACCESS_SENTINEL_SECOND_LENGTH;
+static const u32 ACCESS_SENTINEL_BITMAP_BYTES =
+	( ACCESS_SENTINEL_LENGTH + 7 ) / 8;
+static u8 accessSentinelMismatch[ 2 ][ ACCESS_SENTINEL_BITMAP_BYTES ];
+
+static inline u16 accessSentinelAddr( u32 index )
+{
+	return index < ACCESS_SENTINEL_FIRST_LENGTH
+	     ? (u16)( 0x0800u + index )
+	     : (u16)( 0xC000u + index - ACCESS_SENTINEL_FIRST_LENGTH );
+}
+
+static inline u8 accessSentinelExpected( u16 addr, u8 salt )
+{
+	const u32 mixed = (u32)addr * 73u + (u32)( addr >> 8 ) * 151u
+	                + (u32)salt * 29u;
+	return (u8)( mixed ^ ( addr >> 3 ) ^ ( addr >> 11 ) );
+}
+
+static void accessSentinelSeed( u8 salt )
+{
+	for ( u32 index = 0; index < ACCESS_SENTINEL_LENGTH; index++ )
+	{
+		const u16 addr = accessSentinelAddr( index );
+		busDiagRawWrite( addr, accessSentinelExpected( addr, salt ) );
+	}
+}
+
+static u32 accessSentinelCapture( u8 salt, u8 *mismatch,
+	                              u16 &firstAddr, u8 &firstExpected,
+	                              u8 &firstActual )
+{
+	// Keep a first-read-after-write residue out of the sentinel itself. These
+	// two sacrificial reads are identical for every baseline/exposure pass and
+	// target the cassette-buffer scratch already used by the ordinary self-test.
+	(void)busDiagRawRead( 0x02FC );
+	(void)busDiagRawRead( 0x02FC );
+	for ( u32 byte = 0; byte < ACCESS_SENTINEL_BITMAP_BYTES; byte++ )
+		mismatch[ byte ] = 0;
+
+	u32 errors = 0;
+	firstAddr = 0;
+	firstExpected = firstActual = 0;
+	for ( u32 index = 0; index < ACCESS_SENTINEL_LENGTH; index++ )
+	{
+		const u16 addr = accessSentinelAddr( index );
+		const u8 expected = accessSentinelExpected( addr, salt );
+		const u8 actual = busDiagRawRead( addr );
+		if ( actual == expected ) continue;
+
+		mismatch[ index >> 3 ] |= (u8)( 1u << ( index & 7 ) );
+		if ( errors++ == 0 )
+		{
+			firstAddr = addr;
+			firstExpected = expected;
+			firstActual = actual;
+		}
+	}
+	return errors;
+}
+
+static void accessSentinelCompare( const u8 *before, const u8 *after,
+	                               u32 &same, u32 &added, u32 &removed )
+{
+	same = added = removed = 0;
+	for ( u32 index = 0; index < ACCESS_SENTINEL_LENGTH; index++ )
+	{
+		const u8 bit = (u8)( 1u << ( index & 7 ) );
+		const bool wasWrong = ( before[ index >> 3 ] & bit ) != 0;
+		const bool isWrong = ( after[ index >> 3 ] & bit ) != 0;
+		if ( wasWrong && isWrong ) same++;
+		else if ( !wasWrong && isWrong ) added++;
+		else if ( wasWrong && !isWrong ) removed++;
+	}
+}
+
+static void displaySentinelCompare( const u8 *before, const u8 *after,
+	                                u32 &same, u32 &added, u32 &removed );
+
+// K222 displayed oracle. The matrix and bitmap are both ordinary physical RAM
+// in VIC bank 0. DEN is always clear while these buffers are seeded or read;
+// it is raised only for a display-on exposure arm.
+static const u32 DISPLAY_SENTINEL_MATRIX_LENGTH = 1024;
+static const u32 DISPLAY_SENTINEL_BITMAP_LENGTH = 8192;
+static const u32 DISPLAY_SENTINEL_LENGTH =
+	DISPLAY_SENTINEL_MATRIX_LENGTH + DISPLAY_SENTINEL_BITMAP_LENGTH;
+static const u32 DISPLAY_SENTINEL_BITMAP_BYTES =
+	( DISPLAY_SENTINEL_LENGTH + 7 ) / 8;
+static u8 displaySentinelMismatch[ 2 ][ DISPLAY_SENTINEL_BITMAP_BYTES ];
+
+static inline u16 displaySentinelAddr( u32 index )
+{
+	return index < DISPLAY_SENTINEL_MATRIX_LENGTH
+	     ? (u16)( 0x0400u + index )
+	     : (u16)( 0x2000u + index - DISPLAY_SENTINEL_MATRIX_LENGTH );
+}
+
+static inline u8 displaySentinelExpected( u32 index )
+{
+	if ( index < DISPLAY_SENTINEL_MATRIX_LENGTH )
+		return 0x10; // white foreground, black background in hires mode
+	const u32 bitmapOffset = index - DISPLAY_SENTINEL_MATRIX_LENGTH;
+	const u32 rasterRow = bitmapOffset / 40u;
+	return ( ( bitmapOffset ^ rasterRow ) & 1u ) ? 0x55 : 0xAA;
+}
+
+static void displaySentinelSetMode( bool displayOn, u8 border )
+{
+	static const u16 addrs[ 7 ] =
+		{ 0xDD02, 0xDD00, 0xD015, 0xD016, 0xD018, 0xD020, 0xD021 };
+	const u8 values[ 7 ] =
+		{ 0x03,   0x03,   0x00,   0x08,   0x18,   border, 0x00 };
+	for ( u32 i = 0; i < 7; i++ )
+	{
+		busDiagRawWrite( addrs[ i ], values[ i ] );
+		busDiagRawWrite( addrs[ i ], values[ i ] );
+	}
+	const u8 d011 = displayOn ? 0x3B : 0x2B;
+	busDiagRawWrite( 0xD011, d011 );
+	busDiagRawWrite( 0xD011, d011 );
+}
+
+static void displaySentinelSetDEN( bool displayOn )
+{
+	const u8 d011 = displayOn ? 0x3B : 0x2B;
+	busDiagRawWrite( 0xD011, d011 );
+	busDiagRawWrite( 0xD011, d011 );
+}
+
+static void displaySentinelSeed()
+{
+	for ( u32 index = 0; index < DISPLAY_SENTINEL_LENGTH; index++ )
+		busDiagRawWrite( displaySentinelAddr( index ),
+		                 displaySentinelExpected( index ) );
+}
+
+static u32 displaySentinelCapture( u8 *mismatch,
+	                               u16 &firstAddr, u8 &firstExpected,
+	                               u8 &firstActual )
+{
+	(void)busDiagRawRead( 0x02FC );
+	(void)busDiagRawRead( 0x02FC );
+	for ( u32 byte = 0; byte < DISPLAY_SENTINEL_BITMAP_BYTES; byte++ )
+		mismatch[ byte ] = 0;
+
+	u32 errors = 0;
+	firstAddr = 0;
+	firstExpected = firstActual = 0;
+	for ( u32 index = 0; index < DISPLAY_SENTINEL_LENGTH; index++ )
+	{
+		const u16 addr = displaySentinelAddr( index );
+		const u8 expected = displaySentinelExpected( index );
+		const u8 actual = busDiagRawRead( addr );
+		if ( actual == expected ) continue;
+
+		mismatch[ index >> 3 ] |= (u8)( 1u << ( index & 7 ) );
+		if ( errors++ == 0 )
+		{
+			firstAddr = addr;
+			firstExpected = expected;
+			firstActual = actual;
+		}
+	}
+	return errors;
+}
+
+static void displaySentinelCompare( const u8 *before, const u8 *after,
+	                                u32 &same, u32 &added, u32 &removed )
+{
+	same = added = removed = 0;
+	for ( u32 index = 0; index < DISPLAY_SENTINEL_LENGTH; index++ )
+	{
+		const u8 bit = (u8)( 1u << ( index & 7 ) );
+		const bool wasWrong = ( before[ index >> 3 ] & bit ) != 0;
+		const bool isWrong = ( after[ index >> 3 ] & bit ) != 0;
+		if ( wasWrong && isWrong ) same++;
+		else if ( !wasWrong && isWrong ) added++;
+		else if ( wasWrong && !isWrong ) removed++;
+	}
+}
+
+// K223 retains four complete maps: text/bitmap mode crossed with a one-pass
+// or two-pass bulk seed. They are file-scope scratch so the diagnostic result
+// formatter can preserve the raw evidence without bloating CRADBus itself.
+static u8 displayAddressMismatch[ 2 ][ 2 ][ DISPLAY_SENTINEL_BITMAP_BYTES ];
+
+static void displayAddressSetMode( bool bitmap, u8 border )
+{
+	static const u16 addrs[ 7 ] =
+		{ 0xDD02, 0xDD00, 0xD015, 0xD016, 0xD018, 0xD020, 0xD021 };
+	const u8 values[ 7 ] =
+		{ 0x03,   0x03,   0x00,   0x08,   0x18,   border, 0x00 };
+	for ( u32 i = 0; i < 7; i++ )
+	{
+		busDiagRawWrite( addrs[ i ], values[ i ] );
+		busDiagRawWrite( addrs[ i ], values[ i ] );
+	}
+	// DEN is deliberately clear in both modes. Bit 5 is the only variable.
+	const u8 d011 = bitmap ? 0x2B : 0x0B;
+	busDiagRawWrite( 0xD011, d011 );
+	busDiagRawWrite( 0xD011, d011 );
+}
+
+static void displayAddressSeed( u32 passes )
+{
+	for ( u32 pass = 0; pass < passes; pass++ )
+		for ( u32 index = 0; index < DISPLAY_SENTINEL_LENGTH; index++ )
+			busDiagRawWrite( displaySentinelAddr( index ),
+			                 displaySentinelExpected( index ) );
+}
+
+static void displayAddressAnalyzeMap( const u8 *mismatch,
+	                                  u32 &errors, u16 &first, u16 &last,
+	                                  u16 &addrAND, u16 &addrOR,
+	                                  u16 &runs, u16 &maxRun )
+{
+	errors = 0;
+	first = last = runs = maxRun = 0;
+	addrAND = 0xFFFF;
+	addrOR = 0;
+	u16 previous = 0;
+	u16 currentRun = 0;
+	for ( u32 index = 0; index < DISPLAY_SENTINEL_LENGTH; index++ )
+	{
+		if ( ( mismatch[ index >> 3 ]
+		       & (u8)( 1u << ( index & 7 ) ) ) == 0 )
+			continue;
+		const u16 addr = displaySentinelAddr( index );
+		if ( errors == 0 )
+		{
+			first = addr;
+			currentRun = 1;
+			runs = 1;
+		}
+		else if ( addr == (u16)( previous + 1u ) )
+			currentRun++;
+		else
+		{
+			if ( currentRun > maxRun ) maxRun = currentRun;
+			currentRun = 1;
+			runs++;
+		}
+		errors++;
+		last = previous = addr;
+		addrAND &= addr;
+		addrOR |= addr;
+	}
+	if ( currentRun > maxRun ) maxRun = currentRun;
+	if ( errors == 0 ) addrAND = 0;
+}
+
+static const u32 DISPLAY_ROW_ARM_COUNT = 10;
+static const u32 DISPLAY_ROW_RETENTION_COUNT = 6;
+static u8 displayRowPrefillMismatch
+	[ DISPLAY_ROW_ARM_COUNT ][ DISPLAY_SENTINEL_BITMAP_BYTES ];
+static u8 displayRowTestMismatch
+	[ DISPLAY_ROW_ARM_COUNT ][ DISPLAY_SENTINEL_BITMAP_BYTES ];
+static u8 displayRowRetentionBaselineMismatch
+	[ DISPLAY_ROW_RETENTION_COUNT ][ DISPLAY_SENTINEL_BITMAP_BYTES ];
+static u8 displayRowRetentionMismatch
+	[ DISPLAY_ROW_RETENTION_COUNT ][ DISPLAY_SENTINEL_BITMAP_BYTES ];
+
+static const u32 DISPLAY_FETCH_ARM_COUNT = 9;
+static const u32 DISPLAY_FETCH_RETENTION_COUNT = 6;
+static u8 displayFetchPrefillMismatch
+	[ DISPLAY_FETCH_ARM_COUNT ][ DISPLAY_SENTINEL_BITMAP_BYTES ];
+static u8 displayFetchBaselineMismatch
+	[ DISPLAY_FETCH_ARM_COUNT ][ DISPLAY_SENTINEL_BITMAP_BYTES ];
+static u8 displayFetchPostMismatch
+	[ DISPLAY_FETCH_ARM_COUNT ][ DISPLAY_SENTINEL_BITMAP_BYTES ];
+static u8 displayFetchRetentionPrefillMismatch
+	[ DISPLAY_FETCH_RETENTION_COUNT ][ DISPLAY_SENTINEL_BITMAP_BYTES ];
+static u8 displayFetchRetentionBaselineMismatch
+	[ DISPLAY_FETCH_RETENTION_COUNT ][ DISPLAY_SENTINEL_BITMAP_BYTES ];
+static u8 displayFetchRetentionPostMismatch
+	[ DISPLAY_FETCH_RETENTION_COUNT ][ DISPLAY_SENTINEL_BITMAP_BYTES ];
+
+static const u32 DISPLAY_PERSISTENCE_ARM_COUNT = 12;
+static const u32 DISPLAY_PERSISTENCE_PHASE_COUNT = 5;
+static u8 displayPersistenceMismatch
+	[ DISPLAY_PERSISTENCE_ARM_COUNT ][ DISPLAY_PERSISTENCE_PHASE_COUNT ]
+	[ DISPLAY_SENTINEL_BITMAP_BYTES ];
+static const u32 DISPLAY_TIMING_ARM_COUNT = 6;
+static const u32 DISPLAY_TIMING_PHASE_COUNT = 10;
+static u8 displayTimingMismatch
+	[ DISPLAY_TIMING_ARM_COUNT ][ DISPLAY_TIMING_PHASE_COUNT ]
+	[ DISPLAY_SENTINEL_BITMAP_BYTES ];
+static const u32 DISPLAY_BOUNDARY_ARM_COUNT = 16;
+static const u32 DISPLAY_BOUNDARY_PHASE_COUNT = 2;
+static u8 displayBoundaryMismatch
+	[ DISPLAY_BOUNDARY_ARM_COUNT ][ DISPLAY_BOUNDARY_PHASE_COUNT ]
+	[ DISPLAY_SENTINEL_BITMAP_BYTES ];
+// K233 uses the production CWriteBuffer scrub against this authoritative
+// oracle image. Only the matrix and bitmap ranges are populated.
+static u8 displayScrubShadow[ 0x10000 ];
+
+// K239 keeps every arm on the same composite oracle. Four bitmap families are
+// interleaved by 64-byte block; the second repetition rotates the assignment so
+// an address-sensitive weakness cannot masquerade as a data-pattern effect.
+static const u32 DISPLAY_BA_LOCAL_ARM_COUNT = 12;
+static const u32 DISPLAY_BA_CAPTURE_COUNT = 6;
+static u8 displayBAMismatch
+	[ DISPLAY_BA_LOCAL_ARM_COUNT ][ DISPLAY_BA_CAPTURE_COUNT ]
+	[ DISPLAY_SENTINEL_BITMAP_BYTES ];
+static u8 displayBAAddedMap
+	[ DISPLAY_BA_LOCAL_ARM_COUNT ][ DISPLAY_SENTINEL_BITMAP_BYTES ];
+
+static inline u8 displayBAFamily( u32 index, u8 rotation )
+{
+	if ( index < DISPLAY_SENTINEL_MATRIX_LENGTH ) return 0;
+	const u32 offset = index - DISPLAY_SENTINEL_MATRIX_LENGTH;
+	return (u8)( 1u + ( ( ( offset >> 6 ) + rotation ) & 3u ) );
+}
+
+static inline u8 displayBAExpected( u32 index, u8 rotation )
+{
+	const u8 family = displayBAFamily( index, rotation );
+	if ( family == 0 ) return 0x10;
+	if ( family == 1 ) return 0x00;
+	if ( family == 2 ) return 0xFF;
+	const u16 addr = displaySentinelAddr( index );
+	if ( family == 3 )
+	{
+		const u32 offset = index - DISPLAY_SENTINEL_MATRIX_LENGTH;
+		return ( ( ( offset >> 6 ) ^ ( offset / 320u ) ) & 1u ) ? 0xFF : 0x00;
+	}
+	const u32 mixed = (u32)addr * 73u + index * 29u + 0x6Du;
+	return (u8)( mixed ^ ( mixed >> 8 ) ^ ( addr >> 3 ) ^ ( addr >> 11 ) );
+}
+
+static u32 displayBASeed( u8 rotation, bool complement, bool repeat )
+{
+	u64 started, finished;
+	READ_CYCLE_COUNTER( started );
+	for ( u32 index = 0; index < DISPLAY_SENTINEL_LENGTH; index++ )
+	{
+		u8 value = displayBAExpected( index, rotation );
+		if ( complement ) value = (u8)~value;
+		busDiagRawWrite( displaySentinelAddr( index ), value );
+		if ( repeat ) busDiagRawWrite( displaySentinelAddr( index ), value );
+	}
+	READ_CYCLE_COUNTER( finished );
+	return (u32)( ( finished - started )
+	              / ( SCPU_ARM_CLOCK_HZ / 1000000u ) );
+}
+
+static u32 displayBACapture( u8 rotation, bool complement, u8 *mismatch,
+	                         u32 &errors )
+{
+	u64 started, finished;
+	READ_CYCLE_COUNTER( started );
+	(void)busDiagRawRead( 0x02FC );
+	(void)busDiagRawRead( 0x02FC );
+	for ( u32 byte = 0; byte < DISPLAY_SENTINEL_BITMAP_BYTES; byte++ )
+		mismatch[ byte ] = 0;
+	errors = 0;
+	for ( u32 index = 0; index < DISPLAY_SENTINEL_LENGTH; index++ )
+	{
+		u8 expected = displayBAExpected( index, rotation );
+		if ( complement ) expected = (u8)~expected;
+		if ( busDiagRawRead( displaySentinelAddr( index ) ) == expected ) continue;
+		mismatch[ index >> 3 ] |= (u8)( 1u << ( index & 7 ) );
+		errors++;
+	}
+	READ_CYCLE_COUNTER( finished );
+	return (u32)( ( finished - started )
+	              / ( SCPU_ARM_CLOCK_HZ / 1000000u ) );
+}
+
+static inline u8 displayRowExpected( u32 index, u8 salt )
+{
+	const u16 addr = displaySentinelAddr( index );
+	const u32 mixed = (u32)addr * 73u + (u32)( addr >> 8 ) * 151u
+	                + index * 29u + (u32)salt * 47u;
+	return (u8)( mixed ^ ( mixed >> 8 ) ^ ( addr >> 3 )
+	             ^ ( addr >> 11 ) );
+}
+
+static u32 displayRowSeed( u8 salt, bool complement, bool adjacentRepeat )
+{
+	u64 started, finished;
+	READ_CYCLE_COUNTER( started );
+	for ( u32 index = 0; index < DISPLAY_SENTINEL_LENGTH; index++ )
+	{
+		u8 value = displayRowExpected( index, salt );
+		if ( complement ) value = (u8)~value;
+		busDiagRawWrite( displaySentinelAddr( index ), value );
+		if ( adjacentRepeat )
+			busDiagRawWrite( displaySentinelAddr( index ), value );
+	}
+	READ_CYCLE_COUNTER( finished );
+	return (u32)( ( finished - started )
+	              / ( SCPU_ARM_CLOCK_HZ / 1000000u ) );
+}
+
+static u32 displayRowCapture( u8 salt, bool complement, u8 *mismatch )
+{
+	u64 started, finished;
+	READ_CYCLE_COUNTER( started );
+	(void)busDiagRawRead( 0x02FC );
+	(void)busDiagRawRead( 0x02FC );
+	for ( u32 byte = 0; byte < DISPLAY_SENTINEL_BITMAP_BYTES; byte++ )
+		mismatch[ byte ] = 0;
+	for ( u32 index = 0; index < DISPLAY_SENTINEL_LENGTH; index++ )
+	{
+		u8 expected = displayRowExpected( index, salt );
+		if ( complement ) expected = (u8)~expected;
+		if ( busDiagRawRead( displaySentinelAddr( index ) ) != expected )
+			mismatch[ index >> 3 ] |= (u8)( 1u << ( index & 7 ) );
+	}
+	READ_CYCLE_COUNTER( finished );
+	return (u32)( ( finished - started )
+	              / ( SCPU_ARM_CLOCK_HZ / 1000000u ) );
+}
+
+static u32 displayPersistenceCapture( u8 salt, bool complement, u8 *mismatch,
+	                                  u8 &firstExpected, u8 &firstActual,
+	                                  u8 &xorAND, u8 &xorOR )
+{
+	u64 started, finished;
+	READ_CYCLE_COUNTER( started );
+	// Keep the same two-read priming as K225/K226 so only the number and content
+	// of recorded passes changes between protocols.
+	(void)busDiagRawRead( 0x02FC );
+	(void)busDiagRawRead( 0x02FC );
+	for ( u32 byte = 0; byte < DISPLAY_SENTINEL_BITMAP_BYTES; byte++ )
+		mismatch[ byte ] = 0;
+	firstExpected = firstActual = 0;
+	xorAND = 0xFF;
+	xorOR = 0;
+	u32 errors = 0;
+	for ( u32 index = 0; index < DISPLAY_SENTINEL_LENGTH; index++ )
+	{
+		u8 expected = displayRowExpected( index, salt );
+		if ( complement ) expected = (u8)~expected;
+		const u8 actual = busDiagRawRead( displaySentinelAddr( index ) );
+		if ( actual == expected ) continue;
+		mismatch[ index >> 3 ] |= (u8)( 1u << ( index & 7 ) );
+		const u8 delta = (u8)( actual ^ expected );
+		xorAND &= delta;
+		xorOR |= delta;
+		if ( errors++ == 0 )
+		{
+			firstExpected = expected;
+			firstActual = actual;
+		}
+	}
+	if ( errors == 0 ) xorAND = 0;
+	READ_CYCLE_COUNTER( finished );
+	return (u32)( ( finished - started )
+	              / ( SCPU_ARM_CLOCK_HZ / 1000000u ) );
+}
+
+static void displayFetchSetState( u8 state, u8 border )
+{
+	static const u16 addrs[ 7 ] =
+		{ 0xDD02, 0xDD00, 0xD015, 0xD016, 0xD018, 0xD020, 0xD021 };
+	const u8 values[ 7 ] =
+		{ 0x03,   0x03,   0x00,   0x08,   0x18,   border, 0x00 };
+	for ( u32 i = 0; i < 7; i++ )
+	{
+		busDiagRawWrite( addrs[ i ], values[ i ] );
+		busDiagRawWrite( addrs[ i ], values[ i ] );
+	}
+	const u8 d011 = state == 2 ? 0x3B : state == 1 ? 0x1B : 0x0B;
+	busDiagRawWrite( 0xD011, d011 );
+	busDiagRawWrite( 0xD011, d011 );
+}
+
+static void displayFetchSetDEN( u8 state )
+{
+	const u8 d011 = state == 2 ? 0x3B : state == 1 ? 0x1B : 0x0B;
+	busDiagRawWrite( 0xD011, d011 );
+	busDiagRawWrite( 0xD011, d011 );
+}
+
+static void displayFetchBlank( u8 state )
+{
+	const u8 d011 = state == 2 ? 0x2B : 0x0B;
+	busDiagRawWrite( 0xD011, d011 );
+	busDiagRawWrite( 0xD011, d011 );
+}
+
+static bool displayBoundaryRasterWindow( u8 raster, bool safe )
+{
+	// $F0-$FF is in the lower border on both NTSC and PAL. $80-$87 is well
+	// inside the visible picture. We deliberately use broad windows rather
+	// than one exact line so a slightly late raw sample cannot deadlock K229.
+	return safe ? raster >= 0xF0
+	            : raster >= 0x80 && raster <= 0x87;
+}
+
+static u32 displayBoundaryWaitRaster( bool safe )
+{
+	u64 now;
+	READ_CYCLE_COUNTER( now );
+	const u64 deadline = now + SCPU_ARM_CLOCK_HZ / 10u;
+	u32 reads = 0;
+	u8 raster;
+	// If execution starts inside the requested window, leave it first. This
+	// makes every arm synchronize to a fresh window rather than using a random
+	// point near its trailing edge.
+	do
+	{
+		raster = busDiagRawRead( 0xD012 );
+		reads++;
+		READ_CYCLE_COUNTER( now );
+		if ( now >= deadline ) return reads | 0x80000000u;
+	} while ( displayBoundaryRasterWindow( raster, safe ) );
+	do
+	{
+		raster = busDiagRawRead( 0xD012 );
+		reads++;
+		READ_CYCLE_COUNTER( now );
+		if ( now >= deadline ) return reads | 0x80000000u;
+	} while ( !displayBoundaryRasterWindow( raster, safe ) );
+	return reads;
 }
 
 // bit 0: the next write will pay the read->write turnaround phase.
@@ -367,10 +1206,17 @@ bool CRADBus::acquire()
 			// the FPGA 64U: keep this acquisition and never expose those hosts to
 			// the GAME/Ultimax reset sequence.
 			busWriteTurnaroundPasses = 1;
-			busWriteTurnaroundNeeded = 0;
+			// Machine detection has just ended with physical reads. K243 rotated
+			// the following calibration reads and proved that the first seed
+			// write ($0334 <- $3C) was lost while every later write and read
+			// passed. Represent that real read->write direction here so the
+			// ordinary single-write primitive pays its existing one C64 idle
+			// pass. The C128 path below already does the same with two passes.
+			busWriteTurnaroundNeeded = 1;
 			m_Acquired = true;
 			calibrateReadTiming();
 			calibrateWriteTiming();
+			calibrateSIDReadTiming();
 			m_Signals.video = radDetectVideoStandard();
 
 			RADLOG( "6/6 C64, %s -- legacy bus acquired",
@@ -438,12 +1284,14 @@ bool CRADBus::acquire()
 		// Calibrate exactly once, under the final core3/core0 ownership regime.
 		calibrateReadTiming();
 		calibrateWriteTiming();
+		calibrateSIDReadTiming();
 		RADLOG( "    C128 refresh: loaded timing calibration complete" );
 	}
 	else
 	{
 		calibrateReadTiming();
 		calibrateWriteTiming();
+		calibrateSIDReadTiming();
 	}
 	m_Signals.video = radDetectVideoStandard();
 	if ( m_Signals.machine == MACHINE_C128 )
@@ -500,6 +1348,29 @@ bool CRADBus::startC128LineRefresh()
 	return false;
 }
 
+static void summarizeReadTimingValues( const u8 *values, u32 count,
+	                                   u8 &distinct, u8 &dominantValue,
+	                                   u8 &dominantCount )
+{
+	distinct = dominantValue = dominantCount = 0;
+	for ( u32 i = 0; i < count; i++ )
+	{
+		bool seen = false;
+		for ( u32 j = 0; j < i; j++ )
+			if ( values[ j ] == values[ i ] ) seen = true;
+		if ( !seen ) distinct++;
+
+		u8 matches = 0;
+		for ( u32 j = 0; j < count; j++ )
+			if ( values[ j ] == values[ i ] ) matches++;
+		if ( matches > dominantCount )
+		{
+			dominantCount = matches;
+			dominantValue = values[ i ];
+		}
+	}
+}
+
 void CRADBus::calibrateReadTiming()
 {
 	register u32 g2;
@@ -507,7 +1378,6 @@ void CRADBus::calibrateReadTiming()
 	static const u16 firstSample = 300;
 	static const u16 lastSample  = 620;
 	static const u16 sampleStep  = 5;
-	static const u32 repetitions = 12;
 
 	const u16 configured = busTiming.WAIT_CYCLE_READ;
 	m_ReadTimingConfigured = configured;
@@ -516,35 +1386,144 @@ void CRADBus::calibrateReadTiming()
 	// the same locations. Writes do not depend on the read sample we are about
 	// to calibrate. The VIC border register adds a non-DRAM device to the test;
 	// its low nibble is a stable read-back value on every VIC-II revision.
+	// K243/K244 proved that the first post-acquisition write can be swallowed
+	// even after the configured direction-settle pass: $0334 stayed $00 while
+	// every subsequent write passed. Consume that one unreliable transaction
+	// at a disposable RAM byte, exactly as the later self-test already does,
+	// rather than duplicating an oracle or potentially side-effecting I/O write.
+	RAD_SPOKE( 0x02FE, 0xA6 );
 	for ( u32 i = 0; i < sizeof( patterns ); i++ )
 		RAD_SPOKE( (u16)( 0x0334 + i ), patterns[ i ] );
 	RAD_SPOKE( 0xD020, 0x06 );
-	m_Writes += sizeof( patterns ) + 1;
+	m_Writes += sizeof( patterns ) + 2;
 
 	u16 runStart = 0, runEnd = 0;
 	u16 bestStart = 0, bestEnd = 0;
 	u32 bestRunSamples = 0;
+	m_ReadTimingBestError = 0xFFFF;
+	m_ReadTimingBestErrorSample = firstSample;
+	m_ReadTimingRAMBestError = 0xFFFF;
+	m_ReadTimingRAMBestSample = firstSample;
+	m_ReadTimingRAMOnlyBestError = 0xFFFF;
+	m_ReadTimingRAMOnlyBestSample = firstSample;
+	for ( u32 i = 0; i < READ_TIMING_SCORE_COUNT; i++ )
+	{
+		m_ReadTimingErrors[ i ] = 0xFFFF;
+		m_ReadTimingRAMErrors[ i ] = 0xFFFF;
+		m_ReadTimingRAMOnlyErrors[ i ] = 0xFFFF;
+		m_ReadTimingMixedVICErrors[ i ] = 0xFFFF;
+		m_ReadTimingIsolatedVICErrors[ i ] = 0xFFFF;
+		m_ReadTimingMixedVICDistinct[ i ] = 0;
+		m_ReadTimingMixedVICDominantValue[ i ] = 0;
+		m_ReadTimingMixedVICDominantCount[ i ] = 0;
+		m_ReadTimingIsolatedVICDistinct[ i ] = 0;
+		m_ReadTimingIsolatedVICDominantValue[ i ] = 0;
+		m_ReadTimingIsolatedVICDominantCount[ i ] = 0;
+		for ( u32 p = 0; p < sizeof( patterns ); p++ )
+		{
+			m_ReadTimingMixedRAMPositionErrors[ i ][ p ] = 0;
+			m_ReadTimingMixedRAMAddressErrors[ i ][ p ] = 0;
+		}
+	}
 
 	for ( u16 sample = firstSample; sample <= lastSample; sample += sampleStep )
 	{
 		busTiming.WAIT_CYCLE_READ = sample;
 		busTiming.WAIT_CYCLE_READ2 = (u16)( sample + 20 );
 
-		u32 errors = 0;
-		for ( u32 r = 0; r < repetitions; r++ )
+		const u32 scoreIndex = ( sample - firstSample ) / sampleStep;
+		u32 ramErrors = 0, mixedVICErrors = 0;
+		for ( u32 r = 0; r < READ_TIMING_REPETITIONS; r++ )
+		{
+			// Two complete rotations across twelve repetitions distinguish a
+			// first-position turnaround error from a weak physical address.
+			for ( u32 position = 0; position < sizeof( patterns ); position++ )
+			{
+				const u32 addressIndex = ( r + position ) % sizeof( patterns );
+				u8 v;
+				RAD_SPEEK( (u16)( 0x0334 + addressIndex ), v );
+				if ( v != patterns[ addressIndex ] )
+				{
+					ramErrors++;
+					m_ReadTimingMixedRAMPositionErrors
+						[ scoreIndex ][ position ]++;
+					m_ReadTimingMixedRAMAddressErrors
+						[ scoreIndex ][ addressIndex ]++;
+				}
+			}
+
+			u8 border;
+			RAD_SPEEK( 0xD020, border );
+			m_ReadTimingMixedVICActual[ scoreIndex ][ r ] = border;
+			if ( ( border & 0x0F ) != 0x06 ) mixedVICErrors++;
+		}
+
+		// The mixed loop changes from DRAM to VIC once per repetition. Prime with
+		// an unscored VIC read, then measure a VIC-only chain at the same sample
+		// point. This is observation only and cannot affect timing selection.
+		u8 isolatedPrime;
+		RAD_SPEEK( 0xD020, isolatedPrime );
+		(void)isolatedPrime;
+		u32 isolatedVICErrors = 0;
+		for ( u32 r = 0; r < READ_TIMING_REPETITIONS; r++ )
+		{
+			u8 border;
+			RAD_SPEEK( 0xD020, border );
+			m_ReadTimingIsolatedVICActual[ scoreIndex ][ r ] = border;
+			if ( ( border & 0x0F ) != 0x06 ) isolatedVICErrors++;
+		}
+
+		// Absorb the VIC-to-RAM transition in an unscored read, then measure a
+		// RAM-only chain. This curve is observation-only: production selection
+		// below deliberately continues to use the original mixed score.
+		u8 ramOnlyPrime;
+		RAD_SPEEK( 0x0334, ramOnlyPrime );
+		(void)ramOnlyPrime;
+		u32 ramOnlyErrors = 0;
+		for ( u32 r = 0; r < READ_TIMING_REPETITIONS; r++ )
 		{
 			for ( u32 i = 0; i < sizeof( patterns ); i++ )
 			{
 				u8 v;
 				RAD_SPEEK( (u16)( 0x0334 + i ), v );
-				if ( v != patterns[ i ] ) errors++;
+				if ( v != patterns[ i ] ) ramOnlyErrors++;
 			}
-
-			u8 border;
-		RAD_SPEEK( 0xD020, border );
-		if ( ( border & 0x0F ) != 0x06 ) errors++;
 		}
-		m_Reads += repetitions * ( sizeof( patterns ) + 1 );
+		m_Reads += READ_TIMING_REPETITIONS * ( sizeof( patterns ) * 2 + 2 ) + 2;
+		const u32 errors = ramErrors + mixedVICErrors;
+		if ( scoreIndex < READ_TIMING_SCORE_COUNT )
+		{
+			m_ReadTimingErrors[ scoreIndex ] = (u16)errors;
+			m_ReadTimingRAMErrors[ scoreIndex ] = (u16)ramErrors;
+			m_ReadTimingRAMOnlyErrors[ scoreIndex ] = (u16)ramOnlyErrors;
+			m_ReadTimingMixedVICErrors[ scoreIndex ] = (u16)mixedVICErrors;
+			m_ReadTimingIsolatedVICErrors[ scoreIndex ] = (u16)isolatedVICErrors;
+			summarizeReadTimingValues(
+				m_ReadTimingMixedVICActual[ scoreIndex ], READ_TIMING_REPETITIONS,
+				m_ReadTimingMixedVICDistinct[ scoreIndex ],
+				m_ReadTimingMixedVICDominantValue[ scoreIndex ],
+				m_ReadTimingMixedVICDominantCount[ scoreIndex ] );
+			summarizeReadTimingValues(
+				m_ReadTimingIsolatedVICActual[ scoreIndex ], READ_TIMING_REPETITIONS,
+				m_ReadTimingIsolatedVICDistinct[ scoreIndex ],
+				m_ReadTimingIsolatedVICDominantValue[ scoreIndex ],
+				m_ReadTimingIsolatedVICDominantCount[ scoreIndex ] );
+		}
+		if ( errors < m_ReadTimingBestError )
+		{
+			m_ReadTimingBestError = (u16)errors;
+			m_ReadTimingBestErrorSample = sample;
+		}
+		if ( ramErrors < m_ReadTimingRAMBestError )
+		{
+			m_ReadTimingRAMBestError = (u16)ramErrors;
+			m_ReadTimingRAMBestSample = sample;
+		}
+		if ( ramOnlyErrors < m_ReadTimingRAMOnlyBestError )
+		{
+			m_ReadTimingRAMOnlyBestError = (u16)ramOnlyErrors;
+			m_ReadTimingRAMOnlyBestSample = sample;
+		}
 
 		if ( errors == 0 )
 		{
@@ -604,11 +1583,88 @@ void CRADBus::calibrateReadTiming()
 		        (unsigned)configured );
 	}
 
+	const u32 ramBestIndex =
+		( m_ReadTimingRAMBestSample - firstSample ) / sampleStep;
+	RADLOG( "    read observe: mixed RAM best %u/%u, RAM-only %u/%u, mixed VIC %u, isolated VIC %u",
+	        (unsigned)m_ReadTimingRAMBestSample,
+	        (unsigned)m_ReadTimingRAMBestError,
+	        (unsigned)m_ReadTimingRAMOnlyBestSample,
+	        (unsigned)m_ReadTimingRAMOnlyBestError,
+	        (unsigned)m_ReadTimingMixedVICErrors[ ramBestIndex ],
+	        (unsigned)m_ReadTimingIsolatedVICErrors[ ramBestIndex ] );
+
 	// Return the border to the normal C64 power-on colour. The boot ROM will
 	// shortly initialise the VIC itself, but leaving diagnostics unobtrusive is
 	// useful when acquisition later fails for an unrelated reason.
 	RAD_SPOKE( 0xD020, 0x0E );
 	m_Writes++;
+}
+
+bool CRADBus::verifyC64CIA2DDRA( u8 expected )
+{
+	// A successful ordinary-read calibration gives us an eye rather than one
+	// lucky point. Verify the CIA at its start, selected midpoint and end. If no
+	// eye was established, leave the higher-level shadow unknown: accepting one
+	// configured-point read would recreate the residue/RMW failure this guard is
+	// intended to remove.
+	if ( m_ReadTimingStart == 0 || m_ReadTimingEnd < m_ReadTimingStart )
+	{
+		RADLOG( "    CIA2 DDRA seed: NOT VERIFIED (no calibrated read window)" );
+		return false;
+	}
+
+	u16 points[ 3 ];
+	u32 pointCount = 0;
+	const u16 candidates[ 3 ] = {
+		m_ReadTimingStart, m_ReadTimingSelected, m_ReadTimingEnd
+	};
+	for ( u32 i = 0; i < 3; i++ )
+	{
+		bool duplicate = false;
+		for ( u32 j = 0; j < pointCount; j++ )
+			if ( points[ j ] == candidates[ i ] ) duplicate = true;
+		if ( !duplicate ) points[ pointCount++ ] = candidates[ i ];
+	}
+	if ( pointCount < 2 )
+	{
+		RADLOG( "    CIA2 DDRA seed: NOT VERIFIED (read window has only one sample point)" );
+		return false;
+	}
+
+	const u16 savedRead = (u16)busTiming.WAIT_CYCLE_READ;
+	const u16 savedRead2 = (u16)busTiming.WAIT_CYCLE_READ2;
+	u8 observed[ 3 ][ 3 ];
+	bool verified = true;
+	for ( u32 p = 0; p < pointCount; p++ )
+	{
+		busTiming.WAIT_CYCLE_READ = points[ p ];
+		busTiming.WAIT_CYCLE_READ2 = (u16)( points[ p ] + 20 );
+
+		// The first physical reads after write->read turnaround are known to be
+		// unreliable on buffered C128 expansion ports. Discard two complete
+		// transfers at every timing group before any sample can vote.
+		for ( u32 prime = 0; prime < 2; prime++ )
+		{
+			u8 ignored;
+			RAD_SPEEK( 0xDD02, ignored );
+		}
+		for ( u32 sample = 0; sample < 3; sample++ )
+		{
+			RAD_SPEEK( 0xDD02, observed[ p ][ sample ] );
+			if ( observed[ p ][ sample ] != expected ) verified = false;
+		}
+	}
+	m_Reads += pointCount * 5;
+	busTiming.WAIT_CYCLE_READ = savedRead;
+	busTiming.WAIT_CYCLE_READ2 = savedRead2;
+
+	for ( u32 p = 0; p < pointCount; p++ )
+		RADLOG( "    CIA2 DDRA @%u: %02X %02X %02X",
+		        (unsigned)points[ p ], (unsigned)observed[ p ][ 0 ],
+		        (unsigned)observed[ p ][ 1 ], (unsigned)observed[ p ][ 2 ] );
+	RADLOG( "    CIA2 DDRA seed $%02X: %s",
+	        (unsigned)expected, verified ? "VERIFIED" : "NOT VERIFIED; shadow left unknown" );
+	return verified;
 }
 
 void CRADBus::calibrateWriteTiming()
@@ -715,6 +1771,336 @@ void CRADBus::calibrateWriteTiming()
 	        (unsigned)m_WriteTimingConfiguredAddr, (unsigned)m_WriteTimingConfiguredData,
 	        (unsigned)m_WriteTimingPassingPoints, (unsigned)m_WriteTimingSelectedAddr,
 	        (unsigned)m_WriteTimingSelectedData );
+}
+
+void CRADBus::calibrateSIDReadTiming()
+{
+	static const u16 firstSample = 300;
+	static const u16 lastSample  = 675;
+	static const u16 sampleStep  = 5;
+	static const u32 samplesPerPoint = 64;
+	static const u32 minimumDistinct = 12;
+	static const u32 maximumDominant = 24;
+	static const u32 minimumRampSteps = 40;
+
+	const u16 configured = (u16)busTiming.WAIT_CYCLE_READ_SID;
+	m_SIDTimingConfigured = configured;
+	m_SIDTimingStart = m_SIDTimingEnd = 0;
+	m_SIDTimingSelected = configured;
+	m_SIDTimingDistinct = m_SIDTimingDominant = 0;
+	m_SIDTimingRamp = 0;
+	m_SIDTimingEdge = 0;
+	m_SIDPhysicalReliable = false;
+	sidReadAtFallingEdge = false;
+
+	// Reset voice 3's oscillator, select the maximum frequency, then release
+	// it into the sawtooth waveform. OSC3 ($D41B) is the only useful physical SID
+	// read oracle: a valid sample produces many values, while a missed sample
+	// on the expansion bus is overwhelmingly one open-bus value (typically FC).
+	// This is the same oscillator sequence used by upstream RAD detectSID().
+	// Noise is unsuitable here: its LFSR clocks from oscillator bit 19 and thus
+	// changes only every several reads even at $FFFF, causing a valid window to
+	// fail an entropy test.
+	RAD_SPOKE( 0xD412, 0xFF );
+	RAD_SPOKE( 0xD40E, 0xFF );
+	RAD_SPOKE( 0xD40F, 0xFF );
+	RAD_SPOKE( 0xD412, 0x20 );
+	m_Writes += 4;
+
+	// Give the LFSR time to advance after TEST is released. These discarded
+	// reads also pay the initial write-to-read bus turnaround before scoring.
+	busTiming.WAIT_CYCLE_READ_SID = configured;
+	for ( u32 i = 0; i < 32; i++ )
+	{
+		u8 ignored;
+		RAD_SPEEK( 0xD41B, ignored );
+	}
+	m_Reads += 32;
+
+	u16 runStart = 0, runEnd = 0;
+	u16 bestStart = 0, bestEnd = 0;
+	u32 bestRunSamples = 0;
+	u16 bestObservedSample = firstSample;
+	u32 bestObservedDistinct = 0, bestObservedDominant = samplesPerPoint;
+	u32 bestObservedRamp = 0;
+
+	for ( u16 sample = firstSample; sample <= lastSample; sample += sampleStep )
+	{
+		busTiming.WAIT_CYCLE_READ_SID = sample;
+		u32 distinct = 255, dominant = 0, ramp = 255;
+		for ( u32 pass = 0; pass < 2; pass++ )
+		{
+			u8 counts[ 256 ];
+			for ( u32 i = 0; i < sizeof counts; i++ ) counts[ i ] = 0;
+			u32 blockDistinct = 0, blockDominant = 0, blockRamp = 0;
+			u8 previous = 0;
+			for ( u32 i = 0; i < samplesPerPoint; i++ )
+			{
+				u8 value;
+				RAD_SPEEK( 0xD41B, value );
+				if ( counts[ value ]++ == 0 ) blockDistinct++;
+				if ( counts[ value ] > blockDominant )
+					blockDominant = counts[ value ];
+				if ( i )
+				{
+					const u8 delta = (u8)( value - previous );
+					if ( delta >= 1 && delta <= 16 ) blockRamp++;
+				}
+				previous = value;
+			}
+			if ( blockDistinct < distinct ) distinct = blockDistinct;
+			if ( blockDominant > dominant ) dominant = blockDominant;
+			if ( blockRamp < ramp ) ramp = blockRamp;
+		}
+		m_Reads += samplesPerPoint * 2;
+		if ( ramp > bestObservedRamp
+		     || ( ramp == bestObservedRamp && distinct > bestObservedDistinct )
+		     || ( ramp == bestObservedRamp && distinct == bestObservedDistinct
+		          && dominant < bestObservedDominant ) )
+		{
+			bestObservedSample = sample;
+			bestObservedDistinct = distinct;
+			bestObservedDominant = dominant;
+			bestObservedRamp = ramp;
+		}
+
+		const bool valid = distinct >= minimumDistinct
+		                && dominant <= maximumDominant
+		                && ramp >= minimumRampSteps;
+		if ( valid )
+		{
+			if ( runStart == 0 ) runStart = sample;
+			runEnd = sample;
+		}
+		else if ( runStart != 0 )
+		{
+			const u32 runSamples = ( runEnd - runStart ) / sampleStep + 1;
+			if ( runSamples > bestRunSamples )
+			{
+				bestRunSamples = runSamples;
+				bestStart = runStart;
+				bestEnd = runEnd;
+			}
+			runStart = runEnd = 0;
+		}
+	}
+
+	if ( runStart != 0 )
+	{
+		const u32 runSamples = ( runEnd - runStart ) / sampleStep + 1;
+		if ( runSamples > bestRunSamples )
+		{
+			bestRunSamples = runSamples;
+			bestStart = runStart;
+			bestEnd = runEnd;
+		}
+	}
+
+	if ( bestRunSamples )
+	{
+		const u16 chosen = (u16)( bestStart
+		                 + ( ( ( bestEnd - bestStart ) / sampleStep ) / 2 ) * sampleStep );
+		busTiming.WAIT_CYCLE_READ_SID = chosen;
+		m_SIDTimingStart = bestStart;
+		m_SIDTimingEnd = bestEnd;
+		m_SIDTimingSelected = chosen;
+		m_SIDTimingBestSample = chosen;
+		m_SIDPhysicalReliable = true;
+
+		// Record a fresh score at the selected midpoint for the persistent log.
+		u8 counts[ 256 ];
+		for ( u32 i = 0; i < sizeof counts; i++ ) counts[ i ] = 0;
+		u8 previous = 0;
+		for ( u32 i = 0; i < samplesPerPoint; i++ )
+		{
+			u8 value;
+			RAD_SPEEK( 0xD41B, value );
+			if ( counts[ value ]++ == 0 ) m_SIDTimingDistinct++;
+			if ( counts[ value ] > m_SIDTimingDominant )
+				m_SIDTimingDominant = counts[ value ];
+			if ( i )
+			{
+				const u8 delta = (u8)( value - previous );
+				if ( delta >= 1 && delta <= 16 ) m_SIDTimingRamp++;
+			}
+			previous = value;
+		}
+		m_Reads += samplesPerPoint;
+		RADLOG( "    SID timing: configured %u, saw window %u..%u, selected %u, distinct/dominant/ramp=%u/%u/%u",
+		        (unsigned)configured, (unsigned)bestStart, (unsigned)bestEnd,
+		        (unsigned)chosen, (unsigned)m_SIDTimingDistinct,
+		        (unsigned)m_SIDTimingDominant, (unsigned)m_SIDTimingRamp );
+	}
+	else
+	{
+		// Numeric offsets all missed. Validate the signal at the event where a
+		// physical 6510 samples it: PHI2's falling edge. This is selected only
+		// when the same entropy/dominance oracle passes there.
+		sidReadAtFallingEdge = true;
+		u32 edgeDistinct = 255, edgeDominant = 0, edgeRamp = 255;
+		bool edgeValid = true;
+		for ( u32 pass = 0; pass < 2; pass++ )
+		{
+			u8 counts[ 256 ];
+			for ( u32 i = 0; i < sizeof counts; i++ ) counts[ i ] = 0;
+			u32 distinct = 0, dominant = 0, ramp = 0;
+			u8 previous = 0;
+			for ( u32 i = 0; i < samplesPerPoint; i++ )
+			{
+				u8 value;
+				RAD_SPEEK( 0xD41B, value );
+				if ( counts[ value ]++ == 0 ) distinct++;
+				if ( counts[ value ] > dominant ) dominant = counts[ value ];
+				if ( i )
+				{
+					const u8 delta = (u8)( value - previous );
+					if ( delta >= 1 && delta <= 16 ) ramp++;
+				}
+				previous = value;
+			}
+			m_Reads += samplesPerPoint;
+			if ( distinct < edgeDistinct ) edgeDistinct = distinct;
+			if ( dominant > edgeDominant ) edgeDominant = dominant;
+			if ( ramp < edgeRamp ) edgeRamp = ramp;
+			if ( distinct < minimumDistinct || dominant > maximumDominant
+			     || ramp < minimumRampSteps ) edgeValid = false;
+		}
+		if ( edgeValid )
+		{
+			m_SIDTimingEdge = 1;
+			m_SIDPhysicalReliable = true;
+			m_SIDTimingBestSample = 0;
+			m_SIDTimingDistinct = (u8)edgeDistinct;
+			m_SIDTimingDominant = (u8)edgeDominant;
+			m_SIDTimingRamp = (u8)edgeRamp;
+			RADLOG( "    SID timing: numeric scan missed; selected last PHI2-high sample distinct/dominant/ramp=%u/%u/%u",
+			        (unsigned)edgeDistinct, (unsigned)edgeDominant,
+			        (unsigned)edgeRamp );
+		}
+		else
+		{
+			sidReadAtFallingEdge = false;
+			busTiming.WAIT_CYCLE_READ_SID = configured;
+			m_SIDTimingBestSample = bestObservedSample;
+			m_SIDTimingDistinct = (u8)bestObservedDistinct;
+			m_SIDTimingDominant = (u8)bestObservedDominant;
+			m_SIDTimingRamp = (u8)bestObservedRamp;
+			RADLOG( "    SID timing: no numeric or edge saw window; retaining %u; best %u distinct/dominant/ramp=%u/%u/%u edge=%u/%u/%u",
+			        (unsigned)configured, (unsigned)bestObservedSample,
+			        (unsigned)bestObservedDistinct, (unsigned)bestObservedDominant,
+			        (unsigned)bestObservedRamp, (unsigned)edgeDistinct,
+			        (unsigned)edgeDominant, (unsigned)edgeRamp );
+		}
+	}
+
+	// Leave the physical SID quiet for the boot ROM, which will initialise it
+	// normally. No readable register state existed to preserve at takeover.
+	RAD_SPOKE( 0xD412, 0x08 );
+	RAD_SPOKE( 0xD40E, 0x00 );
+	RAD_SPOKE( 0xD40F, 0x00 );
+	RAD_SPOKE( 0xD412, 0x00 );
+	m_Writes += 4;
+}
+
+void CRADBus::sidModelAdvance()
+{
+	const u64 now = hostCycles();
+	if ( m_SIDModelLastHost == 0 )
+	{
+		m_SIDModelLastHost = now;
+		return;
+	}
+
+	const u64 elapsed = now - m_SIDModelLastHost;
+	m_SIDModelLastHost = now;
+	// The oscillator is clocked by the machine's PHI2, independently of the
+	// accelerated CPU. Keep the fractional conversion in ARM-Hz units so a
+	// tight polling loop neither freezes nor artificially races the model.
+	const u32 sidHz = m_Signals.video == VIDEO_PAL ? 985248u : 1022727u;
+	const u64 scaled = elapsed * sidHz + m_SIDModelRemainder;
+	const u64 sidClocks = scaled / SCPU_ARM_CLOCK_HZ;
+	m_SIDModelRemainder = scaled % SCPU_ARM_CLOCK_HZ;
+	if ( !( m_SIDModelControl & 0x08 ) )
+		m_SIDModelPhase = (u32)( ( m_SIDModelPhase
+		                   + sidClocks * m_SIDModelFreq ) & 0xFFFFFFu );
+}
+
+void CRADBus::sidObserveWrite( u16 addr, u8 value )
+{
+	if ( addr != 0xD40E && addr != 0xD40F && addr != 0xD412 )
+		return;
+
+	sidModelAdvance();
+	if ( addr == 0xD40E )
+		m_SIDModelFreq = (u16)( ( m_SIDModelFreq & 0xFF00 ) | value );
+	else if ( addr == 0xD40F )
+		m_SIDModelFreq = (u16)( ( m_SIDModelFreq & 0x00FF )
+		                           | ( (u16)value << 8 ) );
+	else
+	{
+		m_SIDModelControl = value;
+		if ( value & 0x08 ) m_SIDModelPhase = 0;
+	}
+}
+
+u8 CRADBus::sidReadOSC3Model()
+{
+	sidModelAdvance();
+	if ( ( m_SIDModelControl & 0x08 ) || !( m_SIDModelControl & 0xF0 ) )
+		return 0;
+	// A real SID applies the selected waveform (and has revision-dependent
+	// combined-waveform behaviour). The fallback's contract is narrower: keep
+	// the voice-3 oscillator free-running and deterministic when the expansion
+	// bus cannot sample the real register. Returning the accumulator's top byte
+	// preserves phase/frequency and visits every value, which is what software
+	// such as Metal Dust uses OSC3 for.
+	return (u8)( m_SIDModelPhase >> 16 );
+}
+
+u8 CRADBus::sidReadPOTFiltered( u16 addr )
+{
+	static const u32 samples = 17;
+	u8 counts[ 256 ];
+	for ( u32 i = 0; i < sizeof counts; i++ ) counts[ i ] = 0;
+
+	for ( u32 i = 0; i < samples; i++ )
+	{
+		u8 value;
+		RAD_SPEEK( addr, value );
+		counts[ value ]++;
+	}
+	// CRADBus::read accounts for the logical access; retain the physical bus
+	// statistic for the sixteen additional observations made by the filter.
+	m_Reads += samples - 1;
+
+	const u32 pot = addr - 0xD419;
+	const u8 previous = m_SIDPotFiltered[ pot ];
+	u32 bestCount = 0;
+	u8 best = previous;
+	for ( u32 value = 0; value < 256; value++ )
+	{
+		if ( counts[ value ] > bestCount )
+		{
+			bestCount = counts[ value ];
+			best = (u8)value;
+		}
+		else if ( counts[ value ] == bestCount && bestCount != 0 )
+		{
+			// At a near-even valid/residue split, prefer continuity. The 1351's
+			// POT value moves gradually; open-bus values do not.
+			const u32 oldDistance = best > previous ? best - previous
+			                                      : previous - best;
+			const u32 newDistance = value > previous ? value - previous
+			                                       : previous - value;
+			if ( newDistance < oldDistance ) best = (u8)value;
+		}
+	}
+
+	// Fewer than three repeats means there was no stable POT value in this
+	// group. Hold the last coordinate rather than converting transition noise
+	// into a violent mouse jump.
+	if ( bestCount >= 3 ) m_SIDPotFiltered[ pot ] = best;
+	return m_SIDPotFiltered[ pot ];
 }
 
 void CRADBus::release()
@@ -2237,6 +3623,1497 @@ bool CRADBus::selfTest()
 	return ( addrErr + wrErr + burstErr ) == 0;
 }
 
+bool CRADBus::runAccessSentinelDiagnostic()
+{
+	if ( !m_Acquired || m_TrafficHalted
+	     || m_Signals.machine != MACHINE_C64 )
+		return false;
+
+	m_AccessSentinelRan = true;
+	m_AccessSentinelTrafficCount = 1u << 18;
+	static const u32 trafficRatePerSecond = 16000;
+	const u64 trafficInterval = SCPU_ARM_CLOCK_HZ / trafficRatePerSecond;
+
+	// Make completion/progress visible without touching the sentinel range.
+	// Every write arm then repeats this exact value, so its intentional effect
+	// is a no-op at the VIC register.
+	busDiagRawWrite( 0xD020, 0x06 );
+	busDiagRawWrite( 0xD020, 0x06 );
+	m_Writes += 2;
+
+	for ( u32 arm = 0; arm < 3; arm++ )
+	{
+		const u8 salt = (u8)( 0x35u + arm * 0x49u );
+		accessSentinelSeed( salt );
+		m_Writes += ACCESS_SENTINEL_LENGTH;
+
+		u16 ignoredAddr;
+		u8 ignoredExpected, ignoredActual;
+		m_AccessSentinelBaselineErrors[ arm ][ 0 ] =
+			accessSentinelCapture( salt, accessSentinelMismatch[ 0 ],
+			                       ignoredAddr, ignoredExpected, ignoredActual );
+		m_AccessSentinelBaselineErrors[ arm ][ 1 ] =
+			accessSentinelCapture( salt, accessSentinelMismatch[ 1 ],
+			                       ignoredAddr, ignoredExpected, ignoredActual );
+
+		const u64 started = hostCycles();
+		u64 deadline = started + trafficInterval;
+		for ( u32 access = 0; access < m_AccessSentinelTrafficCount; access++ )
+		{
+			while ( hostCycles() < deadline ) asm volatile( "nop" );
+			if ( arm == 1 )
+				(void)busDiagRawRead( 0xD020 );
+			else if ( arm == 2 )
+				busDiagRawWrite( 0xD020, 0x06 );
+			deadline += trafficInterval;
+		}
+		m_AccessSentinelElapsedUsec[ arm ] =
+			(u32)( ( hostCycles() - started )
+			       / ( SCPU_ARM_CLOCK_HZ / 1000000u ) );
+
+		m_AccessSentinelExposureErrors[ arm ][ 0 ] =
+			accessSentinelCapture(
+				salt, accessSentinelMismatch[ 0 ],
+				m_AccessSentinelFirstAddr[ arm ][ 0 ],
+				m_AccessSentinelFirstExpected[ arm ][ 0 ],
+				m_AccessSentinelFirstActual[ arm ][ 0 ] );
+
+		accessSentinelCompare(
+			accessSentinelMismatch[ 1 ], accessSentinelMismatch[ 0 ],
+			m_AccessSentinelBaselineRetainedErrors[ arm ],
+			m_AccessSentinelArmAddedErrors[ arm ],
+			m_AccessSentinelArmRemovedErrors[ arm ] );
+
+		m_AccessSentinelExposureErrors[ arm ][ 1 ] =
+			accessSentinelCapture(
+				salt, accessSentinelMismatch[ 1 ],
+				m_AccessSentinelFirstAddr[ arm ][ 1 ],
+				m_AccessSentinelFirstExpected[ arm ][ 1 ],
+				m_AccessSentinelFirstActual[ arm ][ 1 ] );
+		accessSentinelCompare(
+			accessSentinelMismatch[ 0 ], accessSentinelMismatch[ 1 ],
+			m_AccessSentinelSameErrors[ arm ],
+			m_AccessSentinelNewErrors[ arm ],
+			m_AccessSentinelClearedErrors[ arm ] );
+
+		m_Reads += ACCESS_SENTINEL_LENGTH * 4u + 8u;
+		if ( arm == 1 ) m_Reads += m_AccessSentinelTrafficCount;
+		if ( arm == 2 ) m_Writes += m_AccessSentinelTrafficCount;
+	}
+	return true;
+}
+
+bool CRADBus::runDisplaySentinelDiagnostic()
+{
+	if ( !m_Acquired || m_TrafficHalted
+	     || m_Signals.machine != MACHINE_C64 )
+		return false;
+
+	m_DisplaySentinelRan = true;
+	static const u8 displayOn[ 9 ] = { 1, 1, 1, 1, 1, 1, 1, 0, 0 };
+	static const u8 operation[ 9 ] = { 0, 1, 1, 1, 2, 2, 2, 1, 2 };
+	static const u32 rate[ 9 ] =
+		{ 0, 4000, 16000, 64000, 4000, 16000, 64000, 64000, 64000 };
+	static const u8 border[ 9 ] = { 1, 5, 7, 2, 3, 4, 8, 13, 10 };
+	static const u32 exposureSeconds = 8;
+
+	for ( u32 arm = 0; arm < 9; arm++ )
+	{
+		m_DisplaySentinelDisplayOn[ arm ] = displayOn[ arm ];
+		m_DisplaySentinelOperation[ arm ] = operation[ arm ];
+		m_DisplaySentinelRate[ arm ] = rate[ arm ];
+		m_DisplaySentinelTrafficCount[ arm ] = rate[ arm ] * exposureSeconds;
+
+		// Blanked setup is repeated for every arm, so no state from the previous
+		// exposure can leak into the next baseline.
+		displaySentinelSetMode( false, 0 );
+		displaySentinelSeed();
+		m_Writes += 16u + DISPLAY_SENTINEL_LENGTH;
+
+		u16 ignoredAddr;
+		u8 ignoredExpected, ignoredActual;
+		m_DisplaySentinelBaselineErrors[ arm ][ 0 ] =
+			displaySentinelCapture( displaySentinelMismatch[ 0 ],
+			                        ignoredAddr, ignoredExpected, ignoredActual );
+		m_DisplaySentinelBaselineErrors[ arm ][ 1 ] =
+			displaySentinelCapture( displaySentinelMismatch[ 1 ],
+			                        ignoredAddr, ignoredExpected, ignoredActual );
+
+		// A distinct border identifies every exposure in a video. D011 is last:
+		// for display-on arms, the bitmap becomes fetch-active only after all
+		// other setup traffic has completed.
+		busDiagRawWrite( 0xD020, border[ arm ] );
+		busDiagRawWrite( 0xD020, border[ arm ] );
+		displaySentinelSetDEN( displayOn[ arm ] != 0 );
+		m_Writes += 4;
+
+		const u64 started = hostCycles();
+		if ( rate[ arm ] == 0 )
+		{
+			const u64 stop = started
+			               + (u64)exposureSeconds * SCPU_ARM_CLOCK_HZ;
+			while ( hostCycles() < stop ) asm volatile( "nop" );
+		}
+		else
+		{
+			const u64 interval = SCPU_ARM_CLOCK_HZ / rate[ arm ];
+			u64 deadline = started + interval;
+			for ( u32 access = 0;
+			      access < m_DisplaySentinelTrafficCount[ arm ]; access++ )
+			{
+				while ( hostCycles() < deadline ) asm volatile( "nop" );
+				if ( operation[ arm ] == 1 )
+					(void)busDiagRawRead( 0xD020 );
+				else
+					busDiagRawWrite( 0xD020, border[ arm ] );
+				deadline += interval;
+			}
+		}
+		m_DisplaySentinelElapsedUsec[ arm ] =
+			(u32)( ( hostCycles() - started )
+			       / ( SCPU_ARM_CLOCK_HZ / 1000000u ) );
+
+		// Blank before the first oracle read. The two idempotent D011 writes are
+		// counted as part of the exposure protocol and are identical in every arm.
+		displaySentinelSetDEN( false );
+		m_Writes += 2;
+		m_DisplaySentinelExposureErrors[ arm ][ 0 ] =
+			displaySentinelCapture(
+				displaySentinelMismatch[ 0 ],
+				m_DisplaySentinelFirstAddr[ arm ][ 0 ],
+				m_DisplaySentinelFirstExpected[ arm ][ 0 ],
+				m_DisplaySentinelFirstActual[ arm ][ 0 ] );
+		displaySentinelCompare(
+			displaySentinelMismatch[ 1 ], displaySentinelMismatch[ 0 ],
+			m_DisplaySentinelBaselineRetainedErrors[ arm ],
+			m_DisplaySentinelArmAddedErrors[ arm ],
+			m_DisplaySentinelArmRemovedErrors[ arm ] );
+
+		m_DisplaySentinelExposureErrors[ arm ][ 1 ] =
+			displaySentinelCapture(
+				displaySentinelMismatch[ 1 ],
+				m_DisplaySentinelFirstAddr[ arm ][ 1 ],
+				m_DisplaySentinelFirstExpected[ arm ][ 1 ],
+				m_DisplaySentinelFirstActual[ arm ][ 1 ] );
+		displaySentinelCompare(
+			displaySentinelMismatch[ 0 ], displaySentinelMismatch[ 1 ],
+			m_DisplaySentinelVerifySameErrors[ arm ][ 0 ],
+			m_DisplaySentinelVerifyNewErrors[ arm ][ 0 ],
+			m_DisplaySentinelVerifyClearedErrors[ arm ][ 0 ] );
+
+		m_DisplaySentinelExposureErrors[ arm ][ 2 ] =
+			displaySentinelCapture(
+				displaySentinelMismatch[ 0 ],
+				m_DisplaySentinelFirstAddr[ arm ][ 2 ],
+				m_DisplaySentinelFirstExpected[ arm ][ 2 ],
+				m_DisplaySentinelFirstActual[ arm ][ 2 ] );
+		displaySentinelCompare(
+			displaySentinelMismatch[ 1 ], displaySentinelMismatch[ 0 ],
+			m_DisplaySentinelVerifySameErrors[ arm ][ 1 ],
+			m_DisplaySentinelVerifyNewErrors[ arm ][ 1 ],
+			m_DisplaySentinelVerifyClearedErrors[ arm ][ 1 ] );
+
+		m_Reads += DISPLAY_SENTINEL_LENGTH * 5u + 10u;
+		if ( operation[ arm ] == 1 )
+			m_Reads += m_DisplaySentinelTrafficCount[ arm ];
+		else if ( operation[ arm ] == 2 )
+			m_Writes += m_DisplaySentinelTrafficCount[ arm ];
+	}
+	return true;
+}
+
+bool CRADBus::runDisplayAddressDiagnostic()
+{
+	if ( !m_Acquired || m_TrafficHalted
+	     || m_Signals.machine != MACHINE_C64 )
+		return false;
+
+	m_DisplayAddressRan = true;
+	static const u16 target = 0x2078;
+	static const u32 immediateTrials = 256;
+
+	// First answer Claude's decisive question at the exact K222 address. Each
+	// iteration writes a changing value and records the first three physical
+	// target reads. Read 0 is intentionally the immediate next transaction;
+	// reads 1 and 2 reveal any turnaround depth rather than hiding it behind a
+	// sacrificial read policy. One- and two-write styles are kept separate.
+	for ( u32 mode = 0; mode < 2; mode++ )
+	{
+		displayAddressSetMode( mode != 0, mode ? 7 : 5 );
+		m_Writes += 16;
+		for ( u32 style = 0; style < 2; style++ )
+		{
+			for ( u32 trial = 0; trial < immediateTrials; trial++ )
+			{
+				const u8 expected =
+					(u8)( trial * 73u + mode * 0x31u + style * 0x57u + 0x35u );
+				busDiagRawWrite( target, expected );
+				if ( style != 0 ) busDiagRawWrite( target, expected );
+				u8 actual[ 3 ];
+				for ( u32 read = 0; read < 3; read++ )
+				{
+					actual[ read ] = busDiagRawRead( target );
+					if ( actual[ read ] != expected )
+						m_DisplayAddressImmediateErrors[ mode ][ style ][ read ]++;
+				}
+				if ( actual[ 2 ] != expected
+				     && m_DisplayAddressImmediateFirstTrial[ mode ][ style ] == 0 )
+				{
+					// Store trial+1 so zero remains the unambiguous "no failure" marker.
+					m_DisplayAddressImmediateFirstTrial[ mode ][ style ] =
+						(u16)( trial + 1u );
+					m_DisplayAddressImmediateFirstExpected[ mode ][ style ] = expected;
+					for ( u32 read = 0; read < 3; read++ )
+						m_DisplayAddressImmediateFirstActual[ mode ][ style ][ read ] =
+							actual[ read ];
+				}
+			}
+			m_Writes += immediateTrials * ( style ? 2u : 1u );
+			m_Reads += immediateTrials * 3u;
+		}
+	}
+
+	// Reproduce K222's bulk seed/capture under both D011 modes. The repeated
+	// seed is the direct A/B for a swallowed or marginal write. Preserve every
+	// mismatch bit plus fixed-address and run summaries.
+	for ( u32 mode = 0; mode < 2; mode++ )
+	{
+		for ( u32 style = 0; style < 2; style++ )
+		{
+			displayAddressSetMode( mode != 0, mode ? 4 : 3 );
+			displayAddressSeed( style ? 2u : 1u );
+			u16 ignoredAddr;
+			u8 ignoredExpected, ignoredActual;
+			(void)displaySentinelCapture(
+				displayAddressMismatch[ mode ][ style ],
+				ignoredAddr, ignoredExpected, ignoredActual );
+			displayAddressAnalyzeMap(
+				displayAddressMismatch[ mode ][ style ],
+				m_DisplayAddressMapErrors[ mode ][ style ],
+				m_DisplayAddressMapFirst[ mode ][ style ],
+				m_DisplayAddressMapLast[ mode ][ style ],
+				m_DisplayAddressMapAND[ mode ][ style ],
+				m_DisplayAddressMapOR[ mode ][ style ],
+				m_DisplayAddressMapRuns[ mode ][ style ],
+				m_DisplayAddressMapMaxRun[ mode ][ style ] );
+			m_Writes += 16u + DISPLAY_SENTINEL_LENGTH * ( style ? 2u : 1u );
+			m_Reads += DISPLAY_SENTINEL_LENGTH + 2u;
+		}
+	}
+
+	// If the third immediate read was reliable in all four arms, a temporal
+	// check is still required. Fresh double seeds make each rung independent;
+	// text versus bitmap mode is the only variable. The 0-us rung measures the
+	// ladder's own overhead, then the spacing grows to four seconds.
+	bool immediateClean = true;
+	for ( u32 mode = 0; mode < 2; mode++ )
+		for ( u32 style = 0; style < 2; style++ )
+			if ( m_DisplayAddressImmediateErrors[ mode ][ style ][ 2 ] != 0 )
+				immediateClean = false;
+
+	static const u32 delayUsec[ 9 ] =
+		{ 0, 100, 1000, 4000, 16000, 64000, 256000, 1000000, 4000000 };
+	if ( immediateClean )
+	{
+		m_DisplayAddressLadderRan = 1;
+		for ( u32 rung = 0; rung < 9; rung++ )
+			m_DisplayAddressDelayUsec[ rung ] = delayUsec[ rung ];
+		for ( u32 mode = 0; mode < 2; mode++ )
+		{
+			displayAddressSetMode( mode != 0, mode ? 8 : 13 );
+			m_Writes += 16;
+			for ( u32 rung = 0; rung < 9; rung++ )
+			{
+				const u8 expected =
+					(u8)( 0x55u + mode * 0x39u + rung * 0x1Du );
+				m_DisplayAddressLadderExpected[ mode ][ rung ] = expected;
+				busDiagRawWrite( target, expected );
+				busDiagRawWrite( target, expected );
+				for ( u32 read = 0; read < 3; read++ )
+					m_DisplayAddressLadderInitial[ mode ][ rung ][ read ] =
+						busDiagRawRead( target );
+				const u64 started = hostCycles();
+				const u64 duration =
+					(u64)delayUsec[ rung ] * ( SCPU_ARM_CLOCK_HZ / 1000000u );
+				while ( hostCycles() - started < duration ) asm volatile( "nop" );
+				m_DisplayAddressElapsedUsec[ mode ][ rung ] =
+					(u32)( ( hostCycles() - started )
+					       / ( SCPU_ARM_CLOCK_HZ / 1000000u ) );
+				for ( u32 read = 0; read < 3; read++ )
+					m_DisplayAddressLadderDelayed[ mode ][ rung ][ read ] =
+						busDiagRawRead( target );
+				m_Writes += 2;
+				m_Reads += 6;
+			}
+		}
+	}
+	return true;
+}
+
+bool CRADBus::runDisplayRowDiagnostic()
+{
+	if ( !m_Acquired || m_TrafficHalted
+	     || m_Signals.machine != MACHINE_C64 )
+		return false;
+
+	m_DisplayRowRan = true;
+	// Eight single-write maps in a deliberately non-alternating permutation,
+	// followed by one genuine adjacent-repeat control in each mode. This keeps
+	// mode from being a synonym for execution order or starting raster phase.
+	static const u8 modes[ DISPLAY_ROW_ARM_COUNT ] =
+		{ 0, 1, 1, 0, 1, 0, 0, 1, 0, 1 };
+	static const u8 kinds[ DISPLAY_ROW_ARM_COUNT ] =
+		{ 0, 0, 0, 0, 0, 0, 0, 0, 1, 1 };
+	static const u8 borders[ DISPLAY_ROW_ARM_COUNT ] =
+		{ 5, 7, 2, 3, 4, 8, 13, 10, 14, 6 };
+
+	for ( u32 arm = 0; arm < DISPLAY_ROW_ARM_COUNT; arm++ )
+	{
+		const u8 salt = (u8)( 0x21u + arm * 0x17u );
+		m_DisplayRowMode[ arm ] = modes[ arm ];
+		m_DisplayRowKind[ arm ] = kinds[ arm ];
+		m_DisplayRowSalt[ arm ] = salt;
+		displayAddressSetMode( modes[ arm ] != 0, borders[ arm ] );
+		m_Writes += 16;
+
+		// Establish a verified complement at every address. These are true
+		// adjacent repeats, not two whole-array passes. Retry only the setup;
+		// the tested pass is always issued exactly once.
+		for ( u32 attempt = 0; attempt < 3; attempt++ )
+		{
+			m_DisplayRowPrefillAttempts[ arm ] = (u8)( attempt + 1u );
+			m_DisplayRowSeedUsec[ arm ][ 0 ] =
+				displayRowSeed( salt, true, true );
+			m_DisplayRowCaptureUsec[ arm ][ 0 ] =
+				displayRowCapture( salt, true,
+				                   displayRowPrefillMismatch[ arm ] );
+			displayAddressAnalyzeMap(
+				displayRowPrefillMismatch[ arm ],
+				m_DisplayRowErrors[ arm ][ 0 ],
+				m_DisplayRowFirst[ arm ][ 0 ],
+				m_DisplayRowLast[ arm ][ 0 ],
+				m_DisplayRowAND[ arm ][ 0 ],
+				m_DisplayRowOR[ arm ][ 0 ],
+				m_DisplayRowRuns[ arm ][ 0 ],
+				m_DisplayRowMaxRun[ arm ][ 0 ] );
+			m_Writes += DISPLAY_SENTINEL_LENGTH * 2u;
+			m_Reads += DISPLAY_SENTINEL_LENGTH + 2u;
+			if ( m_DisplayRowErrors[ arm ][ 0 ] == 0 ) break;
+		}
+
+		m_DisplayRowSeedUsec[ arm ][ 1 ] =
+			displayRowSeed( salt, false, kinds[ arm ] != 0 );
+		m_DisplayRowCaptureUsec[ arm ][ 1 ] =
+			displayRowCapture( salt, false, displayRowTestMismatch[ arm ] );
+		displayAddressAnalyzeMap(
+			displayRowTestMismatch[ arm ],
+			m_DisplayRowErrors[ arm ][ 1 ],
+			m_DisplayRowFirst[ arm ][ 1 ],
+			m_DisplayRowLast[ arm ][ 1 ],
+			m_DisplayRowAND[ arm ][ 1 ],
+			m_DisplayRowOR[ arm ][ 1 ],
+			m_DisplayRowRuns[ arm ][ 1 ],
+			m_DisplayRowMaxRun[ arm ][ 1 ] );
+		m_Writes += DISPLAY_SENTINEL_LENGTH * ( kinds[ arm ] ? 2u : 1u );
+		m_Reads += DISPLAY_SENTINEL_LENGTH + 2u;
+	}
+
+	// Independent retention arms. Each rung gets a fresh, verified, adjacent-
+	// repeat seed and one baseline capture. No physical access occurs between
+	// the end of that capture and its delayed capture, so an earlier rung's
+	// readback cannot refresh a later rung.
+	static const u32 delays[ DISPLAY_ROW_RETENTION_COUNT ] =
+		{ 500000, 1000000, 2000000, 4000000, 8000000, 16000000 };
+	for ( u32 rung = 0; rung < DISPLAY_ROW_RETENTION_COUNT; rung++ )
+	{
+		const u8 salt = (u8)( 0xB3u + rung * 0x25u );
+		m_DisplayRowRetentionSalt[ rung ] = salt;
+		m_DisplayRowRetentionDelayUsec[ rung ] = delays[ rung ];
+		displayAddressSetMode( true, (u8)( 1u + rung ) );
+		m_Writes += 16;
+
+		for ( u32 attempt = 0; attempt < 3; attempt++ )
+		{
+			m_DisplayRowRetentionAttempts[ rung ] = (u8)( attempt + 1u );
+			m_DisplayRowRetentionSeedUsec[ rung ] =
+				displayRowSeed( salt, false, true );
+			m_DisplayRowRetentionCaptureUsec[ rung ][ 0 ] =
+				displayRowCapture(
+					salt, false, displayRowRetentionBaselineMismatch[ rung ] );
+			displayAddressAnalyzeMap(
+				displayRowRetentionBaselineMismatch[ rung ],
+				m_DisplayRowRetentionErrors[ rung ][ 0 ],
+				m_DisplayRowRetentionFirst[ rung ][ 0 ],
+				m_DisplayRowRetentionLast[ rung ][ 0 ],
+				m_DisplayRowRetentionAND[ rung ][ 0 ],
+				m_DisplayRowRetentionOR[ rung ][ 0 ],
+				m_DisplayRowRetentionRuns[ rung ][ 0 ],
+				m_DisplayRowRetentionMaxRun[ rung ][ 0 ] );
+			m_Writes += DISPLAY_SENTINEL_LENGTH * 2u;
+			m_Reads += DISPLAY_SENTINEL_LENGTH + 2u;
+			if ( m_DisplayRowRetentionErrors[ rung ][ 0 ] == 0 ) break;
+		}
+
+		const u64 started = hostCycles();
+		const u64 duration =
+			(u64)delays[ rung ] * ( SCPU_ARM_CLOCK_HZ / 1000000u );
+		while ( hostCycles() - started < duration ) asm volatile( "nop" );
+		m_DisplayRowRetentionElapsedUsec[ rung ] =
+			(u32)( ( hostCycles() - started )
+			       / ( SCPU_ARM_CLOCK_HZ / 1000000u ) );
+		m_DisplayRowRetentionCaptureUsec[ rung ][ 1 ] =
+			displayRowCapture( salt, false,
+			                   displayRowRetentionMismatch[ rung ] );
+		displayAddressAnalyzeMap(
+			displayRowRetentionMismatch[ rung ],
+			m_DisplayRowRetentionErrors[ rung ][ 1 ],
+			m_DisplayRowRetentionFirst[ rung ][ 1 ],
+			m_DisplayRowRetentionLast[ rung ][ 1 ],
+			m_DisplayRowRetentionAND[ rung ][ 1 ],
+			m_DisplayRowRetentionOR[ rung ][ 1 ],
+			m_DisplayRowRetentionRuns[ rung ][ 1 ],
+			m_DisplayRowRetentionMaxRun[ rung ][ 1 ] );
+		m_Reads += DISPLAY_SENTINEL_LENGTH + 2u;
+	}
+	return true;
+}
+
+bool CRADBus::runDisplayFetchDiagnostic()
+{
+	if ( !m_Acquired || m_TrafficHalted
+	     || m_Signals.machine != MACHINE_C64 )
+		return false;
+
+	m_DisplayFetchRan = true;
+	static const u8 states[ DISPLAY_FETCH_ARM_COUNT ] =
+		{ 0, 2, 1, 2, 0, 1, 1, 2, 0 };
+	static const u8 operations[ DISPLAY_FETCH_ARM_COUNT ] =
+		{ 0, 0, 0, 1, 1, 1, 2, 2, 2 };
+	static const u8 borders[ DISPLAY_FETCH_ARM_COUNT ] =
+		{ 5, 7, 2, 3, 4, 8, 13, 10, 14 };
+	static const u32 trafficRate = 16000;
+	static const u32 exposureSeconds = 4;
+
+	for ( u32 arm = 0; arm < DISPLAY_FETCH_ARM_COUNT; arm++ )
+	{
+		const u8 salt = (u8)( 0x19u + arm * 0x2Bu );
+		const u32 rate = operations[ arm ] ? trafficRate : 0;
+		m_DisplayFetchState[ arm ] = states[ arm ];
+		m_DisplayFetchOperation[ arm ] = operations[ arm ];
+		m_DisplayFetchSalt[ arm ] = salt;
+		m_DisplayFetchRate[ arm ] = rate;
+		m_DisplayFetchTrafficCount[ arm ] = rate * exposureSeconds;
+
+		// Setup and both oracle captures are always blanked. Only the fixed
+		// exposure interval enables text or bitmap fetches.
+		displayFetchSetState( 0, borders[ arm ] );
+		m_Writes += 16;
+		for ( u32 attempt = 0; attempt < 3; attempt++ )
+		{
+			m_DisplayFetchPrefillAttempts[ arm ] = (u8)( attempt + 1u );
+			m_DisplayFetchSeedUsec[ arm ][ 0 ] =
+				displayRowSeed( salt, true, true );
+			m_DisplayFetchCaptureUsec[ arm ][ 0 ] =
+				displayRowCapture( salt, true,
+				                   displayFetchPrefillMismatch[ arm ] );
+			displayAddressAnalyzeMap(
+				displayFetchPrefillMismatch[ arm ],
+				m_DisplayFetchErrors[ arm ][ 0 ],
+				m_DisplayFetchFirst[ arm ][ 0 ],
+				m_DisplayFetchLast[ arm ][ 0 ],
+				m_DisplayFetchAND[ arm ][ 0 ],
+				m_DisplayFetchOR[ arm ][ 0 ],
+				m_DisplayFetchRuns[ arm ][ 0 ],
+				m_DisplayFetchMaxRun[ arm ][ 0 ] );
+			m_Writes += DISPLAY_SENTINEL_LENGTH * 2u;
+			m_Reads += DISPLAY_SENTINEL_LENGTH + 2u;
+			if ( m_DisplayFetchErrors[ arm ][ 0 ] == 0 ) break;
+		}
+
+		m_DisplayFetchSeedUsec[ arm ][ 1 ] =
+			displayRowSeed( salt, false, false );
+		m_DisplayFetchCaptureUsec[ arm ][ 1 ] =
+			displayRowCapture( salt, false,
+			                   displayFetchBaselineMismatch[ arm ] );
+		displayAddressAnalyzeMap(
+			displayFetchBaselineMismatch[ arm ],
+			m_DisplayFetchErrors[ arm ][ 1 ],
+			m_DisplayFetchFirst[ arm ][ 1 ],
+			m_DisplayFetchLast[ arm ][ 1 ],
+			m_DisplayFetchAND[ arm ][ 1 ],
+			m_DisplayFetchOR[ arm ][ 1 ],
+			m_DisplayFetchRuns[ arm ][ 1 ],
+			m_DisplayFetchMaxRun[ arm ][ 1 ] );
+		m_Writes += DISPLAY_SENTINEL_LENGTH;
+		m_Reads += DISPLAY_SENTINEL_LENGTH + 2u;
+
+		displayFetchSetDEN( states[ arm ] );
+		m_Writes += 2;
+		const u64 started = hostCycles();
+		if ( operations[ arm ] == 0 )
+		{
+			const u64 stop = started
+			               + (u64)exposureSeconds * SCPU_ARM_CLOCK_HZ;
+			while ( hostCycles() < stop ) asm volatile( "nop" );
+		}
+		else
+		{
+			const u64 interval = SCPU_ARM_CLOCK_HZ / trafficRate;
+			u64 deadline = started + interval;
+			for ( u32 access = 0;
+			      access < m_DisplayFetchTrafficCount[ arm ]; access++ )
+			{
+				while ( hostCycles() < deadline ) asm volatile( "nop" );
+				if ( operations[ arm ] == 1 )
+					(void)busDiagRawRead( 0xD020 );
+				else
+					busDiagRawWrite( 0xD020, borders[ arm ] );
+				deadline += interval;
+			}
+		}
+		m_DisplayFetchElapsedUsec[ arm ] =
+			(u32)( ( hostCycles() - started )
+			       / ( SCPU_ARM_CLOCK_HZ / 1000000u ) );
+		displayFetchBlank( states[ arm ] );
+		m_Writes += 2;
+		m_DisplayFetchCaptureUsec[ arm ][ 2 ] =
+			displayRowCapture( salt, false, displayFetchPostMismatch[ arm ] );
+		displayAddressAnalyzeMap(
+			displayFetchPostMismatch[ arm ],
+			m_DisplayFetchErrors[ arm ][ 2 ],
+			m_DisplayFetchFirst[ arm ][ 2 ],
+			m_DisplayFetchLast[ arm ][ 2 ],
+			m_DisplayFetchAND[ arm ][ 2 ],
+			m_DisplayFetchOR[ arm ][ 2 ],
+			m_DisplayFetchRuns[ arm ][ 2 ],
+			m_DisplayFetchMaxRun[ arm ][ 2 ] );
+		m_Reads += DISPLAY_SENTINEL_LENGTH + 2u;
+		if ( operations[ arm ] == 1 )
+			m_Reads += m_DisplayFetchTrafficCount[ arm ];
+		else if ( operations[ arm ] == 2 )
+			m_Writes += m_DisplayFetchTrafficCount[ arm ];
+	}
+
+	// Independent single-write retention controls. Unlike K225, only the
+	// complement prefill is repeated; every tested target is written once.
+	static const u32 delays[ DISPLAY_FETCH_RETENTION_COUNT ] =
+		{ 500000, 1000000, 2000000, 4000000, 8000000, 16000000 };
+	for ( u32 rung = 0; rung < DISPLAY_FETCH_RETENTION_COUNT; rung++ )
+	{
+		const u8 salt = (u8)( 0xA7u + rung * 0x31u );
+		m_DisplayFetchRetentionSalt[ rung ] = salt;
+		m_DisplayFetchRetentionDelayUsec[ rung ] = delays[ rung ];
+		displayAddressSetMode( true, (u8)( rung + 1u ) );
+		m_Writes += 16;
+		for ( u32 attempt = 0; attempt < 3; attempt++ )
+		{
+			m_DisplayFetchRetentionPrefillAttempts[ rung ] =
+				(u8)( attempt + 1u );
+			m_DisplayFetchRetentionSeedUsec[ rung ][ 0 ] =
+				displayRowSeed( salt, true, true );
+			m_DisplayFetchRetentionCaptureUsec[ rung ][ 0 ] =
+				displayRowCapture(
+					salt, true, displayFetchRetentionPrefillMismatch[ rung ] );
+			displayAddressAnalyzeMap(
+				displayFetchRetentionPrefillMismatch[ rung ],
+				m_DisplayFetchRetentionErrors[ rung ][ 0 ],
+				m_DisplayFetchRetentionFirst[ rung ][ 0 ],
+				m_DisplayFetchRetentionLast[ rung ][ 0 ],
+				m_DisplayFetchRetentionAND[ rung ][ 0 ],
+				m_DisplayFetchRetentionOR[ rung ][ 0 ],
+				m_DisplayFetchRetentionRuns[ rung ][ 0 ],
+				m_DisplayFetchRetentionMaxRun[ rung ][ 0 ] );
+			m_Writes += DISPLAY_SENTINEL_LENGTH * 2u;
+			m_Reads += DISPLAY_SENTINEL_LENGTH + 2u;
+			if ( m_DisplayFetchRetentionErrors[ rung ][ 0 ] == 0 ) break;
+		}
+
+		m_DisplayFetchRetentionSeedUsec[ rung ][ 1 ] =
+			displayRowSeed( salt, false, false );
+		m_DisplayFetchRetentionCaptureUsec[ rung ][ 1 ] =
+			displayRowCapture(
+				salt, false, displayFetchRetentionBaselineMismatch[ rung ] );
+		displayAddressAnalyzeMap(
+			displayFetchRetentionBaselineMismatch[ rung ],
+			m_DisplayFetchRetentionErrors[ rung ][ 1 ],
+			m_DisplayFetchRetentionFirst[ rung ][ 1 ],
+			m_DisplayFetchRetentionLast[ rung ][ 1 ],
+			m_DisplayFetchRetentionAND[ rung ][ 1 ],
+			m_DisplayFetchRetentionOR[ rung ][ 1 ],
+			m_DisplayFetchRetentionRuns[ rung ][ 1 ],
+			m_DisplayFetchRetentionMaxRun[ rung ][ 1 ] );
+		m_Writes += DISPLAY_SENTINEL_LENGTH;
+		m_Reads += DISPLAY_SENTINEL_LENGTH + 2u;
+
+		const u64 started = hostCycles();
+		const u64 duration =
+			(u64)delays[ rung ] * ( SCPU_ARM_CLOCK_HZ / 1000000u );
+		while ( hostCycles() - started < duration ) asm volatile( "nop" );
+		m_DisplayFetchRetentionElapsedUsec[ rung ] =
+			(u32)( ( hostCycles() - started )
+			       / ( SCPU_ARM_CLOCK_HZ / 1000000u ) );
+		m_DisplayFetchRetentionCaptureUsec[ rung ][ 2 ] =
+			displayRowCapture(
+				salt, false, displayFetchRetentionPostMismatch[ rung ] );
+		displayAddressAnalyzeMap(
+			displayFetchRetentionPostMismatch[ rung ],
+			m_DisplayFetchRetentionErrors[ rung ][ 2 ],
+			m_DisplayFetchRetentionFirst[ rung ][ 2 ],
+			m_DisplayFetchRetentionLast[ rung ][ 2 ],
+			m_DisplayFetchRetentionAND[ rung ][ 2 ],
+			m_DisplayFetchRetentionOR[ rung ][ 2 ],
+			m_DisplayFetchRetentionRuns[ rung ][ 2 ],
+			m_DisplayFetchRetentionMaxRun[ rung ][ 2 ] );
+		m_Reads += DISPLAY_SENTINEL_LENGTH + 2u;
+	}
+	return true;
+}
+
+bool CRADBus::runDisplayPersistenceDiagnostic()
+{
+	if ( !m_Acquired || m_TrafficHalted
+	     || m_Signals.machine != MACHINE_C64 )
+		return false;
+
+	m_DisplayPersistenceRan = true;
+	// Each active-display condition appears twice, in a different position and
+	// with a different salt. This catches both run/order dependence and an
+	// oracle-data-dependent address family without spending time on the K226
+	// display-off and retention controls that were clean in both hardware runs.
+	static const u8 states[ DISPLAY_PERSISTENCE_ARM_COUNT ] =
+		{ 1, 2, 1, 2, 1, 2, 2, 1, 2, 1, 2, 1 };
+	static const u8 operations[ DISPLAY_PERSISTENCE_ARM_COUNT ] =
+		{ 1, 0, 2, 1, 0, 2, 2, 0, 1, 2, 0, 1 };
+	static const u8 borders[ DISPLAY_PERSISTENCE_ARM_COUNT ] =
+		{ 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 14, 15 };
+	static const u32 trafficRate = 16000;
+	static const u32 exposureSeconds = 4;
+
+	for ( u32 arm = 0; arm < DISPLAY_PERSISTENCE_ARM_COUNT; arm++ )
+	{
+		const u8 salt = (u8)( 0x31u + arm * 0x37u );
+		const u32 trafficCount = operations[ arm ]
+		                       ? trafficRate * exposureSeconds : 0;
+		m_DisplayPersistenceState[ arm ] = states[ arm ];
+		m_DisplayPersistenceOperation[ arm ] = operations[ arm ];
+		m_DisplayPersistenceSalt[ arm ] = salt;
+		m_DisplayPersistenceTrafficCount[ arm ] = trafficCount;
+
+		displayFetchSetState( 0, borders[ arm ] );
+		m_Writes += 16;
+		for ( u32 attempt = 0; attempt < 3; attempt++ )
+		{
+			m_DisplayPersistencePrefillAttempts[ arm ] =
+				(u8)( attempt + 1u );
+			m_DisplayPersistenceSeedUsec[ arm ][ 0 ] =
+				displayRowSeed( salt, true, true );
+			m_DisplayPersistenceCaptureUsec[ arm ][ 0 ] =
+				displayPersistenceCapture(
+					salt, true, displayPersistenceMismatch[ arm ][ 0 ],
+					m_DisplayPersistenceFirstExpected[ arm ][ 0 ],
+					m_DisplayPersistenceFirstActual[ arm ][ 0 ],
+					m_DisplayPersistenceXorAND[ arm ][ 0 ],
+					m_DisplayPersistenceXorOR[ arm ][ 0 ] );
+			displayAddressAnalyzeMap(
+				displayPersistenceMismatch[ arm ][ 0 ],
+				m_DisplayPersistenceErrors[ arm ][ 0 ],
+				m_DisplayPersistenceFirst[ arm ][ 0 ],
+				m_DisplayPersistenceLast[ arm ][ 0 ],
+				m_DisplayPersistenceAND[ arm ][ 0 ],
+				m_DisplayPersistenceOR[ arm ][ 0 ],
+				m_DisplayPersistenceRuns[ arm ][ 0 ],
+				m_DisplayPersistenceMaxRun[ arm ][ 0 ] );
+			m_Writes += DISPLAY_SENTINEL_LENGTH * 2u;
+			m_Reads += DISPLAY_SENTINEL_LENGTH + 2u;
+			if ( m_DisplayPersistenceErrors[ arm ][ 0 ] == 0 ) break;
+		}
+
+		m_DisplayPersistenceSeedUsec[ arm ][ 1 ] =
+			displayRowSeed( salt, false, false );
+		m_DisplayPersistenceCaptureUsec[ arm ][ 1 ] =
+			displayPersistenceCapture(
+				salt, false, displayPersistenceMismatch[ arm ][ 1 ],
+				m_DisplayPersistenceFirstExpected[ arm ][ 1 ],
+				m_DisplayPersistenceFirstActual[ arm ][ 1 ],
+				m_DisplayPersistenceXorAND[ arm ][ 1 ],
+				m_DisplayPersistenceXorOR[ arm ][ 1 ] );
+		displayAddressAnalyzeMap(
+			displayPersistenceMismatch[ arm ][ 1 ],
+			m_DisplayPersistenceErrors[ arm ][ 1 ],
+			m_DisplayPersistenceFirst[ arm ][ 1 ],
+			m_DisplayPersistenceLast[ arm ][ 1 ],
+			m_DisplayPersistenceAND[ arm ][ 1 ],
+			m_DisplayPersistenceOR[ arm ][ 1 ],
+			m_DisplayPersistenceRuns[ arm ][ 1 ],
+			m_DisplayPersistenceMaxRun[ arm ][ 1 ] );
+		m_Writes += DISPLAY_SENTINEL_LENGTH;
+		m_Reads += DISPLAY_SENTINEL_LENGTH + 2u;
+
+		displayFetchSetDEN( states[ arm ] );
+		m_Writes += 2;
+		const u64 started = hostCycles();
+		if ( operations[ arm ] == 0 )
+		{
+			const u64 stop = started
+			               + (u64)exposureSeconds * SCPU_ARM_CLOCK_HZ;
+			while ( hostCycles() < stop ) asm volatile( "nop" );
+		}
+		else
+		{
+			const u64 interval = SCPU_ARM_CLOCK_HZ / trafficRate;
+			u64 deadline = started + interval;
+			for ( u32 access = 0; access < trafficCount; access++ )
+			{
+				while ( hostCycles() < deadline ) asm volatile( "nop" );
+				if ( operations[ arm ] == 1 )
+					(void)busDiagRawRead( 0xD020 );
+				else
+					busDiagRawWrite( 0xD020, borders[ arm ] );
+				deadline += interval;
+			}
+		}
+		m_DisplayPersistenceElapsedUsec[ arm ] =
+			(u32)( ( hostCycles() - started )
+			       / ( SCPU_ARM_CLOCK_HZ / 1000000u ) );
+		displayFetchBlank( states[ arm ] );
+		m_Writes += 2;
+
+		for ( u32 post = 0; post < 3; post++ )
+		{
+			const u32 phase = post + 2u;
+			m_DisplayPersistenceCaptureUsec[ arm ][ phase ] =
+				displayPersistenceCapture(
+					salt, false, displayPersistenceMismatch[ arm ][ phase ],
+					m_DisplayPersistenceFirstExpected[ arm ][ phase ],
+					m_DisplayPersistenceFirstActual[ arm ][ phase ],
+					m_DisplayPersistenceXorAND[ arm ][ phase ],
+					m_DisplayPersistenceXorOR[ arm ][ phase ] );
+			displayAddressAnalyzeMap(
+				displayPersistenceMismatch[ arm ][ phase ],
+				m_DisplayPersistenceErrors[ arm ][ phase ],
+				m_DisplayPersistenceFirst[ arm ][ phase ],
+				m_DisplayPersistenceLast[ arm ][ phase ],
+				m_DisplayPersistenceAND[ arm ][ phase ],
+				m_DisplayPersistenceOR[ arm ][ phase ],
+				m_DisplayPersistenceRuns[ arm ][ phase ],
+				m_DisplayPersistenceMaxRun[ arm ][ phase ] );
+			m_Reads += DISPLAY_SENTINEL_LENGTH + 2u;
+		}
+		for ( u32 pair = 0; pair < 2; pair++ )
+			displaySentinelCompare(
+				displayPersistenceMismatch[ arm ][ pair + 2u ],
+				displayPersistenceMismatch[ arm ][ pair + 3u ],
+				m_DisplayPersistenceSame[ arm ][ pair ],
+				m_DisplayPersistenceAdded[ arm ][ pair ],
+				m_DisplayPersistenceRemoved[ arm ][ pair ] );
+		if ( operations[ arm ] == 1 ) m_Reads += trafficCount;
+		else if ( operations[ arm ] == 2 ) m_Writes += trafficCount;
+	}
+	return true;
+}
+
+bool CRADBus::runDisplayTimingDiagnostic()
+{
+	if ( !m_Acquired || m_TrafficHalted
+	     || m_Signals.machine != MACHINE_C64 )
+		return false;
+
+	m_DisplayTimingRan = true;
+	static const u8 states[ DISPLAY_TIMING_ARM_COUNT ] = { 1, 2, 1, 2, 1, 2 };
+	static const u8 operations[ DISPLAY_TIMING_ARM_COUNT ] = { 1, 0, 2, 1, 0, 2 };
+	// These are K227 arms 0..5 exactly, including all four salts that produced
+	// stable dirty maps and both clean bitmap controls.
+	static const u8 salts[ DISPLAY_TIMING_ARM_COUNT ] =
+		{ 0x31, 0x68, 0x9F, 0xD6, 0x0D, 0x44 };
+	static const u8 borders[ DISPLAY_TIMING_ARM_COUNT ] = { 2, 3, 4, 5, 6, 7 };
+	static const u16 samples[ DISPLAY_TIMING_PHASE_COUNT ] =
+		{ 475, 350, 400, 450, 475, 500, 550, 600, 475, 475 };
+	static const u32 trafficRate = 16000;
+	static const u32 exposureSeconds = 4;
+	const u16 configured = (u16)busTiming.WAIT_CYCLE_READ;
+	for ( u32 phase = 0; phase < DISPLAY_TIMING_PHASE_COUNT; phase++ )
+		m_DisplayTimingSample[ phase ] = samples[ phase ];
+
+	for ( u32 arm = 0; arm < DISPLAY_TIMING_ARM_COUNT; arm++ )
+	{
+		const u8 salt = salts[ arm ];
+		const u32 trafficCount = operations[ arm ]
+		                       ? trafficRate * exposureSeconds : 0;
+		m_DisplayTimingState[ arm ] = states[ arm ];
+		m_DisplayTimingOperation[ arm ] = operations[ arm ];
+		m_DisplayTimingSalt[ arm ] = salt;
+		m_DisplayTimingTrafficCount[ arm ] = trafficCount;
+
+		displayFetchSetState( 0, borders[ arm ] );
+		m_Writes += 16;
+		busTiming.WAIT_CYCLE_READ = configured;
+		busTiming.WAIT_CYCLE_READ2 = (u16)( configured + 20u );
+		for ( u32 attempt = 0; attempt < 3; attempt++ )
+		{
+			m_DisplayTimingPrefillAttempts[ arm ] = (u8)( attempt + 1u );
+			(void)displayRowSeed( salt, true, true );
+			m_DisplayTimingCaptureUsec[ arm ][ 9 ] =
+				displayPersistenceCapture(
+					salt, true, displayTimingMismatch[ arm ][ 9 ],
+					m_DisplayTimingFirstExpected[ arm ][ 9 ],
+					m_DisplayTimingFirstActual[ arm ][ 9 ],
+					m_DisplayTimingXorAND[ arm ][ 9 ],
+					m_DisplayTimingXorOR[ arm ][ 9 ] );
+			displayAddressAnalyzeMap(
+				displayTimingMismatch[ arm ][ 9 ],
+				m_DisplayTimingErrors[ arm ][ 9 ],
+				m_DisplayTimingFirst[ arm ][ 9 ],
+				m_DisplayTimingLast[ arm ][ 9 ],
+				m_DisplayTimingAND[ arm ][ 9 ],
+				m_DisplayTimingOR[ arm ][ 9 ],
+				m_DisplayTimingRuns[ arm ][ 9 ],
+				m_DisplayTimingMaxRun[ arm ][ 9 ] );
+			m_DisplayTimingPrefillErrors[ arm ] =
+				m_DisplayTimingErrors[ arm ][ 9 ];
+			m_Writes += DISPLAY_SENTINEL_LENGTH * 2u;
+			m_Reads += DISPLAY_SENTINEL_LENGTH + 2u;
+			if ( m_DisplayTimingPrefillErrors[ arm ] == 0 ) break;
+		}
+
+		(void)displayRowSeed( salt, false, false );
+		m_DisplayTimingCaptureUsec[ arm ][ 9 ] =
+			displayPersistenceCapture(
+				salt, false, displayTimingMismatch[ arm ][ 9 ],
+				m_DisplayTimingFirstExpected[ arm ][ 9 ],
+				m_DisplayTimingFirstActual[ arm ][ 9 ],
+				m_DisplayTimingXorAND[ arm ][ 9 ],
+				m_DisplayTimingXorOR[ arm ][ 9 ] );
+		displayAddressAnalyzeMap(
+			displayTimingMismatch[ arm ][ 9 ],
+			m_DisplayTimingErrors[ arm ][ 9 ],
+			m_DisplayTimingFirst[ arm ][ 9 ],
+			m_DisplayTimingLast[ arm ][ 9 ],
+			m_DisplayTimingAND[ arm ][ 9 ],
+			m_DisplayTimingOR[ arm ][ 9 ],
+			m_DisplayTimingRuns[ arm ][ 9 ],
+			m_DisplayTimingMaxRun[ arm ][ 9 ] );
+		m_DisplayTimingBaselineErrors[ arm ] = m_DisplayTimingErrors[ arm ][ 9 ];
+		m_Writes += DISPLAY_SENTINEL_LENGTH;
+		m_Reads += DISPLAY_SENTINEL_LENGTH + 2u;
+
+		displayFetchSetDEN( states[ arm ] );
+		m_Writes += 2;
+		const u64 started = hostCycles();
+		if ( operations[ arm ] == 0 )
+		{
+			const u64 stop = started
+			               + (u64)exposureSeconds * SCPU_ARM_CLOCK_HZ;
+			while ( hostCycles() < stop ) asm volatile( "nop" );
+		}
+		else
+		{
+			const u64 interval = SCPU_ARM_CLOCK_HZ / trafficRate;
+			u64 deadline = started + interval;
+			for ( u32 access = 0; access < trafficCount; access++ )
+			{
+				while ( hostCycles() < deadline ) asm volatile( "nop" );
+				if ( operations[ arm ] == 1 )
+					(void)busDiagRawRead( 0xD020 );
+				else
+					busDiagRawWrite( 0xD020, borders[ arm ] );
+				deadline += interval;
+			}
+		}
+		m_DisplayTimingElapsedUsec[ arm ] =
+			(u32)( ( hostCycles() - started )
+			       / ( SCPU_ARM_CLOCK_HZ / 1000000u ) );
+		displayFetchBlank( states[ arm ] );
+		m_Writes += 2;
+
+		// Phase 0 is the configured-point reference. Phases 1..7 sweep the
+		// sample point, and phase 8 returns to 475 to prove the sweep itself did
+		// not alter the map. Phase 9 is captured after targeted repair below.
+		for ( u32 phase = 0; phase < 9; phase++ )
+		{
+			busTiming.WAIT_CYCLE_READ = samples[ phase ];
+			busTiming.WAIT_CYCLE_READ2 = (u16)( samples[ phase ] + 20u );
+			m_DisplayTimingCaptureUsec[ arm ][ phase ] =
+				displayPersistenceCapture(
+					salt, false, displayTimingMismatch[ arm ][ phase ],
+					m_DisplayTimingFirstExpected[ arm ][ phase ],
+					m_DisplayTimingFirstActual[ arm ][ phase ],
+					m_DisplayTimingXorAND[ arm ][ phase ],
+					m_DisplayTimingXorOR[ arm ][ phase ] );
+			displayAddressAnalyzeMap(
+				displayTimingMismatch[ arm ][ phase ],
+				m_DisplayTimingErrors[ arm ][ phase ],
+				m_DisplayTimingFirst[ arm ][ phase ],
+				m_DisplayTimingLast[ arm ][ phase ],
+				m_DisplayTimingAND[ arm ][ phase ],
+				m_DisplayTimingOR[ arm ][ phase ],
+				m_DisplayTimingRuns[ arm ][ phase ],
+				m_DisplayTimingMaxRun[ arm ][ phase ] );
+			displaySentinelCompare(
+				displayTimingMismatch[ arm ][ 0 ],
+				displayTimingMismatch[ arm ][ phase ],
+				m_DisplayTimingSame[ arm ][ phase ],
+				m_DisplayTimingAdded[ arm ][ phase ],
+				m_DisplayTimingRemoved[ arm ][ phase ] );
+			m_Reads += DISPLAY_SENTINEL_LENGTH + 2u;
+		}
+
+		busTiming.WAIT_CYCLE_READ = configured;
+		busTiming.WAIT_CYCLE_READ2 = (u16)( configured + 20u );
+		for ( u32 index = 0; index < DISPLAY_SENTINEL_LENGTH; index++ )
+		{
+			if ( ( displayTimingMismatch[ arm ][ 0 ][ index >> 3 ]
+			       & (u8)( 1u << ( index & 7 ) ) ) == 0 ) continue;
+			busDiagRawWrite( displaySentinelAddr( index ),
+			                 displayRowExpected( index, salt ) );
+			m_DisplayTimingRepairWrites[ arm ]++;
+			m_Writes++;
+		}
+		m_DisplayTimingCaptureUsec[ arm ][ 9 ] =
+			displayPersistenceCapture(
+				salt, false, displayTimingMismatch[ arm ][ 9 ],
+				m_DisplayTimingFirstExpected[ arm ][ 9 ],
+				m_DisplayTimingFirstActual[ arm ][ 9 ],
+				m_DisplayTimingXorAND[ arm ][ 9 ],
+				m_DisplayTimingXorOR[ arm ][ 9 ] );
+		displayAddressAnalyzeMap(
+			displayTimingMismatch[ arm ][ 9 ],
+			m_DisplayTimingErrors[ arm ][ 9 ],
+			m_DisplayTimingFirst[ arm ][ 9 ],
+			m_DisplayTimingLast[ arm ][ 9 ],
+			m_DisplayTimingAND[ arm ][ 9 ],
+			m_DisplayTimingOR[ arm ][ 9 ],
+			m_DisplayTimingRuns[ arm ][ 9 ],
+			m_DisplayTimingMaxRun[ arm ][ 9 ] );
+		displaySentinelCompare(
+			displayTimingMismatch[ arm ][ 0 ],
+			displayTimingMismatch[ arm ][ 9 ],
+			m_DisplayTimingSame[ arm ][ 9 ],
+			m_DisplayTimingAdded[ arm ][ 9 ],
+			m_DisplayTimingRemoved[ arm ][ 9 ] );
+		m_Reads += DISPLAY_SENTINEL_LENGTH + 2u;
+		if ( operations[ arm ] == 1 ) m_Reads += trafficCount;
+		else if ( operations[ arm ] == 2 ) m_Writes += trafficCount;
+	}
+	busTiming.WAIT_CYCLE_READ = configured;
+	busTiming.WAIT_CYCLE_READ2 = (u16)( configured + 20u );
+	return true;
+}
+
+bool CRADBus::runDisplayBoundaryDiagnostic()
+{
+	if ( !m_Acquired || m_TrafficHalted
+	     || m_Signals.machine != MACHINE_C64 )
+		return false;
+
+	m_DisplayBoundaryRan = true;
+	// Slots 0..7 are the full state x transition-raster x duration matrix.
+	// Slots 8..15 repeat the exact same oracles in a permuted order. The two
+	// salts are patterns already known to fail on hardware (K228 text/none and
+	// K226 bitmap/none), avoiding a false clean result from pattern sensitivity.
+	static const u8 slots[ DISPLAY_BOUNDARY_ARM_COUNT ] =
+		{ 0, 1, 2, 3, 4, 5, 6, 7, 7, 2, 5, 0, 3, 6, 1, 4 };
+	static const u8 borders[ DISPLAY_BOUNDARY_ARM_COUNT ] =
+		{ 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 14, 15, 2, 3, 4, 5 };
+	static const u32 exposureSeconds = 4;
+
+	for ( u32 arm = 0; arm < DISPLAY_BOUNDARY_ARM_COUNT; arm++ )
+	{
+		const u8 slot = slots[ arm ];
+		const u8 state = slot < 4 ? 1 : 2;
+		const bool safe = ( slot & 1u ) != 0;
+		const bool dwell = ( slot & 2u ) != 0;
+		const u8 salt = state == 1 ? 0x0D : 0x44;
+		m_DisplayBoundaryState[ arm ] = state;
+		m_DisplayBoundarySafe[ arm ] = safe ? 1 : 0;
+		m_DisplayBoundaryDwell[ arm ] = dwell ? 1 : 0;
+		m_DisplayBoundarySalt[ arm ] = salt;
+
+		displayFetchSetState( 0, borders[ arm ] );
+		m_Writes += 16;
+		for ( u32 attempt = 0; attempt < 3; attempt++ )
+		{
+			m_DisplayBoundaryPrefillAttempts[ arm ] = (u8)( attempt + 1u );
+			(void)displayRowSeed( salt, true, true );
+			(void)displayPersistenceCapture(
+				salt, true, displayBoundaryMismatch[ arm ][ 0 ],
+				m_DisplayBoundaryFirstExpected[ arm ][ 0 ],
+				m_DisplayBoundaryFirstActual[ arm ][ 0 ],
+				m_DisplayBoundaryXorAND[ arm ][ 0 ],
+				m_DisplayBoundaryXorOR[ arm ][ 0 ] );
+			displayAddressAnalyzeMap(
+				displayBoundaryMismatch[ arm ][ 0 ],
+				m_DisplayBoundaryPrefillErrors[ arm ],
+				m_DisplayBoundaryFirst[ arm ][ 0 ],
+				m_DisplayBoundaryLast[ arm ][ 0 ],
+				m_DisplayBoundaryAND[ arm ][ 0 ],
+				m_DisplayBoundaryOR[ arm ][ 0 ],
+				m_DisplayBoundaryRuns[ arm ][ 0 ],
+				m_DisplayBoundaryMaxRun[ arm ][ 0 ] );
+			m_Writes += DISPLAY_SENTINEL_LENGTH * 2u;
+			m_Reads += DISPLAY_SENTINEL_LENGTH + 2u;
+			if ( m_DisplayBoundaryPrefillErrors[ arm ] == 0 ) break;
+		}
+
+		(void)displayRowSeed( salt, false, false );
+		m_DisplayBoundaryCaptureUsec[ arm ][ 0 ] =
+			displayPersistenceCapture(
+				salt, false, displayBoundaryMismatch[ arm ][ 0 ],
+				m_DisplayBoundaryFirstExpected[ arm ][ 0 ],
+				m_DisplayBoundaryFirstActual[ arm ][ 0 ],
+				m_DisplayBoundaryXorAND[ arm ][ 0 ],
+				m_DisplayBoundaryXorOR[ arm ][ 0 ] );
+		displayAddressAnalyzeMap(
+			displayBoundaryMismatch[ arm ][ 0 ],
+			m_DisplayBoundaryErrors[ arm ][ 0 ],
+			m_DisplayBoundaryFirst[ arm ][ 0 ],
+			m_DisplayBoundaryLast[ arm ][ 0 ],
+			m_DisplayBoundaryAND[ arm ][ 0 ],
+			m_DisplayBoundaryOR[ arm ][ 0 ],
+			m_DisplayBoundaryRuns[ arm ][ 0 ],
+			m_DisplayBoundaryMaxRun[ arm ][ 0 ] );
+		m_Writes += DISPLAY_SENTINEL_LENGTH;
+		m_Reads += DISPLAY_SENTINEL_LENGTH + 2u;
+
+		m_DisplayBoundaryWaitReads[ arm ][ 0 ] =
+			displayBoundaryWaitRaster( safe );
+		m_Reads += m_DisplayBoundaryWaitReads[ arm ][ 0 ] & 0x7FFFFFFFu;
+		const u64 started = hostCycles();
+		displayFetchSetDEN( state );
+		m_Writes += 2;
+		if ( dwell )
+		{
+			const u64 stop = started
+			               + (u64)exposureSeconds * SCPU_ARM_CLOCK_HZ;
+			while ( hostCycles() < stop ) asm volatile( "nop" );
+			m_DisplayBoundaryWaitReads[ arm ][ 1 ] =
+				displayBoundaryWaitRaster( safe );
+			m_Reads += m_DisplayBoundaryWaitReads[ arm ][ 1 ] & 0x7FFFFFFFu;
+		}
+		displayFetchBlank( state );
+		m_Writes += 2;
+		m_DisplayBoundaryElapsedUsec[ arm ] =
+			(u32)( ( hostCycles() - started )
+			       / ( SCPU_ARM_CLOCK_HZ / 1000000u ) );
+
+		m_DisplayBoundaryCaptureUsec[ arm ][ 1 ] =
+			displayPersistenceCapture(
+				salt, false, displayBoundaryMismatch[ arm ][ 1 ],
+				m_DisplayBoundaryFirstExpected[ arm ][ 1 ],
+				m_DisplayBoundaryFirstActual[ arm ][ 1 ],
+				m_DisplayBoundaryXorAND[ arm ][ 1 ],
+				m_DisplayBoundaryXorOR[ arm ][ 1 ] );
+		displayAddressAnalyzeMap(
+			displayBoundaryMismatch[ arm ][ 1 ],
+			m_DisplayBoundaryErrors[ arm ][ 1 ],
+			m_DisplayBoundaryFirst[ arm ][ 1 ],
+			m_DisplayBoundaryLast[ arm ][ 1 ],
+			m_DisplayBoundaryAND[ arm ][ 1 ],
+			m_DisplayBoundaryOR[ arm ][ 1 ],
+			m_DisplayBoundaryRuns[ arm ][ 1 ],
+			m_DisplayBoundaryMaxRun[ arm ][ 1 ] );
+		displaySentinelCompare(
+			displayBoundaryMismatch[ arm ][ 0 ],
+			displayBoundaryMismatch[ arm ][ 1 ],
+			m_DisplayBoundarySame[ arm ],
+			m_DisplayBoundaryAdded[ arm ],
+			m_DisplayBoundaryRemoved[ arm ] );
+		m_Reads += DISPLAY_SENTINEL_LENGTH + 2u;
+	}
+	return true;
+}
+
+bool CRADBus::runDisplayRefreshDiagnostic()
+
+{
+	return runDisplayRefreshDiagnosticVariant( 0 );
+}
+
+bool CRADBus::runDisplayCore0RefreshDiagnostic()
+{
+	return runDisplayRefreshDiagnosticVariant( 1 );
+}
+
+bool CRADBus::runDisplayRWDiagnostic()
+{
+	return runDisplayRefreshDiagnosticVariant( 2 );
+}
+
+bool CRADBus::runDisplayScrubDiagnostic( CWriteBuffer &scrubBuffer )
+{
+	return runDisplayRefreshDiagnosticVariant( 3, &scrubBuffer );
+}
+
+bool CRADBus::runDisplayBAGuardDiagnostic()
+{
+	if ( !m_Acquired || m_TrafficHalted
+	     || m_Signals.machine != MACHINE_C64 )
+		return false;
+
+	m_DisplayBAGuardRan = true;
+	static const u8 operations[ DISPLAY_BA_LOCAL_ARM_COUNT ] =
+		{ 0, 2, 1, 2, 2, 2, 2, 0, 2, 1, 2, 2 };
+	static const u8 biases[ DISPLAY_BA_LOCAL_ARM_COUNT ] =
+		{ 0, 40, 0, 0, 60, 20, 20, 0, 60, 0, 0, 40 };
+	static const u32 trafficRate = 16000;
+	static const u32 exposureSeconds = 4;
+
+	for ( u32 arm = 0; arm < DISPLAY_BA_LOCAL_ARM_COUNT; arm++ )
+	{
+		const u8 operation = operations[ arm ];
+		const u8 bias = biases[ arm ];
+		const u8 rotation = arm >= DISPLAY_BA_LOCAL_ARM_COUNT / 2 ? 1 : 0;
+		const u8 border = (u8)( 1u + arm );
+		m_DisplayBAOperation[ arm ] = operation;
+		m_DisplayBABias[ arm ] = bias;
+		m_DisplayBARotation[ arm ] = rotation;
+		m_DisplayBATrafficCount[ arm ] = operation
+			? trafficRate * exposureSeconds : 0;
+
+		// All setup and verification use the production timing point and DEN=0.
+		// The complement pass clears any retained state from the previous arm.
+		displaySentinelSetMode( false, border );
+		m_Writes += 16;
+		for ( u32 attempt = 0; attempt < 3; attempt++ )
+		{
+			m_DisplayBAPrefillAttempts[ arm ] = (u8)( attempt + 1u );
+			(void)displayBASeed( rotation, true, true );
+			u32 errors = 0;
+			(void)displayBACapture( rotation, true,
+			                      displayBAMismatch[ arm ][ 0 ], errors );
+			m_Writes += DISPLAY_SENTINEL_LENGTH * 2u;
+			m_Reads += DISPLAY_SENTINEL_LENGTH + 2u;
+			if ( errors == 0 ) break;
+		}
+
+		// A stored baseline error must survive all three separately primed maps.
+		// Retry the target seed if that conservative baseline is not clean.
+		for ( u32 attempt = 0; attempt < 3; attempt++ )
+		{
+			m_DisplayBATargetAttempts[ arm ] = (u8)( attempt + 1u );
+			(void)displayBASeed( rotation, false, false );
+			m_Writes += DISPLAY_SENTINEL_LENGTH;
+			for ( u32 pass = 0; pass < 3; pass++ )
+			{
+				u32 ignoredErrors = 0;
+				m_DisplayBACaptureUsec[ arm ][ pass ] =
+					displayBACapture( rotation, false,
+					                  displayBAMismatch[ arm ][ pass ],
+					                  ignoredErrors );
+				m_Reads += DISPLAY_SENTINEL_LENGTH + 2u;
+			}
+			u32 persistent = 0;
+			for ( u32 index = 0; index < DISPLAY_SENTINEL_LENGTH; index++ )
+			{
+				const u8 bit = (u8)( 1u << ( index & 7 ) );
+				if ( ( displayBAMismatch[ arm ][ 0 ][ index >> 3 ] & bit )
+				     && ( displayBAMismatch[ arm ][ 1 ][ index >> 3 ] & bit )
+				     && ( displayBAMismatch[ arm ][ 2 ][ index >> 3 ] & bit ) )
+					persistent++;
+			}
+			if ( persistent == 0 || attempt == 2 ) break;
+		}
+
+		u32 baselinePersistent = 0, baselineUnion = 0;
+		for ( u32 index = 0; index < DISPLAY_SENTINEL_LENGTH; index++ )
+		{
+			const u8 bit = (u8)( 1u << ( index & 7 ) );
+			const bool p0 = ( displayBAMismatch[ arm ][ 0 ][ index >> 3 ] & bit ) != 0;
+			const bool p1 = ( displayBAMismatch[ arm ][ 1 ][ index >> 3 ] & bit ) != 0;
+			const bool p2 = ( displayBAMismatch[ arm ][ 2 ][ index >> 3 ] & bit ) != 0;
+			if ( p0 || p1 || p2 ) baselineUnion++;
+			if ( p0 && p1 && p2 ) baselinePersistent++;
+		}
+		m_DisplayBABaselinePersistent[ arm ] = baselinePersistent;
+		m_DisplayBABaselineUnion[ arm ] = baselineUnion;
+
+		// Bias only the timed address-enable point of paced single writes. It is
+		// restored before DEN is blanked, so setup/capture can never inherit it.
+		displaySentinelSetDEN( true );
+		m_Writes += 2;
+		const u32 productionEnable =
+			busTiming.TIMING_ENABLE_RWOUT_ADDR_LATCH_WRITING;
+		if ( operation == 2 )
+			busTiming.TIMING_ENABLE_RWOUT_ADDR_LATCH_WRITING =
+				productionEnable + bias;
+		const u64 started = hostCycles();
+		if ( operation == 0 )
+		{
+			const u64 stop = started
+			               + (u64)exposureSeconds * SCPU_ARM_CLOCK_HZ;
+			while ( hostCycles() < stop ) asm volatile( "nop" );
+		}
+		else
+		{
+			const u64 interval = SCPU_ARM_CLOCK_HZ / trafficRate;
+			u64 deadline = started + interval;
+			for ( u32 access = 0;
+			      access < m_DisplayBATrafficCount[ arm ]; access++ )
+			{
+				while ( hostCycles() < deadline ) asm volatile( "nop" );
+				if ( operation == 1 ) (void)busDiagRawRead( 0xD020 );
+				else busDiagRawWrite( 0xD020, border );
+				deadline += interval;
+			}
+		}
+		m_DisplayBAElapsedUsec[ arm ] =
+			(u32)( ( hostCycles() - started )
+			       / ( SCPU_ARM_CLOCK_HZ / 1000000u ) );
+		busTiming.TIMING_ENABLE_RWOUT_ADDR_LATCH_WRITING = productionEnable;
+		if ( operation == 1 ) m_Reads += m_DisplayBATrafficCount[ arm ];
+		else if ( operation == 2 ) m_Writes += m_DisplayBATrafficCount[ arm ];
+
+		displaySentinelSetDEN( false );
+		m_Writes += 2;
+		for ( u32 pass = 0; pass < 3; pass++ )
+		{
+			u32 ignoredErrors = 0;
+			m_DisplayBACaptureUsec[ arm ][ pass + 3 ] =
+				displayBACapture( rotation, false,
+				                  displayBAMismatch[ arm ][ pass + 3 ],
+				                  ignoredErrors );
+			m_Reads += DISPLAY_SENTINEL_LENGTH + 2u;
+		}
+
+		u32 postPersistent = 0, postUnion = 0, addedPersistent = 0;
+		for ( u32 byte = 0; byte < DISPLAY_SENTINEL_BITMAP_BYTES; byte++ )
+			displayBAAddedMap[ arm ][ byte ] = 0;
+		for ( u32 index = 0; index < DISPLAY_SENTINEL_LENGTH; index++ )
+		{
+			const u8 bit = (u8)( 1u << ( index & 7 ) );
+			const bool b0 = ( displayBAMismatch[ arm ][ 0 ][ index >> 3 ] & bit ) != 0;
+			const bool b1 = ( displayBAMismatch[ arm ][ 1 ][ index >> 3 ] & bit ) != 0;
+			const bool b2 = ( displayBAMismatch[ arm ][ 2 ][ index >> 3 ] & bit ) != 0;
+			const bool p0 = ( displayBAMismatch[ arm ][ 3 ][ index >> 3 ] & bit ) != 0;
+			const bool p1 = ( displayBAMismatch[ arm ][ 4 ][ index >> 3 ] & bit ) != 0;
+			const bool p2 = ( displayBAMismatch[ arm ][ 5 ][ index >> 3 ] & bit ) != 0;
+			const bool postAny = p0 || p1 || p2;
+			const bool postAll = p0 && p1 && p2;
+			if ( postAny ) postUnion++;
+			if ( postAll ) postPersistent++;
+			// Baseline UNION is deliberately conservative: a target that looked
+			// wrong even once before exposure is never counted as newly stored.
+			if ( postAll && !( b0 || b1 || b2 ) )
+			{
+				displayBAAddedMap[ arm ][ index >> 3 ] |= bit;
+				addedPersistent++;
+				const u8 family = displayBAFamily( index, rotation );
+				if ( family < DISPLAY_BA_FAMILY_COUNT )
+					m_DisplayBAFamilyAdded[ arm ][ family ]++;
+			}
+		}
+		m_DisplayBAPostPersistent[ arm ] = postPersistent;
+		m_DisplayBAPostUnion[ arm ] = postUnion;
+		m_DisplayBAAddedPersistent[ arm ] = addedPersistent;
+		m_DisplayBAUnstableOnly[ arm ] = postUnion - postPersistent;
+	}
+
+	displaySentinelSetMode( false, 0 );
+	m_Writes += 16;
+	return true;
+}
+
+bool CRADBus::runDisplayRefreshDiagnosticVariant( u8 variant,
+	                                                CWriteBuffer *scrubBuffer )
+{
+	if ( !m_Acquired || m_TrafficHalted
+	     || m_Signals.machine != MACHINE_C64 )
+		return false;
+	if ( variant == 3 && !scrubBuffer )
+		return false;
+
+	m_DisplayRefreshRan = true;
+	m_DisplayDiagnosticVariant = variant;
+	const bool core0 = variant == 1;
+	const bool rwHold = variant == 2;
+	const bool scrubTest = variant == 3;
+	// Each state/control/intervention condition is repeated in a permuted second
+	// half. All variants retain K229's displayed oracle, border-synchronised
+	// transitions, and absence of ordinary physical transactions during exposure.
+	static const u8 slots[ 8 ] = { 0, 1, 2, 3, 3, 0, 1, 2 };
+	static const u8 scrubStates[ 8 ] = { 1, 1, 2, 2, 2, 1, 2, 1 };
+	static const u8 scrubEnabled[ 8 ] = { 0, 1, 0, 1, 1, 0, 0, 1 };
+	static const u8 borders[ 8 ] = { 2, 3, 4, 5, 6, 7, 8, 9 };
+	const u32 exposureSeconds = scrubTest ? 16u : rwHold ? 8u : 4u;
+
+	for ( u32 arm = 0; arm < 8; arm++ )
+	{
+		const u8 slot = slots[ arm ];
+		const u8 state = scrubTest ? scrubStates[ arm ]
+		                           : slot < 2 ? 1 : 2;
+		const bool refresh = scrubTest ? scrubEnabled[ arm ] != 0
+		                               : ( slot & 1u ) != 0;
+		const u8 salt = state == 1 ? 0x0D : 0x44;
+		m_DisplayBoundaryState[ arm ] = state;
+		m_DisplayBoundarySafe[ arm ] = 1;
+		m_DisplayBoundaryDwell[ arm ] = 1;
+		m_DisplayBoundarySalt[ arm ] = salt;
+		m_DisplayRefreshEnabled[ arm ] = refresh ? 1 : 0;
+		if ( scrubTest )
+		{
+			for ( u32 index = 0; index < DISPLAY_SENTINEL_LENGTH; index++ )
+				displayScrubShadow[ displaySentinelAddr( index ) ] =
+					displayRowExpected( index, salt );
+			scrubBuffer->attach( this, displayScrubShadow );
+			scrubBuffer->setOptMode( SCPU_OPT_NONE );
+			scrubBuffer->resetStats();
+		}
+
+		displayFetchSetState( 0, borders[ arm ] );
+		m_Writes += 16;
+		for ( u32 attempt = 0; attempt < 3; attempt++ )
+		{
+			m_DisplayBoundaryPrefillAttempts[ arm ] = (u8)( attempt + 1u );
+			(void)displayRowSeed( salt, true, true );
+			(void)displayPersistenceCapture(
+				salt, true, displayBoundaryMismatch[ arm ][ 0 ],
+				m_DisplayBoundaryFirstExpected[ arm ][ 0 ],
+				m_DisplayBoundaryFirstActual[ arm ][ 0 ],
+				m_DisplayBoundaryXorAND[ arm ][ 0 ],
+				m_DisplayBoundaryXorOR[ arm ][ 0 ] );
+			displayAddressAnalyzeMap(
+				displayBoundaryMismatch[ arm ][ 0 ],
+				m_DisplayBoundaryPrefillErrors[ arm ],
+				m_DisplayBoundaryFirst[ arm ][ 0 ],
+				m_DisplayBoundaryLast[ arm ][ 0 ],
+				m_DisplayBoundaryAND[ arm ][ 0 ],
+				m_DisplayBoundaryOR[ arm ][ 0 ],
+				m_DisplayBoundaryRuns[ arm ][ 0 ],
+				m_DisplayBoundaryMaxRun[ arm ][ 0 ] );
+			m_Writes += DISPLAY_SENTINEL_LENGTH * 2u;
+			m_Reads += DISPLAY_SENTINEL_LENGTH + 2u;
+			if ( m_DisplayBoundaryPrefillErrors[ arm ] == 0 ) break;
+		}
+
+		(void)displayRowSeed( salt, false, false );
+		m_DisplayBoundaryCaptureUsec[ arm ][ 0 ] =
+			displayPersistenceCapture(
+				salt, false, displayBoundaryMismatch[ arm ][ 0 ],
+				m_DisplayBoundaryFirstExpected[ arm ][ 0 ],
+				m_DisplayBoundaryFirstActual[ arm ][ 0 ],
+				m_DisplayBoundaryXorAND[ arm ][ 0 ],
+				m_DisplayBoundaryXorOR[ arm ][ 0 ] );
+		displayAddressAnalyzeMap(
+			displayBoundaryMismatch[ arm ][ 0 ],
+			m_DisplayBoundaryErrors[ arm ][ 0 ],
+			m_DisplayBoundaryFirst[ arm ][ 0 ],
+			m_DisplayBoundaryLast[ arm ][ 0 ],
+			m_DisplayBoundaryAND[ arm ][ 0 ],
+			m_DisplayBoundaryOR[ arm ][ 0 ],
+			m_DisplayBoundaryRuns[ arm ][ 0 ],
+			m_DisplayBoundaryMaxRun[ arm ][ 0 ] );
+		m_Writes += DISPLAY_SENTINEL_LENGTH;
+		m_Reads += DISPLAY_SENTINEL_LENGTH + 2u;
+
+		m_DisplayBoundaryWaitReads[ arm ][ 0 ] =
+			displayBoundaryWaitRaster( true );
+		m_Reads += m_DisplayBoundaryWaitReads[ arm ][ 0 ] & 0x7FFFFFFFu;
+		displayFetchSetDEN( state );
+		m_Writes += 2;
+		const u64 started = hostCycles();
+		const u64 stop = started
+		               + (u64)exposureSeconds * SCPU_ARM_CLOCK_HZ;
+		if ( refresh && scrubTest )
+		{
+			m_DisplayRefreshStartOK[ arm ] = 1;
+			const u64 opportunityCycles = SCPU_ARM_CLOCK_HZ / ( 60u * 128u );
+			u64 nextOpportunity = started;
+			u64 now = started;
+			do
+			{
+				READ_CYCLE_COUNTER( now );
+				if ( now >= stop ) break;
+				if ( now < nextOpportunity )
+					continue;
+				nextOpportunity += opportunityCycles;
+				m_DisplayScrubOpportunities[ arm ]++;
+				const u16 line = rasterLine();
+				if ( !c64RasterIsSafeForBulkTransfer( m_Signals.video, line ) )
+					continue;
+				u64 chunkStart, chunkEnd;
+				READ_CYCLE_COUNTER( chunkStart );
+				const u32 sent = scrubBuffer->resyncDisplayed(
+					0x0400, state == 2 ? 0x2000 : 0xFFFFFFFF,
+					64, true );
+				READ_CYCLE_COUNTER( chunkEnd );
+				m_DisplayRefreshSlots[ arm ] += sent;
+				const u32 chunkCycles = (u32)( chunkEnd - chunkStart );
+				if ( chunkCycles > m_DisplayScrubMaxChunkCycles[ arm ] )
+					m_DisplayScrubMaxChunkCycles[ arm ] = chunkCycles;
+			} while ( now < stop );
+		}
+		else if ( refresh && rwHold )
+		{
+			// The output latch is set before changing the GPIO direction, so R/W
+			// can never glitch low. The VIC only reads during its owned cycles.
+			// Restore high impedance before the first following physical access.
+			SET_GPIO( bRW_OUT );
+			OUT_GPIO_RW();
+			m_DisplayRefreshStartOK[ arm ] = 1;
+			while ( hostCycles() < stop ) asm volatile( "nop" );
+			INP_GPIO_RW();
+		}
+		else if ( refresh && core0 )
+		{
+			m_DisplayRefreshStartOK[ arm ] = 1;
+			u64 pulses = 0;
+			do
+			{
+				pulses += core0RefreshFullFrame();
+			} while ( hostCycles() < stop );
+			m_DisplayRefreshSlots[ arm ] = pulses;
+		}
+		else if ( refresh )
+		{
+			c128RefreshForceContinuous( true );
+			m_DisplayRefreshStartOK[ arm ] = c128RefreshStart() ? 1 : 0;
+			const u64 slotsBefore = c128RefreshSlots();
+			while ( hostCycles() < stop ) asm volatile( "nop" );
+			m_DisplayRefreshSlots[ arm ] = c128RefreshSlots() - slotsBefore;
+			c128RefreshStop();
+			c128RefreshForceContinuous( false );
+		}
+		else
+		{
+			while ( hostCycles() < stop ) asm volatile( "nop" );
+		}
+		m_DisplayBoundaryWaitReads[ arm ][ 1 ] =
+			displayBoundaryWaitRaster( true );
+		m_Reads += m_DisplayBoundaryWaitReads[ arm ][ 1 ] & 0x7FFFFFFFu;
+		displayFetchBlank( state );
+		m_Writes += 2;
+		m_DisplayBoundaryElapsedUsec[ arm ] =
+			(u32)( ( hostCycles() - started )
+			       / ( SCPU_ARM_CLOCK_HZ / 1000000u ) );
+
+		m_DisplayBoundaryCaptureUsec[ arm ][ 1 ] =
+			displayPersistenceCapture(
+				salt, false, displayBoundaryMismatch[ arm ][ 1 ],
+				m_DisplayBoundaryFirstExpected[ arm ][ 1 ],
+				m_DisplayBoundaryFirstActual[ arm ][ 1 ],
+				m_DisplayBoundaryXorAND[ arm ][ 1 ],
+				m_DisplayBoundaryXorOR[ arm ][ 1 ] );
+		displayAddressAnalyzeMap(
+			displayBoundaryMismatch[ arm ][ 1 ],
+			m_DisplayBoundaryErrors[ arm ][ 1 ],
+			m_DisplayBoundaryFirst[ arm ][ 1 ],
+			m_DisplayBoundaryLast[ arm ][ 1 ],
+			m_DisplayBoundaryAND[ arm ][ 1 ],
+			m_DisplayBoundaryOR[ arm ][ 1 ],
+			m_DisplayBoundaryRuns[ arm ][ 1 ],
+			m_DisplayBoundaryMaxRun[ arm ][ 1 ] );
+		displaySentinelCompare(
+			displayBoundaryMismatch[ arm ][ 0 ],
+			displayBoundaryMismatch[ arm ][ 1 ],
+			m_DisplayBoundarySame[ arm ],
+			m_DisplayBoundaryAdded[ arm ],
+			m_DisplayBoundaryRemoved[ arm ] );
+		m_Reads += DISPLAY_SENTINEL_LENGTH + 2u;
+	}
+	c128RefreshStop();
+	c128RefreshForceContinuous( false );
+	return true;
+}
+
 bool CRADBus::c128KnownFirstTransferOnly() const
 {
 	return m_Signals.machine == MACHINE_C128
@@ -2319,6 +5196,46 @@ void CRADBus::logSelfTestResults( CLogger *logger ) const
 		logger->Write( "RADbus", LogNotice,
 		               "read timing: NO stable window; retained %u",
 		               (unsigned)m_ReadTimingConfigured );
+	{
+		const u32 i = m_ReadTimingRAMBestSample >= 300u
+		           && m_ReadTimingRAMBestSample <= 620u
+		           ? ( m_ReadTimingRAMBestSample - 300u ) / 5u : 0u;
+		logger->Write( "RADbus", LogNotice,
+		               "read observe: mixed RAM=%u/%u RAM-only=%u/%u mixed VIC err/dist/dom=%u/%u/%02Xx%u isolated=%u/%u/%02Xx%u",
+		               (unsigned)m_ReadTimingRAMBestSample,
+		               (unsigned)m_ReadTimingRAMBestError,
+		               (unsigned)m_ReadTimingRAMOnlyBestSample,
+		               (unsigned)m_ReadTimingRAMOnlyBestError,
+		               (unsigned)m_ReadTimingMixedVICErrors[ i ],
+		               (unsigned)m_ReadTimingMixedVICDistinct[ i ],
+		               m_ReadTimingMixedVICDominantValue[ i ],
+		               (unsigned)m_ReadTimingMixedVICDominantCount[ i ],
+		               (unsigned)m_ReadTimingIsolatedVICErrors[ i ],
+		               (unsigned)m_ReadTimingIsolatedVICDistinct[ i ],
+		               m_ReadTimingIsolatedVICDominantValue[ i ],
+		               (unsigned)m_ReadTimingIsolatedVICDominantCount[ i ] );
+		logger->Write( "RADbus", LogNotice,
+		               "read rotate @%u: position=%u,%u,%u,%u,%u,%u address=%u,%u,%u,%u,%u,%u",
+		               (unsigned)m_ReadTimingRAMBestSample,
+		               (unsigned)m_ReadTimingMixedRAMPositionErrors[ i ][ 0 ],
+		               (unsigned)m_ReadTimingMixedRAMPositionErrors[ i ][ 1 ],
+		               (unsigned)m_ReadTimingMixedRAMPositionErrors[ i ][ 2 ],
+		               (unsigned)m_ReadTimingMixedRAMPositionErrors[ i ][ 3 ],
+		               (unsigned)m_ReadTimingMixedRAMPositionErrors[ i ][ 4 ],
+		               (unsigned)m_ReadTimingMixedRAMPositionErrors[ i ][ 5 ],
+		               (unsigned)m_ReadTimingMixedRAMAddressErrors[ i ][ 0 ],
+		               (unsigned)m_ReadTimingMixedRAMAddressErrors[ i ][ 1 ],
+		               (unsigned)m_ReadTimingMixedRAMAddressErrors[ i ][ 2 ],
+		               (unsigned)m_ReadTimingMixedRAMAddressErrors[ i ][ 3 ],
+		               (unsigned)m_ReadTimingMixedRAMAddressErrors[ i ][ 4 ],
+		               (unsigned)m_ReadTimingMixedRAMAddressErrors[ i ][ 5 ] );
+	}
+	if ( m_SnapshotKernalObserved || m_SnapshotBasicObserved )
+		logger->Write( "RADbus", LogNotice,
+		               "snapshot byte0: kernal=%02X/%02X/%02X basic=%02X/%02X/%02X (first/reread/copied)",
+		               m_SnapshotKernalFirst, m_SnapshotKernalReread,
+		               m_SnapshotKernalCopied, m_SnapshotBasicFirst,
+		               m_SnapshotBasicReread, m_SnapshotBasicCopied );
 
 	logger->Write( "RADbus", LogNotice,
 	               "write timing: configured %u/%u pass=%u selected %u/%u",
@@ -2327,6 +5244,34 @@ void CRADBus::logSelfTestResults( CLogger *logger ) const
 	               (unsigned)m_WriteTimingPassingPoints,
 	               (unsigned)m_WriteTimingSelectedAddr,
 	               (unsigned)m_WriteTimingSelectedData );
+
+	if ( m_SIDTimingEdge )
+		logger->Write( "RADbus", LogNotice,
+		               "SID timing: last PHI2-high selected distinct/dominant/ramp=%u/%u/%u",
+		               (unsigned)m_SIDTimingDistinct,
+		               (unsigned)m_SIDTimingDominant,
+		               (unsigned)m_SIDTimingRamp );
+	else if ( m_SIDTimingStart )
+		logger->Write( "RADbus", LogNotice,
+		               "SID timing: configured %u saw %u..%u selected %u distinct/dominant/ramp=%u/%u/%u",
+		               (unsigned)m_SIDTimingConfigured,
+		               (unsigned)m_SIDTimingStart,
+		               (unsigned)m_SIDTimingEnd,
+		               (unsigned)m_SIDTimingSelected,
+		               (unsigned)m_SIDTimingDistinct,
+		               (unsigned)m_SIDTimingDominant,
+		               (unsigned)m_SIDTimingRamp );
+	else
+		logger->Write( "RADbus", LogNotice,
+		               "SID timing: NO saw window; retained %u best %u distinct/dominant/ramp=%u/%u/%u",
+		               (unsigned)m_SIDTimingConfigured,
+		               (unsigned)m_SIDTimingBestSample,
+		               (unsigned)m_SIDTimingDistinct,
+		               (unsigned)m_SIDTimingDominant,
+		               (unsigned)m_SIDTimingRamp );
+	if ( !m_SIDPhysicalReliable )
+		logger->Write( "RADbus", LogNotice,
+		               "SID fallback: OSC3 host-clock model; POTX/POTY 17-read mode filter" );
 
 	logger->Write( "RADbus", LogNotice,
 	               "raster: %02X %02X %02X %02X %02X %02X %s",
@@ -2385,6 +5330,1133 @@ void CRADBus::logSelfTestResults( CLogger *logger ) const
 		               (unsigned)m_FirstDiscCount[p][5] );
 }
 
+void CRADBus::logAccessSentinelResults( CLogger *logger ) const
+{
+	if ( !logger ) return;
+	if ( !m_AccessSentinelRan )
+	{
+		logger->Write( "RADbus", LogWarning,
+		               "access sentinel: NOT RUN (requires acquired C64 bus)" );
+		return;
+	}
+
+	static const char *armNames[ 3 ] = { "control", "read-D020", "write-D020" };
+	logger->Write( "RADbus", LogNotice,
+	               "access sentinel: bytes=%u traffic/arm=%u rate=16000/s two-pass oracle",
+	               (unsigned)ACCESS_SENTINEL_LENGTH,
+	               (unsigned)m_AccessSentinelTrafficCount );
+	for ( u32 arm = 0; arm < 3; arm++ )
+	{
+		logger->Write( "RADbus", LogNotice,
+		               "  %s base=%u/%u exposure=%u/%u arm retained/added/removed=%u/%u/%u verify same/new/cleared=%u/%u/%u elapsed-us=%u",
+		               armNames[ arm ],
+		               (unsigned)m_AccessSentinelBaselineErrors[ arm ][ 0 ],
+		               (unsigned)m_AccessSentinelBaselineErrors[ arm ][ 1 ],
+		               (unsigned)m_AccessSentinelExposureErrors[ arm ][ 0 ],
+		               (unsigned)m_AccessSentinelExposureErrors[ arm ][ 1 ],
+		               (unsigned)m_AccessSentinelBaselineRetainedErrors[ arm ],
+		               (unsigned)m_AccessSentinelArmAddedErrors[ arm ],
+		               (unsigned)m_AccessSentinelArmRemovedErrors[ arm ],
+		               (unsigned)m_AccessSentinelSameErrors[ arm ],
+		               (unsigned)m_AccessSentinelNewErrors[ arm ],
+		               (unsigned)m_AccessSentinelClearedErrors[ arm ],
+		               (unsigned)m_AccessSentinelElapsedUsec[ arm ] );
+		logger->Write( "RADbus", LogNotice,
+		               "    first pass0/pass1: %04X %02X>%02X / %04X %02X>%02X",
+		               m_AccessSentinelFirstAddr[ arm ][ 0 ],
+		               m_AccessSentinelFirstExpected[ arm ][ 0 ],
+		               m_AccessSentinelFirstActual[ arm ][ 0 ],
+		               m_AccessSentinelFirstAddr[ arm ][ 1 ],
+		               m_AccessSentinelFirstExpected[ arm ][ 1 ],
+		               m_AccessSentinelFirstActual[ arm ][ 1 ] );
+	}
+}
+
+void CRADBus::logDisplaySentinelResults( CLogger *logger ) const
+{
+	if ( !logger ) return;
+	if ( !m_DisplaySentinelRan )
+	{
+		logger->Write( "RADbus", LogWarning,
+		               "display sentinel: NOT RUN (requires acquired C64 bus)" );
+		return;
+	}
+
+	static const char *armNames[ 9 ] =
+	{
+		"on-none", "on-read-4k", "on-read-16k", "on-read-64k",
+		"on-write-4k", "on-write-16k", "on-write-64k",
+		"off-read-64k", "off-write-64k"
+	};
+	logger->Write( "RADbus", LogNotice,
+	               "display sentinel K222: bytes=%u arms=9 exposure=8s blanked-readback=3",
+	               (unsigned)DISPLAY_SENTINEL_LENGTH );
+	for ( u32 arm = 0; arm < 9; arm++ )
+	{
+		logger->Write( "RADbus", LogNotice,
+		               "  %s rate/count=%u/%u base=%u/%u exposure=%u/%u/%u arm kept/add/rem=%u/%u/%u verify01 s/n/c=%u/%u/%u verify12=%u/%u/%u us=%u",
+		               armNames[ arm ],
+		               (unsigned)m_DisplaySentinelRate[ arm ],
+		               (unsigned)m_DisplaySentinelTrafficCount[ arm ],
+		               (unsigned)m_DisplaySentinelBaselineErrors[ arm ][ 0 ],
+		               (unsigned)m_DisplaySentinelBaselineErrors[ arm ][ 1 ],
+		               (unsigned)m_DisplaySentinelExposureErrors[ arm ][ 0 ],
+		               (unsigned)m_DisplaySentinelExposureErrors[ arm ][ 1 ],
+		               (unsigned)m_DisplaySentinelExposureErrors[ arm ][ 2 ],
+		               (unsigned)m_DisplaySentinelBaselineRetainedErrors[ arm ],
+		               (unsigned)m_DisplaySentinelArmAddedErrors[ arm ],
+		               (unsigned)m_DisplaySentinelArmRemovedErrors[ arm ],
+		               (unsigned)m_DisplaySentinelVerifySameErrors[ arm ][ 0 ],
+		               (unsigned)m_DisplaySentinelVerifyNewErrors[ arm ][ 0 ],
+		               (unsigned)m_DisplaySentinelVerifyClearedErrors[ arm ][ 0 ],
+		               (unsigned)m_DisplaySentinelVerifySameErrors[ arm ][ 1 ],
+		               (unsigned)m_DisplaySentinelVerifyNewErrors[ arm ][ 1 ],
+		               (unsigned)m_DisplaySentinelVerifyClearedErrors[ arm ][ 1 ],
+		               (unsigned)m_DisplaySentinelElapsedUsec[ arm ] );
+		logger->Write( "RADbus", LogNotice,
+		               "    first p0/p1/p2: %04X %02X>%02X / %04X %02X>%02X / %04X %02X>%02X",
+		               m_DisplaySentinelFirstAddr[ arm ][ 0 ],
+		               m_DisplaySentinelFirstExpected[ arm ][ 0 ],
+		               m_DisplaySentinelFirstActual[ arm ][ 0 ],
+		               m_DisplaySentinelFirstAddr[ arm ][ 1 ],
+		               m_DisplaySentinelFirstExpected[ arm ][ 1 ],
+		               m_DisplaySentinelFirstActual[ arm ][ 1 ],
+		               m_DisplaySentinelFirstAddr[ arm ][ 2 ],
+		               m_DisplaySentinelFirstExpected[ arm ][ 2 ],
+		               m_DisplaySentinelFirstActual[ arm ][ 2 ] );
+	}
+}
+
+void CRADBus::logDisplayAddressResults( CLogger *logger ) const
+{
+	if ( !logger ) return;
+	if ( !m_DisplayAddressRan )
+	{
+		logger->Write( "RADbus", LogWarning,
+		               "display address K223: NOT RUN (requires acquired C64 bus)" );
+		return;
+	}
+
+	static const char *modeNames[ 2 ] = { "text-DEN0", "bitmap-DEN0" };
+	static const char *styleNames[ 2 ] = { "single", "double" };
+	logger->Write( "RADbus", LogNotice,
+	               "display address K223: target=$2078 immediate=256 trials; bulk maps=9216 bytes" );
+	for ( u32 mode = 0; mode < 2; mode++ )
+	{
+		for ( u32 style = 0; style < 2; style++ )
+		{
+			const u16 fixedMask = m_DisplayAddressMapErrors[ mode ][ style ]
+				? (u16)~( m_DisplayAddressMapAND[ mode ][ style ]
+				          ^ m_DisplayAddressMapOR[ mode ][ style ] )
+				: 0;
+			logger->Write( "RADbus", LogNotice,
+			               "  %s %s immediate r0/r1/r2=%u/%u/%u first=%u exp=%02X got=%02X/%02X/%02X map=%u first/last=%04X/%04X and/or=%04X/%04X fixed=%04X:%04X runs/max=%u/%u",
+			               modeNames[ mode ], styleNames[ style ],
+			               (unsigned)m_DisplayAddressImmediateErrors[ mode ][ style ][ 0 ],
+			               (unsigned)m_DisplayAddressImmediateErrors[ mode ][ style ][ 1 ],
+			               (unsigned)m_DisplayAddressImmediateErrors[ mode ][ style ][ 2 ],
+			               (unsigned)m_DisplayAddressImmediateFirstTrial[ mode ][ style ],
+			               m_DisplayAddressImmediateFirstExpected[ mode ][ style ],
+			               m_DisplayAddressImmediateFirstActual[ mode ][ style ][ 0 ],
+			               m_DisplayAddressImmediateFirstActual[ mode ][ style ][ 1 ],
+			               m_DisplayAddressImmediateFirstActual[ mode ][ style ][ 2 ],
+			               (unsigned)m_DisplayAddressMapErrors[ mode ][ style ],
+			               m_DisplayAddressMapFirst[ mode ][ style ],
+			               m_DisplayAddressMapLast[ mode ][ style ],
+			               m_DisplayAddressMapAND[ mode ][ style ],
+			               m_DisplayAddressMapOR[ mode ][ style ],
+			               fixedMask,
+			               (u16)( m_DisplayAddressMapAND[ mode ][ style ] & fixedMask ),
+			               m_DisplayAddressMapRuns[ mode ][ style ],
+			               m_DisplayAddressMapMaxRun[ mode ][ style ] );
+		}
+	}
+	logger->Write( "RADbus", LogNotice, "  delay ladder: %s",
+	               m_DisplayAddressLadderRan ? "ran" : "skipped (immediate r2 failed)" );
+	if ( m_DisplayAddressLadderRan )
+	{
+		for ( u32 mode = 0; mode < 2; mode++ )
+			for ( u32 rung = 0; rung < 9; rung++ )
+				logger->Write( "RADbus", LogNotice,
+				               "    %s %uus/%uus exp=%02X initial=%02X/%02X/%02X delayed=%02X/%02X/%02X",
+				               modeNames[ mode ],
+				               (unsigned)m_DisplayAddressDelayUsec[ rung ],
+				               (unsigned)m_DisplayAddressElapsedUsec[ mode ][ rung ],
+				               m_DisplayAddressLadderExpected[ mode ][ rung ],
+				               m_DisplayAddressLadderInitial[ mode ][ rung ][ 0 ],
+				               m_DisplayAddressLadderInitial[ mode ][ rung ][ 1 ],
+				               m_DisplayAddressLadderInitial[ mode ][ rung ][ 2 ],
+				               m_DisplayAddressLadderDelayed[ mode ][ rung ][ 0 ],
+				               m_DisplayAddressLadderDelayed[ mode ][ rung ][ 1 ],
+				               m_DisplayAddressLadderDelayed[ mode ][ rung ][ 2 ] );
+	}
+}
+
+void CRADBus::logDisplayRowResults( CLogger *logger ) const
+{
+	if ( !logger ) return;
+	if ( !m_DisplayRowRan )
+	{
+		logger->Write( "RADbus", LogWarning,
+		               "display row K225: NOT RUN (requires acquired C64 bus)" );
+		return;
+	}
+	logger->Write( "RADbus", LogNotice,
+	               "display row K225: 10 high-entropy write maps + 6 independent retention maps" );
+	for ( u32 arm = 0; arm < DISPLAY_ROW_ARM_COUNT; arm++ )
+	{
+		const u16 fixedMask = m_DisplayRowErrors[ arm ][ 1 ]
+			? (u16)~( m_DisplayRowAND[ arm ][ 1 ] ^ m_DisplayRowOR[ arm ][ 1 ] )
+			: 0;
+		logger->Write( "RADbus", LogNotice,
+		               "  arm%u %s-%s salt=%02X pre-attempt/errors=%u/%u test-errors=%u first/last=%04X/%04X and/or=%04X/%04X fixed=%04X:%04X runs/max=%u/%u seed-us=%u/%u capture-us=%u/%u",
+		               (unsigned)arm,
+		               m_DisplayRowMode[ arm ] ? "bitmap" : "text",
+		               m_DisplayRowKind[ arm ] ? "repeat" : "single",
+		               m_DisplayRowSalt[ arm ],
+		               m_DisplayRowPrefillAttempts[ arm ],
+		               (unsigned)m_DisplayRowErrors[ arm ][ 0 ],
+		               (unsigned)m_DisplayRowErrors[ arm ][ 1 ],
+		               m_DisplayRowFirst[ arm ][ 1 ],
+		               m_DisplayRowLast[ arm ][ 1 ],
+		               m_DisplayRowAND[ arm ][ 1 ],
+		               m_DisplayRowOR[ arm ][ 1 ], fixedMask,
+		               (u16)( m_DisplayRowAND[ arm ][ 1 ] & fixedMask ),
+		               m_DisplayRowRuns[ arm ][ 1 ],
+		               m_DisplayRowMaxRun[ arm ][ 1 ],
+		               (unsigned)m_DisplayRowSeedUsec[ arm ][ 0 ],
+		               (unsigned)m_DisplayRowSeedUsec[ arm ][ 1 ],
+		               (unsigned)m_DisplayRowCaptureUsec[ arm ][ 0 ],
+		               (unsigned)m_DisplayRowCaptureUsec[ arm ][ 1 ] );
+	}
+	for ( u32 rung = 0; rung < DISPLAY_ROW_RETENTION_COUNT; rung++ )
+	{
+		const u16 fixedMask = m_DisplayRowRetentionErrors[ rung ][ 1 ]
+			? (u16)~( m_DisplayRowRetentionAND[ rung ][ 1 ]
+			          ^ m_DisplayRowRetentionOR[ rung ][ 1 ] )
+			: 0;
+		logger->Write( "RADbus", LogNotice,
+		               "  retain%u delay/actual=%u/%u salt=%02X attempts=%u base/post=%u/%u first/last=%04X/%04X and/or=%04X/%04X fixed=%04X:%04X runs/max=%u/%u seed-us=%u capture-us=%u/%u",
+		               (unsigned)rung,
+		               (unsigned)m_DisplayRowRetentionDelayUsec[ rung ],
+		               (unsigned)m_DisplayRowRetentionElapsedUsec[ rung ],
+		               m_DisplayRowRetentionSalt[ rung ],
+		               m_DisplayRowRetentionAttempts[ rung ],
+		               (unsigned)m_DisplayRowRetentionErrors[ rung ][ 0 ],
+		               (unsigned)m_DisplayRowRetentionErrors[ rung ][ 1 ],
+		               m_DisplayRowRetentionFirst[ rung ][ 1 ],
+		               m_DisplayRowRetentionLast[ rung ][ 1 ],
+		               m_DisplayRowRetentionAND[ rung ][ 1 ],
+		               m_DisplayRowRetentionOR[ rung ][ 1 ], fixedMask,
+		               (u16)( m_DisplayRowRetentionAND[ rung ][ 1 ] & fixedMask ),
+		               m_DisplayRowRetentionRuns[ rung ][ 1 ],
+		               m_DisplayRowRetentionMaxRun[ rung ][ 1 ],
+		               (unsigned)m_DisplayRowRetentionSeedUsec[ rung ],
+		               (unsigned)m_DisplayRowRetentionCaptureUsec[ rung ][ 0 ],
+		               (unsigned)m_DisplayRowRetentionCaptureUsec[ rung ][ 1 ] );
+	}
+}
+
+void CRADBus::logDisplayFetchResults( CLogger *logger ) const
+{
+	if ( !logger ) return;
+	if ( !m_DisplayFetchRan )
+	{
+		logger->Write( "RADbus", LogWarning,
+		               "display fetch K226: NOT RUN (requires acquired C64 bus)" );
+		return;
+	}
+	static const char *stateNames[ 3 ] = { "off", "text", "bitmap" };
+	static const char *operationNames[ 3 ] = { "none", "read", "write" };
+	logger->Write( "RADbus", LogNotice,
+	               "display fetch K226: 9 active-fetch arms + 6 single-write retention controls" );
+	for ( u32 arm = 0; arm < DISPLAY_FETCH_ARM_COUNT; arm++ )
+	{
+		logger->Write( "RADbus", LogNotice,
+		               "  arm%u %s-%s salt=%02X rate/count=%u/%u pre/base/post=%u/%u/%u elapsed=%u seed-us=%u/%u capture-us=%u/%u/%u",
+		               (unsigned)arm, stateNames[ m_DisplayFetchState[ arm ] ],
+		               operationNames[ m_DisplayFetchOperation[ arm ] ],
+		               m_DisplayFetchSalt[ arm ],
+		               (unsigned)m_DisplayFetchRate[ arm ],
+		               (unsigned)m_DisplayFetchTrafficCount[ arm ],
+		               (unsigned)m_DisplayFetchErrors[ arm ][ 0 ],
+		               (unsigned)m_DisplayFetchErrors[ arm ][ 1 ],
+		               (unsigned)m_DisplayFetchErrors[ arm ][ 2 ],
+		               (unsigned)m_DisplayFetchElapsedUsec[ arm ],
+		               (unsigned)m_DisplayFetchSeedUsec[ arm ][ 0 ],
+		               (unsigned)m_DisplayFetchSeedUsec[ arm ][ 1 ],
+		               (unsigned)m_DisplayFetchCaptureUsec[ arm ][ 0 ],
+		               (unsigned)m_DisplayFetchCaptureUsec[ arm ][ 1 ],
+		               (unsigned)m_DisplayFetchCaptureUsec[ arm ][ 2 ] );
+	}
+	for ( u32 rung = 0; rung < DISPLAY_FETCH_RETENTION_COUNT; rung++ )
+	{
+		logger->Write( "RADbus", LogNotice,
+		               "  retain%u delay/actual=%u/%u salt=%02X attempts=%u pre/base/post=%u/%u/%u seed-us=%u/%u capture-us=%u/%u/%u",
+		               (unsigned)rung,
+		               (unsigned)m_DisplayFetchRetentionDelayUsec[ rung ],
+		               (unsigned)m_DisplayFetchRetentionElapsedUsec[ rung ],
+		               m_DisplayFetchRetentionSalt[ rung ],
+		               m_DisplayFetchRetentionPrefillAttempts[ rung ],
+		               (unsigned)m_DisplayFetchRetentionErrors[ rung ][ 0 ],
+		               (unsigned)m_DisplayFetchRetentionErrors[ rung ][ 1 ],
+		               (unsigned)m_DisplayFetchRetentionErrors[ rung ][ 2 ],
+		               (unsigned)m_DisplayFetchRetentionSeedUsec[ rung ][ 0 ],
+		               (unsigned)m_DisplayFetchRetentionSeedUsec[ rung ][ 1 ],
+		               (unsigned)m_DisplayFetchRetentionCaptureUsec[ rung ][ 0 ],
+		               (unsigned)m_DisplayFetchRetentionCaptureUsec[ rung ][ 1 ],
+		               (unsigned)m_DisplayFetchRetentionCaptureUsec[ rung ][ 2 ] );
+	}
+}
+
+void CRADBus::logDisplayPersistenceResults( CLogger *logger ) const
+{
+	if ( !logger ) return;
+	if ( !m_DisplayPersistenceRan )
+	{
+		logger->Write( "RADbus", LogWarning,
+		               "display persistence K227: NOT RUN (requires acquired C64 bus)" );
+		return;
+	}
+	static const char *stateNames[ 3 ] = { "off", "text", "bitmap" };
+	static const char *operationNames[ 3 ] = { "none", "read", "write" };
+	logger->Write( "RADbus", LogNotice,
+	               "display persistence K227: 12 repeated active-fetch arms, 3 post captures" );
+	for ( u32 arm = 0; arm < DISPLAY_PERSISTENCE_ARM_COUNT; arm++ )
+		logger->Write( "RADbus", LogNotice,
+		               "  arm%u %s-%s salt=%02X errors pre/base/p0/p1/p2=%u/%u/%u/%u/%u persist01 s/a/r=%u/%u/%u persist12=%u/%u/%u",
+		               (unsigned)arm,
+		               stateNames[ m_DisplayPersistenceState[ arm ] ],
+		               operationNames[ m_DisplayPersistenceOperation[ arm ] ],
+		               m_DisplayPersistenceSalt[ arm ],
+		               (unsigned)m_DisplayPersistenceErrors[ arm ][ 0 ],
+		               (unsigned)m_DisplayPersistenceErrors[ arm ][ 1 ],
+		               (unsigned)m_DisplayPersistenceErrors[ arm ][ 2 ],
+		               (unsigned)m_DisplayPersistenceErrors[ arm ][ 3 ],
+		               (unsigned)m_DisplayPersistenceErrors[ arm ][ 4 ],
+		               (unsigned)m_DisplayPersistenceSame[ arm ][ 0 ],
+		               (unsigned)m_DisplayPersistenceAdded[ arm ][ 0 ],
+		               (unsigned)m_DisplayPersistenceRemoved[ arm ][ 0 ],
+		               (unsigned)m_DisplayPersistenceSame[ arm ][ 1 ],
+		               (unsigned)m_DisplayPersistenceAdded[ arm ][ 1 ],
+		               (unsigned)m_DisplayPersistenceRemoved[ arm ][ 1 ] );
+}
+
+void CRADBus::logDisplayTimingResults( CLogger *logger ) const
+{
+	if ( !logger ) return;
+	if ( !m_DisplayTimingRan )
+	{
+		logger->Write( "RADbus", LogWarning,
+		               "display timing K228: NOT RUN (requires acquired C64 bus)" );
+		return;
+	}
+	static const char *stateNames[ 3 ] = { "off", "text", "bitmap" };
+	static const char *operationNames[ 3 ] = { "none", "read", "write" };
+	logger->Write( "RADbus", LogNotice,
+	               "display timing K228: multi-sample readback and targeted repair" );
+	for ( u32 arm = 0; arm < DISPLAY_TIMING_ARM_COUNT; arm++ )
+		logger->Write( "RADbus", LogNotice,
+		               "  arm%u %s-%s salt=%02X pre/base=%u/%u initial/final/repaired=%u/%u/%u repair-writes=%u",
+		               (unsigned)arm, stateNames[ m_DisplayTimingState[ arm ] ],
+		               operationNames[ m_DisplayTimingOperation[ arm ] ],
+		               m_DisplayTimingSalt[ arm ],
+		               (unsigned)m_DisplayTimingPrefillErrors[ arm ],
+		               (unsigned)m_DisplayTimingBaselineErrors[ arm ],
+		               (unsigned)m_DisplayTimingErrors[ arm ][ 0 ],
+		               (unsigned)m_DisplayTimingErrors[ arm ][ 8 ],
+		               (unsigned)m_DisplayTimingErrors[ arm ][ 9 ],
+		               (unsigned)m_DisplayTimingRepairWrites[ arm ] );
+}
+
+void CRADBus::logDisplayBoundaryResults( CLogger *logger ) const
+{
+	if ( !logger ) return;
+	if ( !m_DisplayBoundaryRan )
+	{
+		logger->Write( "RADbus", LogWarning,
+		               "display boundary K229: NOT RUN (requires acquired C64 bus)" );
+		return;
+	}
+	logger->Write( "RADbus", LogNotice,
+	               "display boundary K229: transition-only versus four-second dwell" );
+	for ( u32 arm = 0; arm < DISPLAY_BOUNDARY_ARM_COUNT; arm++ )
+		logger->Write( "RADbus", LogNotice,
+		               "  arm%u %s-%s-%s salt=%02X pre/base/post=%u/%u/%u added=%u waits=%u/%u",
+		               (unsigned)arm,
+		               m_DisplayBoundaryState[ arm ] == 1 ? "text" : "bitmap",
+		               m_DisplayBoundarySafe[ arm ] ? "border" : "visible",
+		               m_DisplayBoundaryDwell[ arm ] ? "dwell" : "transition",
+		               m_DisplayBoundarySalt[ arm ],
+		               (unsigned)m_DisplayBoundaryPrefillErrors[ arm ],
+		               (unsigned)m_DisplayBoundaryErrors[ arm ][ 0 ],
+		               (unsigned)m_DisplayBoundaryErrors[ arm ][ 1 ],
+		               (unsigned)m_DisplayBoundaryAdded[ arm ],
+		               (unsigned)m_DisplayBoundaryWaitReads[ arm ][ 0 ],
+		               (unsigned)m_DisplayBoundaryWaitReads[ arm ][ 1 ] );
+}
+
+void CRADBus::logDisplayRefreshResults( CLogger *logger ) const
+{
+	if ( !logger ) return;
+	if ( !m_DisplayRefreshRan )
+	{
+		logger->Write( "RADbus", LogWarning,
+		               "display refresh %s: NOT RUN (requires acquired C64 bus)",
+		               m_DisplayDiagnosticVariant == 3 ? "K233"
+		             : m_DisplayDiagnosticVariant == 2 ? "K232"
+		             : m_DisplayDiagnosticVariant == 1 ? "K231" : "K230" );
+		return;
+	}
+	logger->Write( "RADbus", LogNotice,
+	               m_DisplayDiagnosticVariant == 3
+	                 ? "display scrub K233: control versus masked shadow repair"
+	               : m_DisplayDiagnosticVariant == 2
+	                 ? "display R/W K232: floating versus actively-held-high idle"
+	                 : m_DisplayDiagnosticVariant == 1
+	                 ? "display refresh K231: sustained-DMA versus core0 VIC-half release"
+	                 : "display refresh K230: sustained-DMA versus core3 VIC-half release" );
+	for ( u32 arm = 0; arm < 8; arm++ )
+		logger->Write( "RADbus", LogNotice,
+		               "  arm%u %s intervention=%u started=%u salt=%02X pre/base/post=%u/%u/%u added=%u bytes/opp/maxcycles=%llu/%u/%u",
+		               (unsigned)arm,
+		               m_DisplayBoundaryState[ arm ] == 1 ? "text" : "bitmap",
+		               (unsigned)m_DisplayRefreshEnabled[ arm ],
+		               (unsigned)m_DisplayRefreshStartOK[ arm ],
+		               m_DisplayBoundarySalt[ arm ],
+		               (unsigned)m_DisplayBoundaryPrefillErrors[ arm ],
+		               (unsigned)m_DisplayBoundaryErrors[ arm ][ 0 ],
+		               (unsigned)m_DisplayBoundaryErrors[ arm ][ 1 ],
+		               (unsigned)m_DisplayBoundaryAdded[ arm ],
+		               (unsigned long long)m_DisplayRefreshSlots[ arm ],
+		               (unsigned)m_DisplayScrubOpportunities[ arm ],
+		               (unsigned)m_DisplayScrubMaxChunkCycles[ arm ] );
+}
+
+void CRADBus::logDisplayBAGuardResults( CLogger *logger ) const
+{
+	if ( !logger ) return;
+	if ( !m_DisplayBAGuardRan )
+	{
+		logger->Write( "RADbus", LogWarning,
+		               "display BA guard K239: NOT RUN (requires acquired C64 bus)" );
+		return;
+	}
+	static const char *operationNames[ 3 ] = { "idle", "read", "write" };
+	logger->Write( "RADbus", LogNotice,
+	               "display BA guard K239: identical composite bitmap, repeated timed arms" );
+	logger->Write( "RADbus", LogNotice,
+	               "  read eye best=%u errors=%u configured/selected=%u/%u stable=%u..%u",
+	               (unsigned)m_ReadTimingBestErrorSample,
+	               (unsigned)m_ReadTimingBestError,
+	               (unsigned)m_ReadTimingConfigured,
+	               (unsigned)m_ReadTimingSelected,
+	               (unsigned)m_ReadTimingStart, (unsigned)m_ReadTimingEnd );
+	for ( u32 arm = 0; arm < DISPLAY_BA_ARM_COUNT; arm++ )
+		logger->Write( "RADbus", LogNotice,
+		               "  arm%u %s bias=%u rot=%u base p/u=%u/%u post p/u/unstable=%u/%u/%u added=%u families matrix/00/ff/alt/entropy=%u/%u/%u/%u/%u",
+		               (unsigned)arm, operationNames[ m_DisplayBAOperation[ arm ] ],
+		               (unsigned)m_DisplayBABias[ arm ],
+		               (unsigned)m_DisplayBARotation[ arm ],
+		               (unsigned)m_DisplayBABaselinePersistent[ arm ],
+		               (unsigned)m_DisplayBABaselineUnion[ arm ],
+		               (unsigned)m_DisplayBAPostPersistent[ arm ],
+		               (unsigned)m_DisplayBAPostUnion[ arm ],
+		               (unsigned)m_DisplayBAUnstableOnly[ arm ],
+		               (unsigned)m_DisplayBAAddedPersistent[ arm ],
+		               (unsigned)m_DisplayBAFamilyAdded[ arm ][ 0 ],
+		               (unsigned)m_DisplayBAFamilyAdded[ arm ][ 1 ],
+		               (unsigned)m_DisplayBAFamilyAdded[ arm ][ 2 ],
+		               (unsigned)m_DisplayBAFamilyAdded[ arm ][ 3 ],
+		               (unsigned)m_DisplayBAFamilyAdded[ arm ][ 4 ] );
+}
+
+static void displayRowFormatMapBits( char *dst, u32 capacity, u32 &n,
+	                                  const u8 *mismatch )
+{
+	for ( u32 byte = 0; byte < DISPLAY_SENTINEL_BITMAP_BYTES; byte++ )
+	{
+		if ( ( byte & 31u ) == 0 ) busDiagEndLine( dst, capacity, n );
+		busDiagHex( dst, capacity, n, mismatch[ byte ] );
+	}
+	busDiagEndLine( dst, capacity, n );
+}
+
+void CRADBus::formatDisplayBAGuardResults( char *dst, u32 capacity,
+	                                        u32 &n ) const
+{
+	static const char *operationNames[ 3 ] = { "idle", "read-D020", "write-D020" };
+	busDiagText( dst, capacity, n,
+	             "protocol: C64-DISPLAY-BA-GUARD-K239 ranges=0400-07FF,2000-3FFF bytes=9216 mode=bitmap exposure-seconds=4 traffic-rate=16000 oracle=interleaved-64-byte-families-matrix,00,FF,alternating,entropy rotation=0,1 arms=idle,w40,read,w0,w60,w20,w20,idle,w60,read,w0,w40 write-address-enable-bias=0,20,40,60 bias-applies-to-production-address-parameter data-enable-unchanged triple-primed-baseline-and-post persistent=intersection union=or added=post-intersection-minus-baseline-union diagnostic_only=1\r\n" );
+	for ( u32 arm = 0; arm < DISPLAY_BA_ARM_COUNT; arm++ )
+	{
+		busDiagText( dst, capacity, n,
+		             "ba arm/op/bias/rotation/prefill-attempts/target-attempts/count/elapsed-us/base-persistent/base-union/post-persistent/post-union/post-unstable/added/family-matrix/00/ff/alt/entropy: " );
+		const u32 first[ 6 ] =
+		{
+			arm, m_DisplayBABias[ arm ], m_DisplayBARotation[ arm ],
+			m_DisplayBAPrefillAttempts[ arm ],
+			m_DisplayBATargetAttempts[ arm ], m_DisplayBATrafficCount[ arm ]
+		};
+		busDiagDecimal( dst, capacity, n, first[ 0 ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagText( dst, capacity, n,
+		             operationNames[ m_DisplayBAOperation[ arm ] ] );
+		for ( u32 i = 1; i < 6; i++ )
+		{
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n, first[ i ] );
+		}
+		const u32 scores[ 12 ] =
+		{
+			m_DisplayBAElapsedUsec[ arm ],
+			m_DisplayBABaselinePersistent[ arm ],
+			m_DisplayBABaselineUnion[ arm ],
+			m_DisplayBAPostPersistent[ arm ],
+			m_DisplayBAPostUnion[ arm ],
+			m_DisplayBAUnstableOnly[ arm ],
+			m_DisplayBAAddedPersistent[ arm ],
+			m_DisplayBAFamilyAdded[ arm ][ 0 ],
+			m_DisplayBAFamilyAdded[ arm ][ 1 ],
+			m_DisplayBAFamilyAdded[ arm ][ 2 ],
+			m_DisplayBAFamilyAdded[ arm ][ 3 ],
+			m_DisplayBAFamilyAdded[ arm ][ 4 ]
+		};
+		for ( u32 i = 0; i < 12; i++ )
+		{
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n, scores[ i ] );
+		}
+		busDiagEndLine( dst, capacity, n );
+		busDiagText( dst, capacity, n,
+		             "  capture-us base0/base1/base2/post0/post1/post2: " );
+		for ( u32 pass = 0; pass < 6; pass++ )
+		{
+			if ( pass ) busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n,
+			                m_DisplayBACaptureUsec[ arm ][ pass ] );
+		}
+		busDiagEndLine( dst, capacity, n );
+		if ( m_DisplayBAAddedPersistent[ arm ] )
+		{
+			busDiagText( dst, capacity, n, "  added-map-bits:" );
+			displayRowFormatMapBits( dst, capacity, n,
+			                         displayBAAddedMap[ arm ] );
+		}
+	}
+}
+
+static void displayRowFormatSummary( char *dst, u32 capacity, u32 &n,
+	                                  const char *label, u32 errors,
+	                                  u16 first, u16 last, u16 addrAND,
+	                                  u16 addrOR, u16 runs, u16 maxRun )
+{
+	const u16 fixedMask = errors ? (u16)~( addrAND ^ addrOR ) : 0;
+	busDiagText( dst, capacity, n, label );
+	busDiagText( dst, capacity, n,
+	             " errors/first/last/and/or/fixed-mask/fixed-value/runs/max-run: " );
+	busDiagDecimal( dst, capacity, n, errors );
+	const u16 values[ 8 ] =
+		{ first, last, addrAND, addrOR, fixedMask,
+		  (u16)( addrAND & fixedMask ), runs, maxRun };
+	for ( u32 i = 0; i < 8; i++ )
+	{
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagHexWord( dst, capacity, n, values[ i ] );
+	}
+	busDiagEndLine( dst, capacity, n );
+}
+
+void CRADBus::formatDisplayRowResults( char *dst, u32 capacity, u32 &n ) const
+{
+	busDiagText( dst, capacity, n,
+	             "protocol: C64-DISPLAY-ROW-K225 ranges=0400-07FF,2000-3FFF bytes=9216 oracle=address-salt-high-entropy prefill=complement-adjacent-repeat-verified single-arms=8 mode-order=text,bitmap,bitmap,text,bitmap,text,text,bitmap repeat-arms=text,bitmap retention-mode=bitmap-DEN0 retention-us=500000,1000000,2000000,4000000,8000000,16000000 raw-maps=errors-only diagnostic_only=1\r\n" );
+	for ( u32 arm = 0; arm < DISPLAY_ROW_ARM_COUNT; arm++ )
+	{
+		busDiagText( dst, capacity, n, "row-map arm/mode/kind/salt/prefill-attempts: " );
+		busDiagDecimal( dst, capacity, n, arm );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagText( dst, capacity, n,
+		             m_DisplayRowMode[ arm ] ? "bitmap" : "text" );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagText( dst, capacity, n,
+		             m_DisplayRowKind[ arm ] ? "repeat" : "single" );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagHex( dst, capacity, n, m_DisplayRowSalt[ arm ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_DisplayRowPrefillAttempts[ arm ] );
+		busDiagEndLine( dst, capacity, n );
+		busDiagText( dst, capacity, n,
+		             "  seed-us prefill/test capture-us prefill/test: " );
+		busDiagDecimal( dst, capacity, n, m_DisplayRowSeedUsec[ arm ][ 0 ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_DisplayRowSeedUsec[ arm ][ 1 ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_DisplayRowCaptureUsec[ arm ][ 0 ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_DisplayRowCaptureUsec[ arm ][ 1 ] );
+		busDiagEndLine( dst, capacity, n );
+		for ( u32 phase = 0; phase < 2; phase++ )
+		{
+			displayRowFormatSummary(
+				dst, capacity, n, phase ? "  test" : "  prefill",
+				m_DisplayRowErrors[ arm ][ phase ],
+				m_DisplayRowFirst[ arm ][ phase ],
+				m_DisplayRowLast[ arm ][ phase ],
+				m_DisplayRowAND[ arm ][ phase ],
+				m_DisplayRowOR[ arm ][ phase ],
+				m_DisplayRowRuns[ arm ][ phase ],
+				m_DisplayRowMaxRun[ arm ][ phase ] );
+			if ( m_DisplayRowErrors[ arm ][ phase ] )
+			{
+				busDiagText( dst, capacity, n,
+				             phase ? "  test-map-bits:" : "  prefill-map-bits:" );
+				displayRowFormatMapBits(
+					dst, capacity, n,
+					phase ? displayRowTestMismatch[ arm ]
+					      : displayRowPrefillMismatch[ arm ] );
+			}
+		}
+	}
+	for ( u32 rung = 0; rung < DISPLAY_ROW_RETENTION_COUNT; rung++ )
+	{
+		busDiagText( dst, capacity, n,
+		             "row-retention rung/salt/attempts/requested-us/elapsed-us/seed-us/capture-base/post: " );
+		busDiagDecimal( dst, capacity, n, rung );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagHex( dst, capacity, n, m_DisplayRowRetentionSalt[ rung ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_DisplayRowRetentionAttempts[ rung ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_DisplayRowRetentionDelayUsec[ rung ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_DisplayRowRetentionElapsedUsec[ rung ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_DisplayRowRetentionSeedUsec[ rung ] );
+		for ( u32 phase = 0; phase < 2; phase++ )
+		{
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n,
+			                m_DisplayRowRetentionCaptureUsec[ rung ][ phase ] );
+		}
+		busDiagEndLine( dst, capacity, n );
+		for ( u32 phase = 0; phase < 2; phase++ )
+		{
+			displayRowFormatSummary(
+				dst, capacity, n, phase ? "  post" : "  baseline",
+				m_DisplayRowRetentionErrors[ rung ][ phase ],
+				m_DisplayRowRetentionFirst[ rung ][ phase ],
+				m_DisplayRowRetentionLast[ rung ][ phase ],
+				m_DisplayRowRetentionAND[ rung ][ phase ],
+				m_DisplayRowRetentionOR[ rung ][ phase ],
+				m_DisplayRowRetentionRuns[ rung ][ phase ],
+				m_DisplayRowRetentionMaxRun[ rung ][ phase ] );
+			if ( m_DisplayRowRetentionErrors[ rung ][ phase ] )
+			{
+				busDiagText( dst, capacity, n,
+				             phase ? "  post-map-bits:" : "  baseline-map-bits:" );
+				displayRowFormatMapBits(
+					dst, capacity, n,
+					phase ? displayRowRetentionMismatch[ rung ]
+					      : displayRowRetentionBaselineMismatch[ rung ] );
+			}
+		}
+	}
+}
+
+void CRADBus::formatDisplayFetchResults( char *dst, u32 capacity, u32 &n ) const
+{
+	static const char *stateNames[ 3 ] = { "off", "text", "bitmap" };
+	static const char *operationNames[ 3 ] = { "none", "read", "write" };
+	static const char *phaseNames[ 3 ] = { "  prefill", "  baseline", "  post" };
+	busDiagText( dst, capacity, n,
+	             "protocol: C64-DISPLAY-FETCH-K226 ranges=0400-07FF,2000-3FFF bytes=9216 oracle=address-salt-high-entropy setup=DEN0-complement-adjacent-repeat-verified target=single-write exposure-seconds=4 traffic-rate=16000 states=off,text,bitmap operations=none,read-D020,write-same-D020 retention=single-write-DEN0 delays-us=500000,1000000,2000000,4000000,8000000,16000000 raw-maps=errors-only diagnostic_only=1\r\n" );
+	for ( u32 arm = 0; arm < DISPLAY_FETCH_ARM_COUNT; arm++ )
+	{
+		busDiagText( dst, capacity, n,
+		             "fetch arm/state/op/salt/prefill-attempts/rate/count/elapsed-us: " );
+		busDiagDecimal( dst, capacity, n, arm );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagText( dst, capacity, n, stateNames[ m_DisplayFetchState[ arm ] ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagText( dst, capacity, n,
+		             operationNames[ m_DisplayFetchOperation[ arm ] ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagHex( dst, capacity, n, m_DisplayFetchSalt[ arm ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_DisplayFetchPrefillAttempts[ arm ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_DisplayFetchRate[ arm ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_DisplayFetchTrafficCount[ arm ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_DisplayFetchElapsedUsec[ arm ] );
+		busDiagEndLine( dst, capacity, n );
+		busDiagText( dst, capacity, n,
+		             "  seed-us complement/target capture-us prefill/baseline/post: " );
+		busDiagDecimal( dst, capacity, n, m_DisplayFetchSeedUsec[ arm ][ 0 ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_DisplayFetchSeedUsec[ arm ][ 1 ] );
+		for ( u32 phase = 0; phase < 3; phase++ )
+		{
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n,
+			                m_DisplayFetchCaptureUsec[ arm ][ phase ] );
+		}
+		busDiagEndLine( dst, capacity, n );
+		for ( u32 phase = 0; phase < 3; phase++ )
+		{
+			displayRowFormatSummary(
+				dst, capacity, n, phaseNames[ phase ],
+				m_DisplayFetchErrors[ arm ][ phase ],
+				m_DisplayFetchFirst[ arm ][ phase ],
+				m_DisplayFetchLast[ arm ][ phase ],
+				m_DisplayFetchAND[ arm ][ phase ],
+				m_DisplayFetchOR[ arm ][ phase ],
+				m_DisplayFetchRuns[ arm ][ phase ],
+				m_DisplayFetchMaxRun[ arm ][ phase ] );
+			if ( m_DisplayFetchErrors[ arm ][ phase ] )
+			{
+				const u8 *map = phase == 0
+					? displayFetchPrefillMismatch[ arm ]
+					: phase == 1 ? displayFetchBaselineMismatch[ arm ]
+					             : displayFetchPostMismatch[ arm ];
+				busDiagText( dst, capacity, n, "  map-bits:" );
+				displayRowFormatMapBits( dst, capacity, n, map );
+			}
+		}
+	}
+	for ( u32 rung = 0; rung < DISPLAY_FETCH_RETENTION_COUNT; rung++ )
+	{
+		busDiagText( dst, capacity, n,
+		             "fetch-retention rung/salt/prefill-attempts/requested-us/elapsed-us: " );
+		busDiagDecimal( dst, capacity, n, rung );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagHex( dst, capacity, n, m_DisplayFetchRetentionSalt[ rung ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n,
+		                m_DisplayFetchRetentionPrefillAttempts[ rung ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n,
+		                m_DisplayFetchRetentionDelayUsec[ rung ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n,
+		                m_DisplayFetchRetentionElapsedUsec[ rung ] );
+		busDiagEndLine( dst, capacity, n );
+		busDiagText( dst, capacity, n,
+		             "  seed-us complement/target capture-us prefill/baseline/post: " );
+		busDiagDecimal( dst, capacity, n,
+		                m_DisplayFetchRetentionSeedUsec[ rung ][ 0 ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n,
+		                m_DisplayFetchRetentionSeedUsec[ rung ][ 1 ] );
+		for ( u32 phase = 0; phase < 3; phase++ )
+		{
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n,
+			                m_DisplayFetchRetentionCaptureUsec[ rung ][ phase ] );
+		}
+		busDiagEndLine( dst, capacity, n );
+		for ( u32 phase = 0; phase < 3; phase++ )
+		{
+			displayRowFormatSummary(
+				dst, capacity, n, phaseNames[ phase ],
+				m_DisplayFetchRetentionErrors[ rung ][ phase ],
+				m_DisplayFetchRetentionFirst[ rung ][ phase ],
+				m_DisplayFetchRetentionLast[ rung ][ phase ],
+				m_DisplayFetchRetentionAND[ rung ][ phase ],
+				m_DisplayFetchRetentionOR[ rung ][ phase ],
+				m_DisplayFetchRetentionRuns[ rung ][ phase ],
+				m_DisplayFetchRetentionMaxRun[ rung ][ phase ] );
+			if ( m_DisplayFetchRetentionErrors[ rung ][ phase ] )
+			{
+				const u8 *map = phase == 0
+					? displayFetchRetentionPrefillMismatch[ rung ]
+					: phase == 1 ? displayFetchRetentionBaselineMismatch[ rung ]
+					             : displayFetchRetentionPostMismatch[ rung ];
+				busDiagText( dst, capacity, n, "  map-bits:" );
+				displayRowFormatMapBits( dst, capacity, n, map );
+			}
+		}
+	}
+}
+
+void CRADBus::formatDisplayPersistenceResults( char *dst, u32 capacity,
+	                                            u32 &n ) const
+{
+	static const char *stateNames[ 3 ] = { "off", "text", "bitmap" };
+	static const char *operationNames[ 3 ] = { "none", "read", "write" };
+	static const char *phaseNames[ 5 ] =
+		{ "prefill", "baseline", "post0", "post1", "post2" };
+	busDiagText( dst, capacity, n,
+	             "protocol: C64-DISPLAY-PERSISTENCE-K227 ranges=0400-07FF,2000-3FFF bytes=9216 oracle=address-salt-high-entropy setup=DEN0-complement-adjacent-repeat-verified target=single-write exposure-seconds=4 traffic-rate=16000 active-states=text,bitmap operations=none,read-D020,write-same-D020 repeats-per-condition=2 blank-before-post=1 post-captures=3 xor-signature=1 raw-maps=errors-only diagnostic_only=1\r\n" );
+	for ( u32 arm = 0; arm < DISPLAY_PERSISTENCE_ARM_COUNT; arm++ )
+	{
+		busDiagText( dst, capacity, n,
+		             "persistence arm/state/op/salt/prefill-attempts/count/elapsed-us: " );
+		busDiagDecimal( dst, capacity, n, arm );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagText( dst, capacity, n,
+		             stateNames[ m_DisplayPersistenceState[ arm ] ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagText( dst, capacity, n,
+		             operationNames[ m_DisplayPersistenceOperation[ arm ] ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagHex( dst, capacity, n, m_DisplayPersistenceSalt[ arm ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n,
+		                m_DisplayPersistencePrefillAttempts[ arm ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n,
+		                m_DisplayPersistenceTrafficCount[ arm ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n,
+		                m_DisplayPersistenceElapsedUsec[ arm ] );
+		busDiagEndLine( dst, capacity, n );
+		busDiagText( dst, capacity, n,
+		             "  seed-us complement/target capture-us pre/base/p0/p1/p2: " );
+		busDiagDecimal( dst, capacity, n,
+		                m_DisplayPersistenceSeedUsec[ arm ][ 0 ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n,
+		                m_DisplayPersistenceSeedUsec[ arm ][ 1 ] );
+		for ( u32 phase = 0; phase < DISPLAY_PERSISTENCE_PHASE_COUNT; phase++ )
+		{
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n,
+			                m_DisplayPersistenceCaptureUsec[ arm ][ phase ] );
+		}
+		busDiagEndLine( dst, capacity, n );
+		busDiagText( dst, capacity, n,
+		             "  persistence p0-p1 same/added/removed p1-p2 same/added/removed: " );
+		for ( u32 pair = 0; pair < 2; pair++ )
+		{
+			if ( pair ) busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n,
+			                m_DisplayPersistenceSame[ arm ][ pair ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n,
+			                m_DisplayPersistenceAdded[ arm ][ pair ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n,
+			                m_DisplayPersistenceRemoved[ arm ][ pair ] );
+		}
+		busDiagEndLine( dst, capacity, n );
+		for ( u32 phase = 0; phase < DISPLAY_PERSISTENCE_PHASE_COUNT; phase++ )
+		{
+			displayRowFormatSummary(
+				dst, capacity, n, phaseNames[ phase ],
+				m_DisplayPersistenceErrors[ arm ][ phase ],
+				m_DisplayPersistenceFirst[ arm ][ phase ],
+				m_DisplayPersistenceLast[ arm ][ phase ],
+				m_DisplayPersistenceAND[ arm ][ phase ],
+				m_DisplayPersistenceOR[ arm ][ phase ],
+				m_DisplayPersistenceRuns[ arm ][ phase ],
+				m_DisplayPersistenceMaxRun[ arm ][ phase ] );
+			busDiagText( dst, capacity, n,
+			             "  first expected/actual xor-and/or: " );
+			busDiagHex( dst, capacity, n,
+			            m_DisplayPersistenceFirstExpected[ arm ][ phase ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagHex( dst, capacity, n,
+			            m_DisplayPersistenceFirstActual[ arm ][ phase ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagHex( dst, capacity, n,
+			            m_DisplayPersistenceXorAND[ arm ][ phase ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagHex( dst, capacity, n,
+			            m_DisplayPersistenceXorOR[ arm ][ phase ] );
+			busDiagEndLine( dst, capacity, n );
+			if ( m_DisplayPersistenceErrors[ arm ][ phase ] )
+			{
+				busDiagText( dst, capacity, n, "  map-bits:" );
+				displayRowFormatMapBits(
+					dst, capacity, n,
+					displayPersistenceMismatch[ arm ][ phase ] );
+			}
+		}
+	}
+}
+
+void CRADBus::formatDisplayTimingResults( char *dst, u32 capacity,
+	                                      u32 &n ) const
+{
+	static const char *stateNames[ 3 ] = { "off", "text", "bitmap" };
+	static const char *operationNames[ 3 ] = { "none", "read", "write" };
+	busDiagText( dst, capacity, n,
+	             "protocol: C64-DISPLAY-TIMING-K228 ranges=0400-07FF,2000-3FFF bytes=9216 K227-arms=0..5 exposure-seconds=4 traffic-rate=16000 samples=475,350,400,450,475,500,550,600,475,repair-475 compare-to-phase0=1 targeted-repair=phase0-errors-only raw-maps=phase0,phase8,phase9-errors-only diagnostic_only=1\r\n" );
+	for ( u32 arm = 0; arm < DISPLAY_TIMING_ARM_COUNT; arm++ )
+	{
+		busDiagText( dst, capacity, n,
+		             "timing arm/state/op/salt/prefill-attempts/prefill-errors/baseline-errors/count/elapsed-us/repair-writes: " );
+		busDiagDecimal( dst, capacity, n, arm );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagText( dst, capacity, n, stateNames[ m_DisplayTimingState[ arm ] ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagText( dst, capacity, n,
+		             operationNames[ m_DisplayTimingOperation[ arm ] ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagHex( dst, capacity, n, m_DisplayTimingSalt[ arm ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n,
+		                m_DisplayTimingPrefillAttempts[ arm ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n,
+		                m_DisplayTimingPrefillErrors[ arm ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n,
+		                m_DisplayTimingBaselineErrors[ arm ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n,
+		                m_DisplayTimingTrafficCount[ arm ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n,
+		                m_DisplayTimingElapsedUsec[ arm ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n,
+		                m_DisplayTimingRepairWrites[ arm ] );
+		busDiagEndLine( dst, capacity, n );
+		for ( u32 phase = 0; phase < DISPLAY_TIMING_PHASE_COUNT; phase++ )
+		{
+			busDiagText( dst, capacity, n,
+			             "  phase/sample/errors/same/added/removed/first/last/and/or/first-expected/actual/xor-and/or/capture-us: " );
+			busDiagDecimal( dst, capacity, n, phase );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n,
+			                m_DisplayTimingSample[ phase ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n,
+			                m_DisplayTimingErrors[ arm ][ phase ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n,
+			                m_DisplayTimingSame[ arm ][ phase ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n,
+			                m_DisplayTimingAdded[ arm ][ phase ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n,
+			                m_DisplayTimingRemoved[ arm ][ phase ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagHexWord( dst, capacity, n,
+			                m_DisplayTimingFirst[ arm ][ phase ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagHexWord( dst, capacity, n,
+			                m_DisplayTimingLast[ arm ][ phase ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagHexWord( dst, capacity, n,
+			                m_DisplayTimingAND[ arm ][ phase ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagHexWord( dst, capacity, n,
+			                m_DisplayTimingOR[ arm ][ phase ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagHex( dst, capacity, n,
+			            m_DisplayTimingFirstExpected[ arm ][ phase ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagHex( dst, capacity, n,
+			            m_DisplayTimingFirstActual[ arm ][ phase ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagHex( dst, capacity, n,
+			            m_DisplayTimingXorAND[ arm ][ phase ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagHex( dst, capacity, n,
+			            m_DisplayTimingXorOR[ arm ][ phase ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n,
+			                m_DisplayTimingCaptureUsec[ arm ][ phase ] );
+			busDiagEndLine( dst, capacity, n );
+			if ( m_DisplayTimingErrors[ arm ][ phase ]
+			     && ( phase == 0 || phase >= 8 ) )
+			{
+				busDiagText( dst, capacity, n, "  map-bits:" );
+				displayRowFormatMapBits(
+					dst, capacity, n,
+					displayTimingMismatch[ arm ][ phase ] );
+			}
+		}
+	}
+}
+
+void CRADBus::formatDisplayBoundaryResults( char *dst, u32 capacity,
+	                                        u32 &n ) const
+{
+	busDiagText( dst, capacity, n,
+	             "protocol: C64-DISPLAY-BOUNDARY-K229 ranges=0400-07FF,2000-3FFF bytes=9216 states=text,bitmap transition-windows=visible-80-87,border-F0-FF durations=transition-only,4-second-dwell repeats=2 salts=text-0D,bitmap-44 prefill=complement-repeat-verified capture-DEN0 raw-maps=errors-only diagnostic_only=1\r\n" );
+	for ( u32 arm = 0; arm < DISPLAY_BOUNDARY_ARM_COUNT; arm++ )
+	{
+		busDiagText( dst, capacity, n,
+		             "boundary arm/state/window/duration/salt/prefill-attempts/prefill-errors/elapsed-us/wait-enable/wait-blank/same/added/removed: " );
+		busDiagDecimal( dst, capacity, n, arm );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagText( dst, capacity, n,
+		             m_DisplayBoundaryState[ arm ] == 1 ? "text" : "bitmap" );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagText( dst, capacity, n,
+		             m_DisplayBoundarySafe[ arm ] ? "border" : "visible" );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagText( dst, capacity, n,
+		             m_DisplayBoundaryDwell[ arm ] ? "dwell" : "transition" );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagHex( dst, capacity, n, m_DisplayBoundarySalt[ arm ] );
+		const u32 values[ 8 ] =
+		{
+			m_DisplayBoundaryPrefillAttempts[ arm ],
+			m_DisplayBoundaryPrefillErrors[ arm ],
+			m_DisplayBoundaryElapsedUsec[ arm ],
+			m_DisplayBoundaryWaitReads[ arm ][ 0 ],
+			m_DisplayBoundaryWaitReads[ arm ][ 1 ],
+			m_DisplayBoundarySame[ arm ],
+			m_DisplayBoundaryAdded[ arm ],
+			m_DisplayBoundaryRemoved[ arm ]
+		};
+		for ( u32 i = 0; i < 8; i++ )
+		{
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n, values[ i ] );
+		}
+		busDiagEndLine( dst, capacity, n );
+		for ( u32 phase = 0; phase < DISPLAY_BOUNDARY_PHASE_COUNT; phase++ )
+		{
+			displayRowFormatSummary(
+				dst, capacity, n, phase == 0 ? "  baseline" : "  post",
+				m_DisplayBoundaryErrors[ arm ][ phase ],
+				m_DisplayBoundaryFirst[ arm ][ phase ],
+				m_DisplayBoundaryLast[ arm ][ phase ],
+				m_DisplayBoundaryAND[ arm ][ phase ],
+				m_DisplayBoundaryOR[ arm ][ phase ],
+				m_DisplayBoundaryRuns[ arm ][ phase ],
+				m_DisplayBoundaryMaxRun[ arm ][ phase ] );
+			busDiagText( dst, capacity, n,
+			             "  first expected/actual xor-and/or capture-us: " );
+			busDiagHex( dst, capacity, n,
+			            m_DisplayBoundaryFirstExpected[ arm ][ phase ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagHex( dst, capacity, n,
+			            m_DisplayBoundaryFirstActual[ arm ][ phase ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagHex( dst, capacity, n,
+			            m_DisplayBoundaryXorAND[ arm ][ phase ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagHex( dst, capacity, n,
+			            m_DisplayBoundaryXorOR[ arm ][ phase ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n,
+			                m_DisplayBoundaryCaptureUsec[ arm ][ phase ] );
+			busDiagEndLine( dst, capacity, n );
+			if ( m_DisplayBoundaryErrors[ arm ][ phase ] )
+			{
+				busDiagText( dst, capacity, n, "  map-bits:" );
+				displayRowFormatMapBits(
+					dst, capacity, n,
+					displayBoundaryMismatch[ arm ][ phase ] );
+			}
+		}
+	}
+}
+
+void CRADBus::formatDisplayRefreshResults( char *dst, u32 capacity,
+	                                       u32 &n ) const
+{
+	busDiagText( dst, capacity, n,
+	             m_DisplayDiagnosticVariant == 3
+	               ? "protocol: C64-DISPLAY-SCRUB-K233 ranges=0400-07FF,2000-3FFF bytes=9216 states=text,bitmap exposure-seconds=16 scrub=off,production-CWriteBuffer-masked-A1-low-A3-high repeats=2 cadence=128-opportunities-per-frame chunk=64 hidden-raster-only ordinary-queue-empty prefill=complement-repeat-verified capture-DEN0 raw-maps=errors-only diagnostic_only=1\r\n"
+	             : m_DisplayDiagnosticVariant == 2
+	               ? "protocol: C64-DISPLAY-RW-K232 ranges=0400-07FF,2000-3FFF bytes=9216 states=text,bitmap exposure-seconds=8 rw-idle=floating,actively-held-high repeats=2 salts=text-0D,bitmap-44 transitions=border-F0-FF traffic=none dma=continuously-asserted prefill=complement-repeat-verified capture-DEN0 raw-maps=errors-only diagnostic_only=1\r\n"
+	             : m_DisplayDiagnosticVariant == 1
+	               ? "protocol: C64-DISPLAY-REFRESH-K231 ranges=0400-07FF,2000-3FFF bytes=9216 states=text,bitmap exposure-seconds=4 refresh=none,core0-continuous-VIC-half-DMA-release repeats=2 salts=text-0D,bitmap-44 transitions=border-F0-FF prefill=complement-repeat-verified capture-DEN0 raw-maps=errors-only diagnostic_only=1\r\n"
+	               : "protocol: C64-DISPLAY-REFRESH-K230 ranges=0400-07FF,2000-3FFF bytes=9216 states=text,bitmap exposure-seconds=4 refresh=none,core3-continuous-VIC-half-DMA-release repeats=2 salts=text-0D,bitmap-44 transitions=border-F0-FF prefill=complement-repeat-verified capture-DEN0 raw-maps=errors-only diagnostic_only=1\r\n" );
+	for ( u32 arm = 0; arm < 8; arm++ )
+	{
+		busDiagText( dst, capacity, n,
+		             m_DisplayDiagnosticVariant == 3
+		               ? "scrub arm/state/enabled/start-ok/salt/prefill-attempts/prefill-errors/elapsed-us/wait-enable/wait-blank/bytes/same/added/removed/opportunities/max-chunk-cycles: "
+		             : m_DisplayDiagnosticVariant == 2
+		               ? "rw arm/state/held-high/start-ok/salt/prefill-attempts/prefill-errors/elapsed-us/wait-enable/wait-blank/slots/same/added/removed: "
+		               : "refresh arm/state/enabled/start-ok/salt/prefill-attempts/prefill-errors/elapsed-us/wait-enable/wait-blank/slots/same/added/removed: " );
+		busDiagDecimal( dst, capacity, n, arm );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagText( dst, capacity, n,
+		             m_DisplayBoundaryState[ arm ] == 1 ? "text" : "bitmap" );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_DisplayRefreshEnabled[ arm ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_DisplayRefreshStartOK[ arm ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagHex( dst, capacity, n, m_DisplayBoundarySalt[ arm ] );
+		const u32 values[ 5 ] =
+		{
+			m_DisplayBoundaryPrefillAttempts[ arm ],
+			m_DisplayBoundaryPrefillErrors[ arm ],
+			m_DisplayBoundaryElapsedUsec[ arm ],
+			m_DisplayBoundaryWaitReads[ arm ][ 0 ],
+			m_DisplayBoundaryWaitReads[ arm ][ 1 ]
+		};
+		for ( u32 i = 0; i < 5; i++ )
+		{
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n, values[ i ] );
+		}
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n,
+		                (u32)m_DisplayRefreshSlots[ arm ] );
+		const u32 comparison[ 3 ] =
+		{
+			m_DisplayBoundarySame[ arm ], m_DisplayBoundaryAdded[ arm ],
+			m_DisplayBoundaryRemoved[ arm ]
+		};
+		for ( u32 i = 0; i < 3; i++ )
+		{
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n, comparison[ i ] );
+		}
+		if ( m_DisplayDiagnosticVariant == 3 )
+		{
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n,
+			                m_DisplayScrubOpportunities[ arm ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n,
+			                m_DisplayScrubMaxChunkCycles[ arm ] );
+		}
+		busDiagEndLine( dst, capacity, n );
+		for ( u32 phase = 0; phase < 2; phase++ )
+		{
+			displayRowFormatSummary(
+				dst, capacity, n, phase == 0 ? "  baseline" : "  post",
+				m_DisplayBoundaryErrors[ arm ][ phase ],
+				m_DisplayBoundaryFirst[ arm ][ phase ],
+				m_DisplayBoundaryLast[ arm ][ phase ],
+				m_DisplayBoundaryAND[ arm ][ phase ],
+				m_DisplayBoundaryOR[ arm ][ phase ],
+				m_DisplayBoundaryRuns[ arm ][ phase ],
+				m_DisplayBoundaryMaxRun[ arm ][ phase ] );
+			busDiagText( dst, capacity, n,
+			             "  first expected/actual xor-and/or capture-us: " );
+			busDiagHex( dst, capacity, n,
+			            m_DisplayBoundaryFirstExpected[ arm ][ phase ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagHex( dst, capacity, n,
+			            m_DisplayBoundaryFirstActual[ arm ][ phase ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagHex( dst, capacity, n,
+			            m_DisplayBoundaryXorAND[ arm ][ phase ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagHex( dst, capacity, n,
+			            m_DisplayBoundaryXorOR[ arm ][ phase ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n,
+			                m_DisplayBoundaryCaptureUsec[ arm ][ phase ] );
+			busDiagEndLine( dst, capacity, n );
+			if ( m_DisplayBoundaryErrors[ arm ][ phase ] )
+			{
+				busDiagText( dst, capacity, n, "  map-bits:" );
+				displayRowFormatMapBits(
+					dst, capacity, n,
+					displayBoundaryMismatch[ arm ][ phase ] );
+			}
+		}
+	}
+}
+
 u32 CRADBus::formatSelfTestResults( char *dst, u32 capacity ) const
 {
 	u32 n = 0;
@@ -2395,6 +6467,398 @@ u32 CRADBus::formatSelfTestResults( char *dst, u32 capacity ) const
 	busDiagText( dst, capacity, n, m_SelfTestFailure ? "FAIL mask=" : "PASS mask=" );
 	busDiagDecimal( dst, capacity, n, m_SelfTestFailure );
 	busDiagEndLine( dst, capacity, n );
+	busDiagText( dst, capacity, n,
+	             "read-eye configured/selected/stable-start/stable-end/best-sample/best-errors: " );
+	busDiagDecimal( dst, capacity, n, m_ReadTimingConfigured );
+	busDiagChar( dst, capacity, n, '/' );
+	busDiagDecimal( dst, capacity, n, m_ReadTimingSelected );
+	busDiagChar( dst, capacity, n, '/' );
+	busDiagDecimal( dst, capacity, n, m_ReadTimingStart );
+	busDiagChar( dst, capacity, n, '/' );
+	busDiagDecimal( dst, capacity, n, m_ReadTimingEnd );
+	busDiagChar( dst, capacity, n, '/' );
+	busDiagDecimal( dst, capacity, n, m_ReadTimingBestErrorSample );
+	busDiagChar( dst, capacity, n, '/' );
+	busDiagDecimal( dst, capacity, n, m_ReadTimingBestError );
+	busDiagEndLine( dst, capacity, n );
+	busDiagText( dst, capacity, n, "read-eye sample/errors:" );
+	for ( u32 i = 0; i < READ_TIMING_SCORE_COUNT; i++ )
+	{
+		busDiagChar( dst, capacity, n, ' ' );
+		busDiagDecimal( dst, capacity, n, 300u + i * 5u );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_ReadTimingErrors[ i ] );
+	}
+	busDiagEndLine( dst, capacity, n );
+	busDiagText( dst, capacity, n,
+	             "read-eye split sample/mixed-ram-errors/ram-only-errors/mixed-vic-errors/isolated-vic-errors/mixed-distinct/mixed-dominant-value/mixed-dominant-count/isolated-distinct/isolated-dominant-value/isolated-dominant-count:" );
+	for ( u32 i = 0; i < READ_TIMING_SCORE_COUNT; i++ )
+	{
+		busDiagChar( dst, capacity, n, ' ' );
+		busDiagDecimal( dst, capacity, n, 300u + i * 5u );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_ReadTimingRAMErrors[ i ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_ReadTimingRAMOnlyErrors[ i ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_ReadTimingMixedVICErrors[ i ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_ReadTimingIsolatedVICErrors[ i ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_ReadTimingMixedVICDistinct[ i ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagHex( dst, capacity, n, m_ReadTimingMixedVICDominantValue[ i ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_ReadTimingMixedVICDominantCount[ i ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_ReadTimingIsolatedVICDistinct[ i ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagHex( dst, capacity, n, m_ReadTimingIsolatedVICDominantValue[ i ] );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_ReadTimingIsolatedVICDominantCount[ i ] );
+	}
+	busDiagEndLine( dst, capacity, n );
+	const u32 ramBestIndex = m_ReadTimingRAMBestSample >= 300u
+	                       && m_ReadTimingRAMBestSample <= 620u
+	                       ? ( m_ReadTimingRAMBestSample - 300u ) / 5u : 0u;
+	busDiagText( dst, capacity, n, "read-eye RAM-best sample/errors: " );
+	busDiagDecimal( dst, capacity, n, m_ReadTimingRAMBestSample );
+	busDiagChar( dst, capacity, n, '/' );
+	busDiagDecimal( dst, capacity, n, m_ReadTimingRAMBestError );
+	busDiagEndLine( dst, capacity, n );
+	busDiagText( dst, capacity, n, "read-eye RAM-only-best sample/errors: " );
+	busDiagDecimal( dst, capacity, n, m_ReadTimingRAMOnlyBestSample );
+	busDiagChar( dst, capacity, n, '/' );
+	busDiagDecimal( dst, capacity, n, m_ReadTimingRAMOnlyBestError );
+	busDiagEndLine( dst, capacity, n );
+	busDiagText( dst, capacity, n,
+	             "read-eye RAM-best rotated position-errors (positions 0..5):" );
+	for ( u32 p = 0; p < 6; p++ )
+	{
+		busDiagChar( dst, capacity, n, ' ' );
+		busDiagDecimal( dst, capacity, n,
+		                m_ReadTimingMixedRAMPositionErrors[ ramBestIndex ][ p ] );
+	}
+	busDiagEndLine( dst, capacity, n );
+	busDiagText( dst, capacity, n,
+	             "read-eye RAM-best rotated address-errors ($0334..$0339):" );
+	for ( u32 p = 0; p < 6; p++ )
+	{
+		busDiagChar( dst, capacity, n, ' ' );
+		busDiagDecimal( dst, capacity, n,
+		                m_ReadTimingMixedRAMAddressErrors[ ramBestIndex ][ p ] );
+	}
+	busDiagEndLine( dst, capacity, n );
+	busDiagText( dst, capacity, n, "read-eye RAM-best mixed-vic actual:" );
+	for ( u32 r = 0; r < READ_TIMING_REPETITIONS; r++ )
+	{
+		busDiagChar( dst, capacity, n, ' ' );
+		busDiagHex( dst, capacity, n,
+		            m_ReadTimingMixedVICActual[ ramBestIndex ][ r ] );
+	}
+	busDiagEndLine( dst, capacity, n );
+	busDiagText( dst, capacity, n, "read-eye RAM-best isolated-vic actual:" );
+	for ( u32 r = 0; r < READ_TIMING_REPETITIONS; r++ )
+	{
+		busDiagChar( dst, capacity, n, ' ' );
+		busDiagHex( dst, capacity, n,
+		            m_ReadTimingIsolatedVICActual[ ramBestIndex ][ r ] );
+	}
+	busDiagEndLine( dst, capacity, n );
+	busDiagText( dst, capacity, n,
+	             "snapshot byte0 observed kernal/basic: " );
+	if ( m_SnapshotKernalObserved )
+	{
+		busDiagHex( dst, capacity, n, m_SnapshotKernalFirst );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagHex( dst, capacity, n, m_SnapshotKernalReread );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagHex( dst, capacity, n, m_SnapshotKernalCopied );
+	}
+	else busDiagText( dst, capacity, n, "not-read" );
+	busDiagText( dst, capacity, n, " " );
+	if ( m_SnapshotBasicObserved )
+	{
+		busDiagHex( dst, capacity, n, m_SnapshotBasicFirst );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagHex( dst, capacity, n, m_SnapshotBasicReread );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagHex( dst, capacity, n, m_SnapshotBasicCopied );
+	}
+	else busDiagText( dst, capacity, n, "not-read" );
+	busDiagText( dst, capacity, n, " (first/reread/copied)\r\n" );
+	if ( m_AccessSentinelRan )
+	{
+		busDiagText( dst, capacity, n,
+		             "protocol: C64-ACCESS-SENTINEL-K221 ranges=0800-9FFF,C000-CFFF bytes=43008 traffic-rate-per-sec=16000 traffic-count=" );
+		busDiagDecimal( dst, capacity, n, m_AccessSentinelTrafficCount );
+		busDiagText( dst, capacity, n,
+		             " arms=control,read-D020,write-same-D020 baseline-passes=2 exposure-passes=2 diagnostic_only=1\r\n" );
+		static const char *armNames[ 3 ] =
+			{ "control", "read-D020", "write-D020" };
+		for ( u32 arm = 0; arm < 3; arm++ )
+		{
+			busDiagText( dst, capacity, n, "access-sentinel " );
+			busDiagText( dst, capacity, n, armNames[ arm ] );
+			busDiagText( dst, capacity, n,
+			             " base0/base1/exposure0/exposure1/retained/arm-added/arm-removed/verify-same/verify-new/verify-cleared/elapsed-us: " );
+			busDiagDecimal( dst, capacity, n,
+			                m_AccessSentinelBaselineErrors[ arm ][ 0 ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n,
+			                m_AccessSentinelBaselineErrors[ arm ][ 1 ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n,
+			                m_AccessSentinelExposureErrors[ arm ][ 0 ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n,
+			                m_AccessSentinelExposureErrors[ arm ][ 1 ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n,
+			                m_AccessSentinelBaselineRetainedErrors[ arm ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n,
+			                m_AccessSentinelArmAddedErrors[ arm ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n,
+			                m_AccessSentinelArmRemovedErrors[ arm ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n,
+			                m_AccessSentinelSameErrors[ arm ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n,
+			                m_AccessSentinelNewErrors[ arm ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n,
+			                m_AccessSentinelClearedErrors[ arm ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n,
+			                m_AccessSentinelElapsedUsec[ arm ] );
+			busDiagEndLine( dst, capacity, n );
+			busDiagText( dst, capacity, n,
+			             "  first0 addr/expected/actual: " );
+			busDiagHexWord( dst, capacity, n,
+			                m_AccessSentinelFirstAddr[ arm ][ 0 ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagHex( dst, capacity, n,
+			            m_AccessSentinelFirstExpected[ arm ][ 0 ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagHex( dst, capacity, n,
+			            m_AccessSentinelFirstActual[ arm ][ 0 ] );
+			busDiagText( dst, capacity, n,
+			             " first1 addr/expected/actual: " );
+			busDiagHexWord( dst, capacity, n,
+			                m_AccessSentinelFirstAddr[ arm ][ 1 ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagHex( dst, capacity, n,
+			            m_AccessSentinelFirstExpected[ arm ][ 1 ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagHex( dst, capacity, n,
+			            m_AccessSentinelFirstActual[ arm ][ 1 ] );
+			busDiagEndLine( dst, capacity, n );
+		}
+	}
+	if ( m_DisplaySentinelRan )
+	{
+		busDiagText( dst, capacity, n,
+		             "protocol: C64-DISPLAY-SENTINEL-K222 matrix=0400-07FF bitmap=2000-3FFF bytes=9216 display-oracle=hires-AA55 readback-DEN0=1 readback-passes=3 exposure-seconds=8 arms=on-none,on-read4k,on-read16k,on-read64k,on-write4k,on-write16k,on-write64k,off-read64k,off-write64k diagnostic_only=1\r\n" );
+		static const char *armNames[ 9 ] =
+		{
+			"on-none", "on-read-4k", "on-read-16k", "on-read-64k",
+			"on-write-4k", "on-write-16k", "on-write-64k",
+			"off-read-64k", "off-write-64k"
+		};
+		for ( u32 arm = 0; arm < 9; arm++ )
+		{
+			busDiagText( dst, capacity, n, "display-sentinel " );
+			busDiagText( dst, capacity, n, armNames[ arm ] );
+			busDiagText( dst, capacity, n,
+			             " rate/count/base0/base1/exposure0/exposure1/exposure2/retained/arm-added/arm-removed/verify01-same/new/cleared/verify12-same/new/cleared/elapsed-us: " );
+			busDiagDecimal( dst, capacity, n, m_DisplaySentinelRate[ arm ] );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n,
+			                m_DisplaySentinelTrafficCount[ arm ] );
+			for ( u32 pass = 0; pass < 2; pass++ )
+			{
+				busDiagChar( dst, capacity, n, '/' );
+				busDiagDecimal( dst, capacity, n,
+				                m_DisplaySentinelBaselineErrors[ arm ][ pass ] );
+			}
+			for ( u32 pass = 0; pass < 3; pass++ )
+			{
+				busDiagChar( dst, capacity, n, '/' );
+				busDiagDecimal( dst, capacity, n,
+				                m_DisplaySentinelExposureErrors[ arm ][ pass ] );
+			}
+			const u32 summary[ 9 ] =
+			{
+				m_DisplaySentinelBaselineRetainedErrors[ arm ],
+				m_DisplaySentinelArmAddedErrors[ arm ],
+				m_DisplaySentinelArmRemovedErrors[ arm ],
+				m_DisplaySentinelVerifySameErrors[ arm ][ 0 ],
+				m_DisplaySentinelVerifyNewErrors[ arm ][ 0 ],
+				m_DisplaySentinelVerifyClearedErrors[ arm ][ 0 ],
+				m_DisplaySentinelVerifySameErrors[ arm ][ 1 ],
+				m_DisplaySentinelVerifyNewErrors[ arm ][ 1 ],
+				m_DisplaySentinelVerifyClearedErrors[ arm ][ 1 ]
+			};
+			for ( u32 i = 0; i < 9; i++ )
+			{
+				busDiagChar( dst, capacity, n, '/' );
+				busDiagDecimal( dst, capacity, n, summary[ i ] );
+			}
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n,
+			                m_DisplaySentinelElapsedUsec[ arm ] );
+			busDiagEndLine( dst, capacity, n );
+			for ( u32 pass = 0; pass < 3; pass++ )
+			{
+				busDiagText( dst, capacity, n, "  first" );
+				busDiagChar( dst, capacity, n, (char)( '0' + pass ) );
+				busDiagText( dst, capacity, n, " addr/expected/actual: " );
+				busDiagHexWord( dst, capacity, n,
+				                m_DisplaySentinelFirstAddr[ arm ][ pass ] );
+				busDiagChar( dst, capacity, n, '/' );
+				busDiagHex( dst, capacity, n,
+				            m_DisplaySentinelFirstExpected[ arm ][ pass ] );
+				busDiagChar( dst, capacity, n, '/' );
+				busDiagHex( dst, capacity, n,
+				            m_DisplaySentinelFirstActual[ arm ][ pass ] );
+				busDiagEndLine( dst, capacity, n );
+			}
+		}
+	}
+	if ( m_DisplayAddressRan )
+	{
+		busDiagText( dst, capacity, n,
+		             "protocol: C64-DISPLAY-ADDRESS-K223 target=2078 immediate-trials=256 modes=text-DEN0,bitmap-DEN0 seed-styles=single,double maps=0400-07FF+2000-3FFF map-bytes=9216 map-order=matrix-then-bitmap delay-us=0,100,1000,4000,16000,64000,256000,1000000,4000000 diagnostic_only=1\r\n" );
+		static const char *modeNames[ 2 ] = { "text", "bitmap" };
+		static const char *styleNames[ 2 ] = { "single", "double" };
+		for ( u32 mode = 0; mode < 2; mode++ )
+		{
+			for ( u32 style = 0; style < 2; style++ )
+			{
+				const u16 fixedMask = m_DisplayAddressMapErrors[ mode ][ style ]
+					? (u16)~( m_DisplayAddressMapAND[ mode ][ style ]
+					          ^ m_DisplayAddressMapOR[ mode ][ style ] )
+					: 0;
+				busDiagText( dst, capacity, n, "display-address " );
+				busDiagText( dst, capacity, n, modeNames[ mode ] );
+				busDiagChar( dst, capacity, n, '-' );
+				busDiagText( dst, capacity, n, styleNames[ style ] );
+				busDiagText( dst, capacity, n,
+				             " immediate-errors-r0/r1/r2/first-trial/expected/actual0/actual1/actual2: " );
+				for ( u32 read = 0; read < 3; read++ )
+				{
+					if ( read ) busDiagChar( dst, capacity, n, '/' );
+					busDiagDecimal( dst, capacity, n,
+					                m_DisplayAddressImmediateErrors[ mode ][ style ][ read ] );
+				}
+				busDiagChar( dst, capacity, n, '/' );
+				busDiagDecimal( dst, capacity, n,
+				                m_DisplayAddressImmediateFirstTrial[ mode ][ style ] );
+				busDiagChar( dst, capacity, n, '/' );
+				busDiagHex( dst, capacity, n,
+				            m_DisplayAddressImmediateFirstExpected[ mode ][ style ] );
+				for ( u32 read = 0; read < 3; read++ )
+				{
+					busDiagChar( dst, capacity, n, '/' );
+					busDiagHex( dst, capacity, n,
+					            m_DisplayAddressImmediateFirstActual[ mode ][ style ][ read ] );
+				}
+				busDiagEndLine( dst, capacity, n );
+				busDiagText( dst, capacity, n,
+				             "  map errors/first/last/and/or/fixed-mask/fixed-value/runs/max-run: " );
+				busDiagDecimal( dst, capacity, n,
+				                m_DisplayAddressMapErrors[ mode ][ style ] );
+				const u16 mapSummary[ 7 ] =
+				{
+					m_DisplayAddressMapFirst[ mode ][ style ],
+					m_DisplayAddressMapLast[ mode ][ style ],
+					m_DisplayAddressMapAND[ mode ][ style ],
+					m_DisplayAddressMapOR[ mode ][ style ],
+					fixedMask,
+					(u16)( m_DisplayAddressMapAND[ mode ][ style ] & fixedMask ),
+					m_DisplayAddressMapRuns[ mode ][ style ]
+				};
+				for ( u32 i = 0; i < 7; i++ )
+				{
+					busDiagChar( dst, capacity, n, '/' );
+					busDiagHexWord( dst, capacity, n, mapSummary[ i ] );
+				}
+				busDiagChar( dst, capacity, n, '/' );
+				busDiagHexWord( dst, capacity, n,
+				                 m_DisplayAddressMapMaxRun[ mode ][ style ] );
+				busDiagEndLine( dst, capacity, n );
+
+				// A fixed-size raw bitmap makes every address recoverable from the
+				// SD log. Index 0 is $0400; index 1024 is $2000.
+				busDiagText( dst, capacity, n, "  map-bits " );
+				busDiagText( dst, capacity, n, modeNames[ mode ] );
+				busDiagChar( dst, capacity, n, '-' );
+				busDiagText( dst, capacity, n, styleNames[ style ] );
+				busDiagText( dst, capacity, n, ":" );
+				for ( u32 byte = 0; byte < DISPLAY_SENTINEL_BITMAP_BYTES; byte++ )
+				{
+					if ( ( byte & 31u ) == 0 ) busDiagEndLine( dst, capacity, n );
+					busDiagHex( dst, capacity, n,
+					            displayAddressMismatch[ mode ][ style ][ byte ] );
+				}
+				busDiagEndLine( dst, capacity, n );
+			}
+		}
+		busDiagText( dst, capacity, n, "display-address ladder-ran: " );
+		busDiagDecimal( dst, capacity, n, m_DisplayAddressLadderRan );
+		busDiagEndLine( dst, capacity, n );
+		if ( m_DisplayAddressLadderRan )
+		{
+			for ( u32 mode = 0; mode < 2; mode++ )
+			{
+				for ( u32 rung = 0; rung < 9; rung++ )
+				{
+					busDiagText( dst, capacity, n, "delay " );
+					busDiagText( dst, capacity, n, modeNames[ mode ] );
+					busDiagText( dst, capacity, n,
+					             " requested-us/elapsed-us/expected/initial0/initial1/initial2/delayed0/delayed1/delayed2: " );
+					busDiagDecimal( dst, capacity, n,
+					                m_DisplayAddressDelayUsec[ rung ] );
+					busDiagChar( dst, capacity, n, '/' );
+					busDiagDecimal( dst, capacity, n,
+					                m_DisplayAddressElapsedUsec[ mode ][ rung ] );
+					busDiagChar( dst, capacity, n, '/' );
+					busDiagHex( dst, capacity, n,
+					            m_DisplayAddressLadderExpected[ mode ][ rung ] );
+					for ( u32 read = 0; read < 3; read++ )
+					{
+						busDiagChar( dst, capacity, n, '/' );
+						busDiagHex( dst, capacity, n,
+						            m_DisplayAddressLadderInitial[ mode ][ rung ][ read ] );
+					}
+					for ( u32 read = 0; read < 3; read++ )
+					{
+						busDiagChar( dst, capacity, n, '/' );
+						busDiagHex( dst, capacity, n,
+						            m_DisplayAddressLadderDelayed[ mode ][ rung ][ read ] );
+					}
+					busDiagEndLine( dst, capacity, n );
+				}
+			}
+		}
+	}
+	if ( m_DisplayRowRan )
+		formatDisplayRowResults( dst, capacity, n );
+	if ( m_DisplayFetchRan )
+		formatDisplayFetchResults( dst, capacity, n );
+	if ( m_DisplayPersistenceRan )
+		formatDisplayPersistenceResults( dst, capacity, n );
+	if ( m_DisplayTimingRan )
+		formatDisplayTimingResults( dst, capacity, n );
+	if ( m_DisplayBoundaryRan )
+		formatDisplayBoundaryResults( dst, capacity, n );
+	if ( m_DisplayRefreshRan )
+		formatDisplayRefreshResults( dst, capacity, n );
+	if ( m_DisplayBAGuardRan )
+		formatDisplayBAGuardResults( dst, capacity, n );
 	if ( m_Signals.machine == MACHINE_C128 )
 	{
 		// Always place the live scheduler record before the optional historical
@@ -3189,6 +7653,51 @@ u32 CRADBus::formatSelfTestResults( char *dst, u32 capacity ) const
 	busDiagDecimal( dst, capacity, n, m_WriteTimingSelectedData );
 	busDiagEndLine( dst, capacity, n );
 
+	busDiagText( dst, capacity, n, "SID timing: configured=" );
+	busDiagDecimal( dst, capacity, n, m_SIDTimingConfigured );
+	if ( m_SIDTimingEdge )
+	{
+		busDiagText( dst, capacity, n, " selected=LAST-HIGH d/d/r=" );
+		busDiagDecimal( dst, capacity, n, m_SIDTimingDistinct );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_SIDTimingDominant );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_SIDTimingRamp );
+	}
+	else if ( m_SIDTimingStart )
+	{
+		busDiagText( dst, capacity, n, " saw=" );
+		busDiagDecimal( dst, capacity, n, m_SIDTimingStart );
+		busDiagText( dst, capacity, n, ".." );
+		busDiagDecimal( dst, capacity, n, m_SIDTimingEnd );
+		busDiagText( dst, capacity, n, " selected=" );
+		busDiagDecimal( dst, capacity, n, m_SIDTimingSelected );
+		busDiagText( dst, capacity, n, " d/d/r=" );
+		busDiagDecimal( dst, capacity, n, m_SIDTimingDistinct );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_SIDTimingDominant );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_SIDTimingRamp );
+	}
+	else
+	{
+		busDiagText( dst, capacity, n, " NO-SAW-WINDOW best=" );
+		busDiagDecimal( dst, capacity, n, m_SIDTimingBestSample );
+		busDiagText( dst, capacity, n, " d/d/r=" );
+		busDiagDecimal( dst, capacity, n, m_SIDTimingDistinct );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_SIDTimingDominant );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_SIDTimingRamp );
+	}
+	busDiagEndLine( dst, capacity, n );
+	if ( !m_SIDPhysicalReliable )
+	{
+		busDiagText( dst, capacity, n,
+		             "SID fallback: OSC3=model POT=17-read-filter" );
+		busDiagEndLine( dst, capacity, n );
+	}
+
 	busDiagText( dst, capacity, n, "raster: " );
 	busDiagBytes( dst, capacity, n, m_TestRaster, 6 );
 	busDiagText( dst, capacity, n, m_TestRasterChanged ? " advancing" : " FROZEN" );
@@ -3507,7 +8016,12 @@ u8 CRADBus::read( u16 addr )
 	if ( m_TrafficHalted ) return 0xFF;
 	u8 v = 0xFF;
 
-	RAD_SPEEK( addr, v );
+	if ( !m_SIDPhysicalReliable && addr == 0xD41B )
+		v = sidReadOSC3Model();
+	else if ( !m_SIDPhysicalReliable && ( addr == 0xD419 || addr == 0xD41A ) )
+		v = sidReadPOTFiltered( addr );
+	else
+		RAD_SPEEK( addr, v );
 	m_Reads++;
 	return v;
 }
@@ -3516,6 +8030,7 @@ void CRADBus::write( u16 addr, u8 value )
 {
 	if ( m_TrafficHalted ) return;
 
+	sidObserveWrite( addr, value );
 	RAD_SPOKE( addr, value );
 	m_Writes++;
 }
@@ -3584,11 +8099,36 @@ void CRADBus::readBlock( u16 addr, u8 *dst, u32 length )
 		for ( u32 i = 0; i < length; i++ ) dst[ i ] = 0xFF;
 		return;
 	}
+	const bool observeKernal = addr == 0xE000 && length != 0;
+	const bool observeBasic  = addr == 0xA000 && length != 0;
 	for ( u32 i = 0; i < length; i++ )
 	{
 		u8 v = 0xFF;
 		RAD_SPEEK( (u16)( addr + i ), v );
 		dst[ i ] = v;
+		if ( i == 0 && ( observeKernal || observeBasic ) )
+		{
+			// Preserve the actual unprimed byte in the snapshot, then reread
+			// the same side-effect-free ROM location immediately. A mismatch
+			// exposes byte-zero turnaround residue without silently fixing it.
+			u8 reread = 0xFF;
+			RAD_SPEEK( addr, reread );
+			m_Reads++;
+			if ( observeKernal )
+			{
+				m_SnapshotKernalFirst = v;
+				m_SnapshotKernalReread = reread;
+				m_SnapshotKernalCopied = dst[ 0 ];
+				m_SnapshotKernalObserved = 1;
+			}
+			else
+			{
+				m_SnapshotBasicFirst = v;
+				m_SnapshotBasicReread = reread;
+				m_SnapshotBasicCopied = dst[ 0 ];
+				m_SnapshotBasicObserved = 1;
+			}
+		}
 	}
 
 	m_Reads += length;

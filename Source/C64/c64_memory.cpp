@@ -417,6 +417,35 @@ void CC64Memory::reset()
 	updateBankMode();
 }
 
+bool CC64Memory::initializeC64CIA2()
+{
+	if ( !m_C64 )
+		return false;
+
+	// This is intentionally the ONLY repeated CIA write in the emulator. The
+	// physical C128 expansion port can lose the first standalone write after a
+	// direction change; repeating arbitrary CIA writes would be unsafe because
+	// many registers have edge, acknowledge, or timer-load semantics. DDRA is a
+	// pure latch, and $3F is the C64 KERNAL's established state: VIC bank and IEC
+	// outputs on PA0-PA5, receive lines on PA6-PA7.
+	static const u8 c64DDRA = 0x3F;
+	m_C64->write( 0xDD02, c64DDRA );
+	m_C64->write( 0xDD02, c64DDRA );
+
+	// Never promote one physical read to authoritative state. On marginal
+	// machines it may be data-bus residue, and a later RMW would then persist
+	// that residue back into the real CIA. The backend verifies at several
+	// calibrated sample points before this shadow becomes live.
+	if ( !m_C64->verifyC64CIA2DDRA( c64DDRA ) )
+		return false;
+
+	m_CIA2DDRA = c64DDRA;
+	m_HaveCIA2DDRA = true;
+	updateSpritePtrBase();
+	updateHotShapeBlocks();
+	return true;
+}
+
 void CC64Memory::noteIECActivity()
 {
 	const bool wasQuiet = ( m_IECActivityCycles == 0 );
@@ -610,7 +639,34 @@ u8 CC64Memory::read8( scpu_addr_t addr )
 			// SuperCPU mirrors asynchronously and has the same property.
 			m_IOReads++;
 			noteBusAccess( a, false );
-			v = m_C64 ? m_C64->read( a ) : 0xFF;
+			// Once verified or written by the guest, CIA2 DDRA is a pure output
+			// latch. While /DMA is held, the physical 6510/8502 cannot alter it
+			// behind us, so a marginal physical read must never poison the shadow.
+			// Still charge the ordinary I/O stretch above: shadowing correctness
+			// must not turn a 1MHz-class access into a fast private-register access.
+			if ( a == 0xDD02 && m_HaveCIA2DDRA )
+				v = m_CIA2DDRA;
+			else
+				v = m_C64 ? m_C64->read( a ) : 0xFF;
+			// $D011 is two different registers on read: bit 7 is the live
+			// raster counter's ninth bit, while bits 6..0 are the writable VIC
+			// control latch. Only the live bit needs the physical bus. Returning
+			// all eight physical bits made a late/marginal expansion-bus sample
+			// destructive: GEOS does LDA $D011 / AND #$7F / STA $D011, so one
+			// residue value ($7F on the tested real C64) was written back and
+			// enabled ECM+BMM, an invalid mode with a black bitmap but live
+			// sprites. The halted host CPU means every writable VIC change passes
+			// through write8(), so the shadow is authoritative for the low bits.
+			if ( a == 0xD011 )
+				v = (u8)( ( v & 0x80 ) | ( m_VICRegShadow[ 0x11 ] & 0x7F ) );
+			// PRA reads combine live input pins with the hidden output latch. Once
+			// both pieces of state are known, reconstruct that split explicitly:
+			// output bits come from our authoritative latch, input bits remain the
+			// physical sample. This prevents residue on PA0/PA1 from moving the VIC
+			// bank through an otherwise innocent read-modify-write sequence.
+			if ( a == 0xDD00 && m_HaveCIA2DDRA && m_HaveCIA2PortALatch )
+				v = (u8)( ( v & (u8)~m_CIA2DDRA )
+				        | ( m_CIA2PortALatch & m_CIA2DDRA ) );
 			m_IOLog[ m_IOLogPos++ & 63 ] = (u32)a | ( (u32)v << 16 );
 			if ( ( a & 0xFE00 ) == 0xDC00 )
 			{
@@ -676,15 +732,6 @@ u8 CC64Memory::read8( scpu_addr_t addr )
 				// a fresh edge.
 				m_SynthNMIActive = false;
 				m_CIA2ICRPending = 0;
-			}
-			else if ( a == 0xDD02 )
-			{
-				// A read establishes the real direction baseline; it does not
-				// itself represent a direction change on the pins.
-				m_CIA2DDRA = v;
-				m_HaveCIA2DDRA = true;
-				updateSpritePtrBase();
-				updateHotShapeBlocks();
 			}
 			return v;
 		}
@@ -824,7 +871,11 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 
 		m_IOWrites++;
 		if ( a < 0xD040 )
+		{
 			m_VICRegShadow[ a & 0x3F ] = value;
+			if ( a == 0xD015 )
+				updateHotShapeBlocks();
+		}
 		m_IOLog[ m_IOLogPos++ & 63 ] = (u32)a | ( (u32)value << 16 ) | ( 1u << 24 );
 		if ( ( a & 0xFE00 ) == 0xDC00 )
 		{

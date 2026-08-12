@@ -283,6 +283,27 @@ void busReadByte_p3( register u32 &g2, register u8 &x, bool releaseDMA,
 	busWriteTurnaroundNeeded = 1;
 } 
 
+// Some SID revisions do not present stable OSC3 data until the very end of
+// PHI2 high. A 6510 samples there, at the falling edge. Retain the final GPIO
+// word observed while PHI2 is still high; the first low sample may already be
+// outside the SID's data-hold interval. This follows the edge without guessing
+// an ARM-cycle offset and without discarding the last known-valid phase.
+__attribute__( ( always_inline ) ) inline
+void busReadByte_p3FallingEdge( register u32 &g2, register u8 &x,
+	                            bool releaseDMA )
+{
+	u32 lastHigh = g2;
+	do
+	{
+		lastHigh = g2;
+		g2 = read32( ARM_GPIO_GPLEV0 );
+	} while ( CPU_HALF_CYCLE );
+	x = (u8)( ( lastHigh >> D0 ) & 255 );
+	RESTART_CYCLE_COUNTER
+	DISABLE_ADDRESS_LATCH_AND_BUSTRANSCEIVER( releaseDMA );
+	busWriteTurnaroundNeeded = 1;
+}
+
 __attribute__( ( always_inline ) ) inline  
 void busBeginBurstWrites( register u32 &g2 )
 {

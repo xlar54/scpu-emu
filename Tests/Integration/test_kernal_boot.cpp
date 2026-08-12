@@ -55,6 +55,18 @@ struct SystemFixture
 	}
 };
 
+struct CIA2SeedBus : CHostBus
+{
+	bool allowVerification = true;
+	u32 verificationCalls = 0;
+
+	bool verifyC64CIA2DDRA( u8 expected ) override
+	{
+		verificationCalls++;
+		return allowVerification && m_Memory[ 0xDD02 ] == expected;
+	}
+};
+
 TEST( integration_reset_vector_comes_from_shadowed_kernal )
 {
 	SystemFixture f;
@@ -1222,8 +1234,7 @@ TEST( integration_polling_dd00_with_idle_lines_never_latches_iec_activity )
 	// mirroring, so the physical screen froze while the machine ran on.
 	SystemFixture f;
 	f.start();
-	f.bus.m_Memory[ 0xDD02 ] = 0x3F;		// PA6/PA7 inputs, as the KERNAL sets
-	f.mem.read8( 0xDD02 );
+	f.mem.write8( 0xDD02, 0x3F );		// PA6/PA7 inputs, as the KERNAL sets
 
 	// A real transaction opens the window.
 	f.bus.m_Memory[ 0xDD00 ] = 0x7F;		// DATA in low: a drive is talking
@@ -1390,6 +1401,162 @@ TEST( integration_active_screen_base_tracks_d018_and_vic_bank )
 	CHECK_EQ( f.mem.activeScreenBase(), 0xFFFFFFFFu );
 }
 
+TEST( integration_active_bitmap_base_tracks_mode_d018_and_vic_bank )
+{
+	SystemFixture f;
+	f.start();
+
+	CHECK_EQ( f.mem.activeBitmapBase(), 0xFFFFFFFFu );
+	f.mem.write8( 0xD011, 0x3B );			// bitmap mode on
+	CHECK_EQ( f.mem.activeBitmapBase(), 0x0000u );
+	f.mem.write8( 0xD018, 0x1C );			// bitmap high half
+	CHECK_EQ( f.mem.activeBitmapBase(), 0x2000u );
+	f.mem.write8( 0xDD00, 0xC6 );			// VIC bank 1
+	CHECK_EQ( f.mem.activeBitmapBase(), 0x6000u );
+
+	// Bitmap selection remains known even when the screen matrix is under I/O.
+	f.mem.write8( 0xDD00, 0xC4 );			// VIC bank 3
+	f.mem.write8( 0xD018, 0x40 );			// screen $D000, bitmap $C000
+	CHECK_EQ( f.mem.activeScreenBase(), 0xFFFFFFFFu );
+	CHECK_EQ( f.mem.activeBitmapBase(), 0xC000u );
+	f.mem.write8( 0xD011, 0x1B );			// bitmap mode off
+	CHECK_EQ( f.mem.activeBitmapBase(), 0xFFFFFFFFu );
+}
+
+TEST( integration_active_charset_base_tracks_d018_bank_and_character_rom )
+{
+	SystemFixture f;
+	f.start();
+
+	// Default D018=$14 selects the VIC's internal character ROM at $1000.
+	CHECK_EQ( f.mem.activeCharsetBase(), 0xFFFFFFFFu );
+	f.mem.write8( 0xD018, 0x02 );			// bank-0 DRAM charset $0800
+	CHECK_EQ( f.mem.activeCharsetBase(), 0x0800u );
+	f.mem.write8( 0xDD00, 0xC6 );			// VIC bank 1
+	CHECK_EQ( f.mem.activeCharsetBase(), 0x4800u );
+	f.mem.write8( 0xD018, 0x04 );			// bank-1 DRAM charset $5000
+	CHECK_EQ( f.mem.activeCharsetBase(), 0x5000u );
+	f.mem.write8( 0xDD00, 0xC5 );			// VIC bank 2
+	f.mem.write8( 0xD018, 0x02 );			// offset $0800 is DRAM
+	CHECK_EQ( f.mem.activeCharsetBase(), 0x8800u );
+	f.mem.write8( 0xD018, 0x06 );			// offset $1800 is character ROM
+	CHECK_EQ( f.mem.activeCharsetBase(), 0xFFFFFFFFu );
+	f.mem.write8( 0xD011, 0x3B );			// bitmap mode suppresses charset
+	CHECK_EQ( f.mem.activeCharsetBase(), 0xFFFFFFFFu );
+}
+
+TEST( integration_d011_read_uses_shadowed_control_and_live_raster_high_bit )
+{
+	SystemFixture f;
+	f.start();
+
+	// Establish a valid hires-bitmap control latch through the same write path
+	// used by the emulated CPU, then corrupt only the physical readback. GEOS
+	// reads, masks bit 7 and writes this value back; the low seven bits must not
+	// be allowed to inherit expansion-bus residue.
+	f.mem.write8( 0xD011, 0x3B );
+	f.bus.m_Memory[ 0xD011 ] = 0x7F;
+	CHECK_EQ( f.mem.read8( 0xD011 ), (u8)0x3B );
+
+	// Bit 7 remains live and comes from the physical raster counter rather than
+	// the shadowed compare value.
+	f.bus.m_Cycles = (u64)300 * c64CyclesPerLine( VIDEO_PAL );
+	CHECK_EQ( f.mem.read8( 0xD011 ), (u8)0xBB );
+}
+
+TEST( integration_c64_cia2_seed_repeats_only_the_verified_ddra_write )
+{
+	CIA2SeedBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	bus.m_LogEnabled = true;
+
+	CHECK( mem.initializeC64CIA2() );
+	CHECK_EQ( bus.verificationCalls, 1u );
+	CHECK_EQ( bus.m_LogCount, 2u );
+	CHECK_EQ( bus.m_Log[ 0 ].op, HOSTOP_WRITE );
+	CHECK_EQ( bus.m_Log[ 0 ].addr, 0xDD02 );
+	CHECK_EQ( bus.m_Log[ 0 ].value, 0x3F );
+	CHECK_EQ( bus.m_Log[ 1 ].op, HOSTOP_WRITE );
+	CHECK_EQ( bus.m_Log[ 1 ].addr, 0xDD02 );
+	CHECK_EQ( bus.m_Log[ 1 ].value, 0x3F );
+
+	// Ordinary guest writes remain single accesses; the repeat is confined to
+	// the dedicated pure-latch initialization above.
+	mem.write8( 0xDD02, 0x37 );
+	CHECK_EQ( bus.m_LogCount, 3u );
+	CHECK_EQ( bus.m_Log[ 2 ].value, 0x37 );
+}
+
+TEST( integration_failed_cia2_seed_verification_leaves_ddra_unknown )
+{
+	CIA2SeedBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	bus.allowVerification = false;
+
+	CHECK( !mem.initializeC64CIA2() );
+	bus.m_Memory[ 0xDD02 ] = 0xA5;
+	bus.resetStats();
+	CHECK_EQ( mem.read8( 0xDD02 ), (u8)0xA5 );
+	CHECK_EQ( bus.m_Reads, 1u );
+}
+
+TEST( integration_verified_cia2_ddra_shadow_rejects_poisoned_physical_reads )
+{
+	CIA2SeedBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	CHECK( mem.initializeC64CIA2() );
+
+	bus.m_Memory[ 0xDD02 ] = 0x00;
+	bus.resetStats();
+	const u8 rmw = mem.read8( 0xDD02 );
+	CHECK_EQ( rmw, (u8)0x3F );
+	CHECK_EQ( bus.m_Reads, 0u );
+	mem.write8( 0xDD02, rmw );
+	CHECK_EQ( bus.m_Memory[ 0xDD02 ], (u8)0x3F );
+}
+
+TEST( integration_cia2_pra_read_combines_latch_outputs_with_physical_inputs )
+{
+	CIA2SeedBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	CHECK( mem.initializeC64CIA2() );
+	mem.write8( 0xDD00, 0x35 );
+
+	// DDRA=$3F: PA0-PA5 are outputs from the hidden latch; PA6-PA7 are live
+	// physical inputs. Neither half may overwrite the other.
+	bus.m_Memory[ 0xDD00 ] = 0xC0;
+	CHECK_EQ( mem.read8( 0xDD00 ), (u8)0xF5 );
+	bus.m_Memory[ 0xDD00 ] = 0x00;
+	CHECK_EQ( mem.read8( 0xDD00 ), (u8)0x35 );
+}
+
+TEST( integration_cia2_pra_rmw_residue_cannot_move_the_vic_bank )
+{
+	CIA2SeedBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	CHECK( mem.initializeC64CIA2() );
+	mem.write8( 0xDD00, 0xC6 );		// VIC bank 1
+	CHECK_EQ( mem.activeScreenBase(), 0x4400u );
+
+	// Physical residue claims PA0/PA1 are both low. A read-modify-write must
+	// preserve the output latch's %10 bank selection rather than changing it.
+	bus.m_Memory[ 0xDD00 ] = 0x00;
+	const u8 rmw = mem.read8( 0xDD00 );
+	mem.write8( 0xDD00, rmw );
+	CHECK_EQ( rmw & 3, (u8)2 );
+	CHECK_EQ( mem.activeScreenBase(), 0x4400u );
+}
+
 TEST( integration_visible_drain_defers_screen_but_not_cold_traffic )
 {
 	struct FixedRasterBus : CHostBus
@@ -1446,6 +1613,64 @@ TEST( integration_visible_drain_defers_screen_but_not_cold_traffic )
 	CHECK_EQ( bus.m_Memory[ 0x0400 ], (u8)0xA5 );
 	CHECK_EQ( bus.m_Memory[ 0x07E7 ], (u8)( 999 ^ 0xA5 ) );
 	CHECK( !scpu.writeBuffer().hasPendingInRange( 0x0400, 1000 ) );
+}
+
+TEST( integration_bitmap_drain_is_hidden_and_prioritized )
+{
+	struct FixedRasterBus : CHostBus
+	{
+		u16 line = 100;
+		u32 maxBurst = 0;
+		u16 rasterLine() override { return line; }
+		void writeBurst( const C64BusWrite *writes, u32 count ) override
+		{
+			if ( count > maxBurst ) maxBurst = count;
+			CHostBus::writeBurst( writes, count );
+		}
+	} bus;
+
+	CSuperCPU scpu;
+	u8 basic[ C64_BASIC_SIZE ];
+	u8 kernal[ C64_KERNAL_SIZE ];
+	std::memset( basic, 0xEA, sizeof basic );
+	std::memset( kernal, 0xEA, sizeof kernal );
+	kernal[ 0 ] = 0x4C;
+	kernal[ 1 ] = 0x00;
+	kernal[ 2 ] = 0xE0;
+	kernal[ 0x1FFC ] = 0x00;
+	kernal[ 0x1FFD ] = 0xE0;
+	scpu.setBasicROM( basic );
+	scpu.setKernalROM( kernal );
+	CHECK( scpu.init( &bus, SCPU_CORE_6502, 0 ) );
+	scpu.writeBuffer().setOptMode( SCPU_OPT_NONE );
+	scpu.setMirrorDisplayBudget( 256 );
+
+	// Bank 2, bitmap at $A000. Queue bitmap bytes first and unrelated cold RAM
+	// behind them to prove the visible drain skips the entire 8K display span.
+	scpu.memory().write8( 0xDD00, 0xC5 );
+	scpu.memory().write8( 0xD011, 0x3B );
+	scpu.memory().write8( 0xD018, 0x18 );
+	CHECK_EQ( scpu.memory().activeBitmapBase(), 0xA000u );
+	for ( u32 i = 0; i < 8000; i++ )
+		scpu.memory().write8( (u16)( 0xA000 + i ), (u8)( i ^ 0x5A ) );
+	scpu.memory().write8( 0x2000, 0xA5 );
+
+	scpu.runFrame();
+	CHECK_EQ( bus.m_Memory[ 0x2000 ], 0xA5 );
+	CHECK( bus.m_Memory[ 0xA000 ] != (u8)0x5A );
+	CHECK( scpu.writeBuffer().hasPendingInRange( 0xA000, 8000 ) );
+
+	// In the hidden window, the bitmap is selected ahead of cold FIFO traffic
+	// and completed through individually raster-checked 64-byte bursts.
+	bus.line = 251;
+	bus.resetStats();
+	bus.maxBurst = 0;
+	scpu.runFrame();
+	CHECK_EQ( bus.m_BurstWrites, 8000u );
+	CHECK_EQ( bus.maxBurst, 64u );
+	CHECK_EQ( bus.m_Memory[ 0xA000 ], (u8)0x5A );
+	CHECK_EQ( bus.m_Memory[ 0xBF3F ], (u8)( 7999 ^ 0x5A ) );
+	CHECK( !scpu.writeBuffer().hasPendingInRange( 0xA000, 8000 ) );
 }
 
 TEST( integration_display_drain_avoids_sprite_fetch_lines )

@@ -194,6 +194,13 @@ public:
 	// chargen from a file instead (see ROMs/README.md).
 	bool snapshotROMsFromBus();
 
+	// Establish the C64 KERNAL's CIA2 direction state before guest execution.
+	// The dedicated double write handles the known first-write loss on buffered
+	// C128 expansion ports; the shadow becomes authoritative only after the bus
+	// backend verifies the value. Called only for the C64 personality while
+	// /DMA still holds the physical host CPU off the bus.
+	bool initializeC64CIA2();
+
 	bool hasBasicROM()  const { return m_HasBasic; }
 	bool hasKernalROM() const { return m_HasKernal; }
 	bool hasCharROM()   const { return m_HasChar; }
@@ -868,6 +875,36 @@ public:
 		return m_SpritePtrBase == 0xFFFFFFFF
 		     ? 0xFFFFFFFF : m_SpritePtrBase - 0x3F8;
 	}
+	// First byte of the active 8K bitmap, or the sentinel while bitmap mode is
+	// off. Unlike activeScreenBase(), this remains meaningful when the screen
+	// matrix itself lies under I/O: $D011/$D018 and the CIA2 bank pins select
+	// the bitmap independently of whether the CPU can mirror the matrix row.
+	u32 activeBitmapBase() const
+	{
+		if ( !( m_VICRegShadow[ 0x11 ] & 0x20 ) )
+			return 0xFFFFFFFF;
+		const u8 outputs = m_HaveCIA2DDRA ? m_CIA2DDRA : 0x03;
+		const u8 bank = m_HaveCIA2PortALatch
+		              ? (u8)( ~m_CIA2PortALatch & outputs & 3 ) : 0;
+		return ( (u32)bank << 14 ) + ( ( m_LastD018 & 0x08 ) ? 0x2000 : 0 );
+	}
+	// First byte of the active 2K character-pattern region, or the sentinel
+	// while bitmap mode is selected or the VIC is fetching its internal
+	// character ROM. D018 bits 1-3 select 2K steps inside the CIA2-selected
+	// 16K VIC bank. In banks 0 and 2, offsets $1000/$1800 select character ROM,
+	// not physical DRAM, so there is nothing for the mirror scrub to repair.
+	u32 activeCharsetBase() const
+	{
+		if ( m_VICRegShadow[ 0x11 ] & 0x20 )
+			return 0xFFFFFFFF;
+		const u8 outputs = m_HaveCIA2DDRA ? m_CIA2DDRA : 0x03;
+		const u8 bank = m_HaveCIA2PortALatch
+		              ? (u8)( ~m_CIA2PortALatch & outputs & 3 ) : 0;
+		const u32 offset = (u32)( m_LastD018 & 0x0E ) << 10;
+		if ( ( bank & 1 ) == 0 && offset >= 0x1000 )
+			return 0xFFFFFFFF;
+		return ( (u32)bank << 14 ) + offset;
+	}
 
 	// Writes aimed at the active sprite-pointer row, same-value or not. A
 	// multiplexer rewrites this row several times per FRAME; the rate is the
@@ -947,8 +984,11 @@ public:
 		if ( m_SpritePtrBase == 0xFFFFFFFF )
 			return;
 		const u32 bank = ( m_SpritePtrBase >> 14 ) & 3;
+		const u8 enabled = m_VICRegShadow[ 0x15 ];
 		for ( u32 n = 0; n < 8; n++ )
 		{
+			if ( !( enabled & ( 1u << n ) ) )
+				continue;
 			u32 v = m_RAM[ (u16)( m_SpritePtrBase + n ) ];
 			if ( m_RelocEnable && bank == 3 && v >= 0x40 && v < 0x80
 			     && m_PtrReloc[ v - 0x40 ] != 0xFF )

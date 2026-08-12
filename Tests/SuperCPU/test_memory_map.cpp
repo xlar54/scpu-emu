@@ -1115,6 +1115,7 @@ TEST( scpu_c128_host_uses_stable_ff_presets_or_an_explicit_mode )
 		nativeSCPU.setCharROM( chargen );
 		CHECK( nativeSCPU.init( &nativeBus, SCPU_CORE_65816, SCPU_SIMM_NONE ) );
 		CHECK( nativeSCPU.registers().scpu128Mode() );
+		CHECK_EQ( nativeBus.m_Memory[ 0xDD02 ], (u8)0x00 );
 	}
 
 	{
@@ -1132,6 +1133,7 @@ TEST( scpu_c128_host_uses_stable_ff_presets_or_an_explicit_mode )
 		c64SCPU.setCharROM( chargen );
 		CHECK( c64SCPU.init( &c64Bus, SCPU_CORE_65816, SCPU_SIMM_NONE ) );
 		CHECK( !c64SCPU.registers().scpu128Mode() );
+		CHECK_EQ( c64Bus.m_Memory[ 0xDD02 ], (u8)0x3F );
 	}
 
 	{
@@ -1151,6 +1153,7 @@ TEST( scpu_c128_host_uses_stable_ff_presets_or_an_explicit_mode )
 		forcedSCPU.setCharROM( chargen );
 		CHECK( forcedSCPU.init( &forcedBus, SCPU_CORE_65816, SCPU_SIMM_NONE ) );
 		CHECK( !forcedSCPU.registers().scpu128Mode() );
+		CHECK_EQ( forcedBus.m_Memory[ 0xDD02 ], (u8)0x3F );
 	}
 }
 

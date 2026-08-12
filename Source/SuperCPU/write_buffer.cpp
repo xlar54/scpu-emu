@@ -22,6 +22,9 @@
 CWriteBuffer::CWriteBuffer()
 	: m_WritesAccepted( 0 ), m_WritesEliminated( 0 ),
 	  m_RelocForwarded( 0 ), m_RelocShielded( 0 ), m_BytesResynced( 0 ),
+	  m_DisplayScrubBytes( 0 ), m_DisplayScrubMatrixBytes( 0 ),
+	  m_DisplayScrubBitmapBytes( 0 ), m_DisplayScrubCharsetBytes( 0 ),
+	  m_DisplayScrubSpriteBytes( 0 ),
 	  m_WritesSkipped( 0 ), m_WritesCoalesced( 0 ),
 	  m_BytesFlushed( 0 ), m_Flushes( 0 ),
 	  m_IOWindowSuppressed( 0 ),
@@ -30,6 +33,8 @@ CWriteBuffer::CWriteBuffer()
 	  m_RangeLo( 0x0000 ), m_RangeHi( 0xFFFF ),
 	  m_Head( 0 ), m_Count( 0 )
 {
+	m_DisplayScrubSampled[ 0 ] = m_DisplayScrubSampled[ 1 ] = 0;
+	m_DisplayScrubMismatches[ 0 ] = m_DisplayScrubMismatches[ 1 ] = 0;
 	clearDirty();
 	setOptMode( SCPU_OPT_DEFAULT );
 }
@@ -39,6 +44,11 @@ void CWriteBuffer::attach( IC64Bus *bus, const u8 *ram )
 	m_Bus = bus;
 	m_RAM = ram;
 	for ( u32 i = 0; i < 0x10000 / 64; i++ ) m_Synced[ i ] = 0;
+	m_DisplayScrubScreenBase = m_DisplayScrubGraphicsBase = 0xFFFFFFFF;
+	m_DisplayScrubGraphicsLength = 0;
+	m_DisplayScrubScreenOffset = m_DisplayScrubGraphicsOffset = 0;
+	m_DisplayScrubSpriteOffset = 0;
+	m_DisplayScrubTurn = 0;
 }
 
 void CWriteBuffer::clearDirty()
@@ -80,6 +90,11 @@ void CWriteBuffer::resetStats()
 	m_WritesAccepted = m_WritesEliminated = m_WritesSkipped = m_WritesCoalesced = 0;
 	m_RelocForwarded = m_RelocShielded = 0;
 	m_BytesResynced = 0;
+	m_DisplayScrubBytes = m_DisplayScrubMatrixBytes = 0;
+	m_DisplayScrubBitmapBytes = m_DisplayScrubCharsetBytes = 0;
+	m_DisplayScrubSpriteBytes = 0;
+	m_DisplayScrubSampled[ 0 ] = m_DisplayScrubSampled[ 1 ] = 0;
+	m_DisplayScrubMismatches[ 0 ] = m_DisplayScrubMismatches[ 1 ] = 0;
 	m_BytesFlushed = m_Flushes = 0;
 	m_IOWindowSuppressed = 0;
 }
@@ -269,8 +284,9 @@ bool CWriteBuffer::hasPendingInRange( u32 base, u32 len ) const
 }
 
 u32 CWriteBuffer::flushSelectedChunk( u32 maxBytes, bool deferHot,
-	                                  u32 screenBase, u32 screenLen,
-	                                  bool screenOnly )
+	                                  u32 displayBase, u32 displayLen,
+	                                  bool displayOnly,
+	                                  u32 displayBase2, u32 displayLen2 )
 {
 	if ( m_Count == 0 || maxBytes == 0 || !m_Bus )
 		return 0;
@@ -287,14 +303,15 @@ u32 CWriteBuffer::flushSelectedChunk( u32 maxBytes, bool deferHot,
 	while ( examined < original && selected < maxBytes && m_Count != 0 )
 	{
 		const u16 a = m_List[ m_Head ];
-		const bool inScreen = addressInRange( a, screenBase, screenLen );
+		const bool inDisplay = addressInRange( a, displayBase, displayLen )
+		                    || addressInRange( a, displayBase2, displayLen2 );
 		bool hot = false;
 		if ( deferHot && m_HotBlocks )
 		{
 			const u32 blk = (u32)a >> 6;
 			hot = ( ( m_HotBlocks[ blk >> 6 ] >> ( blk & 63 ) ) & 1 ) != 0;
 		}
-		const bool take = screenOnly ? inScreen : ( !inScreen && !hot );
+		const bool take = displayOnly ? inDisplay : ( !inDisplay && !hot );
 		examined++;
 
 		if ( !take )
@@ -328,7 +345,7 @@ u32 CWriteBuffer::flushSelectedChunk( u32 maxBytes, bool deferHot,
 }
 
 u32 CWriteBuffer::flushUpToPolicy( u32 maxBytes, bool deferHot,
-	                               u32 screenBase )
+	                               u32 screenBase, u32 bitmapBase )
 {
 	if ( m_Count == 0 || maxBytes == 0 )
 		return m_Count;
@@ -346,7 +363,8 @@ u32 CWriteBuffer::flushUpToPolicy( u32 maxBytes, bool deferHot,
 	while ( m_Count > 0 && sent < maxBytes )
 	{
 		const u32 n = flushSelectedChunk( maxBytes - sent, deferHot,
-		                                  screenBase, 1000, false );
+		                                  screenBase, 1000, false,
+		                                  bitmapBase, 8000 );
 		if ( n == 0 ) break;
 		sent += n;
 	}
@@ -394,17 +412,10 @@ void CWriteBuffer::resyncSweep( u32 maxBytes )
 		if ( isDirty( a ) )
 			continue;				// pending value owns this address
 
-		u8 v = m_RAM[ a ];
-		if ( m_RelocCount && *m_RelocCount && a >= 0xC000 && a < 0xCC00 )
-		{
-			// A stolen block heals from its under-I/O SOURCE, not from the
-			// shadow underneath it -- the shadow there is program data whose
-			// DRAM copy is deliberately dead. This is also what repairs the
-			// rare mis-elimination a value-collision can cause.
-			const u8 srcV = m_RelocInUse[ ( (u32)a - 0xC000 ) >> 6 ];
-			if ( srcV != 0xFF )
-				v = m_RAM[ 0xC000 + ( (u32)srcV << 6 ) + ( a & 63 ) ];
-		}
+		// A stolen block heals from its under-I/O SOURCE, not from the
+		// shadow underneath it -- the shadow there is program data whose
+		// DRAM copy is deliberately dead.
+		const u8 v = authoritativeShadowValue( a );
 		m_Burst[ n ].addr  = a;
 		m_Burst[ n ].value = deliverValue( a, v );
 		m_Synced[ a >> 6 ] |= 1ULL << ( a & 63 );
@@ -416,6 +427,133 @@ void CWriteBuffer::resyncSweep( u32 maxBytes )
 		m_Bus->writeBurst( m_Burst, n );
 		m_BytesResynced += n;
 	}
+}
+
+u32 CWriteBuffer::resyncDisplayed( u32 screenBase, u32 graphicsBase,
+	                                u32 graphicsLength, u32 maxBytes,
+	                                bool masked, bool repair, bool sample )
+{
+	if ( !m_Bus || !m_RAM || maxBytes == 0 )
+		return 0;
+	if ( maxBytes > SCPU_WRITEBUF_CHUNK )
+		maxBytes = SCPU_WRITEBUF_CHUNK;
+	if ( graphicsBase >= 0x10000 ) graphicsLength = 0;
+	if ( graphicsLength != 2048 && graphicsLength != 8192 ) graphicsLength = 0;
+
+	if ( screenBase != m_DisplayScrubScreenBase )
+	{
+		m_DisplayScrubScreenBase = screenBase;
+		m_DisplayScrubScreenOffset = 0;
+	}
+	if ( graphicsBase != m_DisplayScrubGraphicsBase
+	     || graphicsLength != m_DisplayScrubGraphicsLength )
+	{
+		m_DisplayScrubGraphicsBase = graphicsBase;
+		m_DisplayScrubGraphicsLength = graphicsLength;
+		m_DisplayScrubGraphicsOffset = 0;
+	}
+
+	const bool haveScreen = screenBase < 0x10000;
+	const bool haveGraphics = graphicsLength != 0;
+	u16 hotBlocks[ 8 ];
+	u32 hotCount = 0;
+	if ( m_HotBlocks )
+	{
+		for ( u32 block = 0; block < 1024 && hotCount < 8; block++ )
+			if ( ( m_HotBlocks[ block >> 6 ] >> ( block & 63 ) ) & 1 )
+				hotBlocks[ hotCount++ ] = (u16)block;
+	}
+
+	const u32 screenSlots = haveScreen ? 1u : 0u;
+	const u32 graphicsSlots = haveGraphics ? graphicsLength / 1024u : 0u;
+	const u32 spriteSlots = hotCount ? 1u : 0u;
+	const u32 totalSlots = screenSlots + graphicsSlots + spriteSlots;
+	if ( totalSlots == 0 )
+		return 0;
+	if ( m_DisplayScrubTurn >= totalSlots ) m_DisplayScrubTurn = 0;
+
+	enum { REGION_MATRIX, REGION_GRAPHICS, REGION_SPRITES };
+	u32 region;
+	u32 base = 0, length = 0;
+	u16 *offset = 0;
+	if ( m_DisplayScrubTurn < screenSlots )
+	{
+		region = REGION_MATRIX;
+		base = screenBase;
+		length = 1024;
+		offset = &m_DisplayScrubScreenOffset;
+	}
+	else if ( m_DisplayScrubTurn < screenSlots + graphicsSlots )
+	{
+		region = REGION_GRAPHICS;
+		base = graphicsBase;
+		length = graphicsLength;
+		offset = &m_DisplayScrubGraphicsOffset;
+	}
+	else
+	{
+		region = REGION_SPRITES;
+		length = hotCount * 64u;
+		offset = &m_DisplayScrubSpriteOffset;
+		if ( *offset >= length ) *offset = 0;
+	}
+
+	u32 candidates = 0;
+	u32 written = 0;
+	u32 inspected = 0;
+	const u32 mode = graphicsLength == 8192 ? 1u : 0u;
+	while ( candidates < maxBytes && inspected < length )
+	{
+		u16 a;
+		if ( region == REGION_SPRITES )
+		{
+			const u32 virtualOffset = *offset;
+			a = (u16)( ( (u32)hotBlocks[ virtualOffset >> 6 ] << 6 )
+			          + ( virtualOffset & 63 ) );
+		}
+		else
+			a = (u16)( base + *offset );
+		*offset = (u16)( ( *offset + 1u ) % length );
+		inspected++;
+
+		if ( masked && ( a & 0x000A ) != 0x0008 )
+			continue;
+		if ( !shouldMirror( a ) || isDirty( a ) )
+			continue;
+		const u8 expected = deliverValue( a, authoritativeShadowValue( a ) );
+		candidates++;
+		if ( sample )
+		{
+			const u8 actual = m_Bus->read( a );
+			m_DisplayScrubSampled[ mode ]++;
+			if ( actual != expected ) m_DisplayScrubMismatches[ mode ]++;
+		}
+		if ( !repair )
+			continue;
+		// Selection and writeBurst run synchronously with the guest CPU stopped,
+		// but sampling above may take many physical cycles. Re-check immediately
+		// before staging the write so a future asynchronous producer cannot let a
+		// stale scrub value overtake a newer dirty value.
+		if ( isDirty( a ) )
+			continue;
+		m_Burst[ written ].addr = a;
+		m_Burst[ written ].value = expected;
+		m_Synced[ a >> 6 ] |= 1ULL << ( a & 63 );
+		written++;
+	}
+
+	m_DisplayScrubTurn = (u8)( ( m_DisplayScrubTurn + 1u ) % totalSlots );
+
+	if ( written )
+	{
+		m_Bus->writeBurst( m_Burst, written );
+		m_DisplayScrubBytes += written;
+		if ( region == REGION_MATRIX ) m_DisplayScrubMatrixBytes += written;
+		else if ( region == REGION_SPRITES ) m_DisplayScrubSpriteBytes += written;
+		else if ( graphicsLength == 8192 ) m_DisplayScrubBitmapBytes += written;
+		else m_DisplayScrubCharsetBytes += written;
+	}
+	return written;
 }
 
 void CWriteBuffer::flush()

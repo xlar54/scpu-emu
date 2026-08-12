@@ -167,6 +167,13 @@ bool CSuperCPU::init( IC64Bus *bus, SCPUCoreType core, u32 simmMB )
 	}, this );
 
 	reset();
+	// reset() deliberately invalidates every CIA shadow, so establish the
+	// deterministic C64 KERNAL direction state only afterwards. A physical C128
+	// running the C64 personality belongs on this path too; future native C128
+	// mode does not. acquire() still owns /DMA here, therefore no host CPU can
+	// change the latch behind the shadow before guest execution begins.
+	if ( !scpu128Mode )
+		m_Memory.initializeC64CIA2();
 	return true;
 }
 
@@ -177,6 +184,10 @@ void CSuperCPU::reset()
 	// immediately by clearing the shadow anyway.
 	m_WriteBuffer.discard();
 	m_FrameTickDebt = 0;
+	m_DisplayScrubPhaseStart = 0;
+	m_DisplayScrubPhaseOn = m_DisplayScrubEnabled
+	                      && m_DisplayScrubPeriodSeconds == 0;
+	m_DisplayScrubBitmapSeen = false;
 	m_Memory.reset();
 
 	// Bootmap, before the registers are reset -- CSuperCPURegisters::reset()
@@ -233,6 +244,33 @@ void CSuperCPU::reset()
 
 	if ( m_CPU )
 		m_CPU->reset();
+}
+
+void CSuperCPU::updateDisplayScrubPhase( bool bitmapActive )
+{
+	bool next = m_DisplayScrubEnabled;
+	if ( m_DisplayScrubEnabled && m_DisplayScrubPeriodSeconds )
+	{
+		const u32 hz = m_Bus ? m_Bus->hostCyclesPerSec() : 0;
+		const u64 now = m_Bus ? m_Bus->hostCycles() : 0;
+		if ( bitmapActive && !m_DisplayScrubBitmapSeen )
+		{
+			m_DisplayScrubBitmapSeen = true;
+			m_DisplayScrubPhaseStart = now;
+		}
+		if ( hz && m_DisplayScrubBitmapSeen )
+		{
+			const u64 interval = (u64)m_DisplayScrubPeriodSeconds * hz;
+			next = interval && ( ( ( now - m_DisplayScrubPhaseStart ) / interval ) & 1 );
+		}
+		else
+			next = false;
+	}
+	if ( next != m_DisplayScrubPhaseOn )
+	{
+		m_DisplayScrubPhaseOn = next;
+		m_DisplayScrubPhaseGeneration++;
+	}
 }
 
 void CSuperCPU::benchmark65816()
@@ -444,7 +482,8 @@ static bool c64LineInSpriteFetchSpan( const u8 *vic, u16 line )
 static void flushMirrorsRasterAware( CWriteBuffer &buffer, IC64Bus &bus,
                                      const C64Signals &sig, u32 displayBudget,
                                      u32 transferBudget, u32 screenBudget,
-                                     const u8 *vicShadow, u32 screenBase )
+	                                 const u8 *vicShadow, u32 screenBase,
+	                                 u32 bitmapBase )
 {
 	const u32 perLine  = c64CyclesPerLine( sig.video );
 	const u32 lines    = c64RasterLines( sig.video );
@@ -458,7 +497,8 @@ static void flushMirrorsRasterAware( CWriteBuffer &buffer, IC64Bus &bus,
 		const u16 line = bus.rasterLine();
 		u32 budgetBytes;
 		bool inDisplay = false;
-		bool screenPriority = false;
+		bool displayPriority = false;
+		u32 priorityBase = 0xFFFFFFFF, priorityLen = 0;
 
 		if ( c64RasterIsSafeForBulkTransfer( sig.video, line ) )
 		{
@@ -470,14 +510,21 @@ static void flushMirrorsRasterAware( CWriteBuffer &buffer, IC64Bus &bus,
 			budgetBytes = ( linesLeft * perLine * 3 ) / 4;
 			const bool screenPending = screenBase < 0x10000
 			                        && buffer.hasPendingInRange( screenBase, 1000 );
-			if ( screenPending )
+			const bool bitmapPending = bitmapBase < 0x10000
+			                        && buffer.hasPendingInRange( bitmapBase, 8000 );
+			if ( screenPending || bitmapPending )
 			{
 				// Do not spend this opportunity on general FIFO traffic while a
 				// matrix transaction is still incomplete. Its dedicated allowance
 				// is larger, but every physical burst below remains 64 bytes and
 				// the raster is sampled again before the next one.
 				if ( screenLeft == 0 ) break;
-				screenPriority = true;
+				displayPriority = true;
+				// Matrix first: it is only 1000 bytes and includes bitmap colour
+				// selection. The bitmap consumes the remaining hidden opportunities
+				// and converges over subsequent frames without visible-picture tears.
+				priorityBase = screenPending ? screenBase : bitmapBase;
+				priorityLen = screenPending ? 1000 : 8000;
 				if ( budgetBytes > screenLeft ) budgetBytes = screenLeft;
 			}
 			else
@@ -509,7 +556,7 @@ static void flushMirrorsRasterAware( CWriteBuffer &buffer, IC64Bus &bus,
 			break;
 
 		const u32 before = buffer.pending();
-		if ( screenPriority )
+		if ( displayPriority )
 		{
 			// A smooth character scroller rewrites the matrix at every
 			// eight-pixel boundary. Deliver those bytes first, but still in
@@ -517,7 +564,7 @@ static void flushMirrorsRasterAware( CWriteBuffer &buffer, IC64Bus &bus,
 			// picture a partially updated matrix is invisible, and completing
 			// it before general traffic prevents an old/new one-character
 			// composite from appearing on the next frame.
-			buffer.flushRangeUpTo( screenBase, 1000, chunk );
+			buffer.flushRangeUpTo( priorityBase, priorityLen, chunk );
 		}
 		else
 		{
@@ -525,7 +572,8 @@ static void flushMirrorsRasterAware( CWriteBuffer &buffer, IC64Bus &bus,
 			// screen matrix while continuing past them to cold traffic. Outside
 			// it, any leftover installment is ordinary FIFO delivery.
 			buffer.flushUpToPolicy( chunk, inDisplay,
-			                        inDisplay ? screenBase : 0xFFFFFFFF );
+			                        inDisplay ? screenBase : 0xFFFFFFFF,
+			                        inDisplay ? bitmapBase : 0xFFFFFFFF );
 		}
 		const u32 after = buffer.pending();
 
@@ -534,7 +582,7 @@ static void flushMirrorsRasterAware( CWriteBuffer &buffer, IC64Bus &bus,
 			break;
 
 		const u32 sent = before - after;
-		if ( screenPriority )
+		if ( displayPriority )
 			screenLeft = ( screenLeft > sent ) ? ( screenLeft - sent ) : 0;
 		else
 		{
@@ -598,6 +646,8 @@ u64 CSuperCPU::runFrame()
 
 	while ( ticksUsed < frameTicks )
 	{
+		const u32 scrubBitmapBase = m_Memory.activeBitmapBase();
+		updateDisplayScrubPhase( scrubBitmapBase < 0x10000 );
 		const u32 selectedClockHz = currentClockHz();
 		if ( m_Registers.consumeSpeedChanged() )
 			m_Memory.setPacing( m_Bus->hostCyclesPerSec(), selectedClockHz );
@@ -635,7 +685,32 @@ u64 CSuperCPU::runFrame()
 			                         transferPerOpportunity,
 			                         SCPU_MIRROR_SCREEN_BYTES_PER_OPPORTUNITY,
 			                         m_Memory.m_VICRegShadow,
-			                         m_Memory.activeScreenBase() );
+			                         m_Memory.activeScreenBase(),
+			                         m_Memory.activeBitmapBase() );
+
+		// Physical-C64 display DRAM can acquire sparse stored single-bit errors
+		// while the VIC is actively fetching. Repair the measured vulnerable
+		// address class from authoritative shadow, but only after ordinary dirty
+		// traffic has drained and only in the hidden raster window. One 32-byte
+		// chunk per scheduler opportunity keeps the measured worst pause below
+		// 60us. A timed trial alternates repair off/on, making the visual result
+		// self-controlled without adding physical reads on machines whose bus has
+		// no calibrated stable read window.
+		if ( m_DisplayScrubEnabled && !m_MirrorHalted
+		     && sig.machine == MACHINE_C64
+		     && scrubBitmapBase < 0x10000
+		     && ( m_Memory.m_VICRegShadow[ 0x11 ] & 0x10 )
+		     && !m_Memory.iecBusActive() && m_WriteBuffer.empty()
+		     && ticksUsed < frameTicks )
+		{
+			const u16 scrubLine = m_Bus->rasterLine();
+			if ( c64RasterIsSafeForBulkTransfer( sig.video, scrubLine ) )
+			{
+				m_WriteBuffer.resyncDisplayed(
+					m_Memory.activeScreenBase(), scrubBitmapBase, 8192,
+					32, m_DisplayScrubMasked, m_DisplayScrubPhaseOn, false );
+			}
+		}
 	}
 
 	// --- raster-scheduled mirroring ----------------------------------------
@@ -686,7 +761,8 @@ u64 CSuperCPU::runFrame()
 			                         transferPerOpportunity,
 			                         SCPU_MIRROR_SCREEN_BYTES_PER_OPPORTUNITY,
 			                         m_Memory.m_VICRegShadow,
-			                         m_Memory.activeScreenBase() );
+			                         m_Memory.activeScreenBase(),
+			                         m_Memory.activeBitmapBase() );
 
 			// Spare border time goes to convergence: re-deliver a slice of
 			// clean shadow so real DRAM provably approaches shadow no matter

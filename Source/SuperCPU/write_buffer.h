@@ -125,6 +125,28 @@ public:
 	// the raster is somewhere safe; the caller owns that judgement.
 	void resyncSweep( u32 maxBytes );
 
+	// Fast convergence for the memory the VIC is displaying right now. The
+	// physical C64 diagnostic found stored single-bit changes at 2,516 sampled
+	// addresses, all satisfying (addr & $000A) == $0008. Re-deliver that
+	// bounded quarter of the complete active VIC fetch set from authoritative
+	// shadow in short caller-scheduled chunks: matrix, bitmap or charset, and
+	// enabled sprite blocks. Dirty bytes are re-checked immediately before
+	// delivery because their queued value owns the address. When sample is set,
+	// the selected bytes are physically read and compared first; repair=false
+	// makes that a non-writing control pass. Returns the number actually written.
+	u32 resyncDisplayed( u32 screenBase, u32 graphicsBase, u32 graphicsLength,
+	                     u32 maxBytes, bool masked, bool repair = true,
+	                     bool sample = false );
+	// K233/older diagnostic compatibility: the second region was always an 8K
+	// bitmap and every call repaired without sampling.
+	u32 resyncDisplayed( u32 screenBase, u32 bitmapBase, u32 maxBytes,
+	                     bool masked )
+	{
+		return resyncDisplayed( screenBase, bitmapBase,
+		                        bitmapBase < 0x10000 ? 8192u : 0u,
+		                        maxBytes, masked, true, false );
+	}
+
 	// Bitmap of 64-byte blocks currently selected by ACTIVE sprite pointers
 	// (owned by CC64Memory). Bytes inside them are delivered only by border
 	// drains, and a display drain stops when it meets one: a re-rendered
@@ -134,12 +156,14 @@ public:
 	void attachHotShapeBlocks( const u64 *bits ) { m_HotBlocks = bits; }
 
 	// flushUpTo with display-time policy. Hot sprite-shape bytes and bytes in
-	// the active 1000-byte screen matrix are skipped, not allowed to block cold
-	// traffic behind them. Skipped entries remain queued in stable order for a
-	// hidden-window drain. screenBase=0xFFFFFFFF disables screen deferral.
+	// the active 1000-byte screen matrix or 8000-byte bitmap are skipped, not
+	// allowed to block cold traffic behind them. Skipped entries remain queued
+	// in stable order for a hidden-window drain. A base of 0xFFFFFFFF disables
+	// that display-region deferral.
 	// The IMirrorSink flushUpTo() delegates here with both policies disabled.
 	u32 flushUpToPolicy( u32 maxBytes, bool deferHot,
-	                     u32 screenBase = 0xFFFFFFFF );
+	                     u32 screenBase = 0xFFFFFFFF,
+	                     u32 bitmapBase = 0xFFFFFFFF );
 
 	// Hidden-window priority path: deliver only dirty bytes in [base,base+len),
 	// retaining every other FIFO entry. This lets a screen matrix converge in
@@ -208,6 +232,13 @@ public:
 	u64 m_RelocForwarded;	// under-I/O writes redirected to a relocated block
 	u64 m_RelocShielded;	// program writes into stolen blocks, suppressed
 	u64 m_BytesResynced;	// background-sweep bytes re-delivered
+	u64 m_DisplayScrubBytes;	// targeted active matrix/bitmap bytes re-delivered
+	u64 m_DisplayScrubMatrixBytes;
+	u64 m_DisplayScrubBitmapBytes;
+	u64 m_DisplayScrubCharsetBytes;
+	u64 m_DisplayScrubSpriteBytes;
+	u64 m_DisplayScrubSampled[ 2 ];	// [0] text, [1] bitmap
+	u64 m_DisplayScrubMismatches[ 2 ];
 	u64 m_WritesSkipped;	// writes the policy discarded
 	u64 m_WritesCoalesced;	// accepted writes that hit an already-dirty address
 	u64 m_BytesFlushed;		// bytes actually sent over the bus
@@ -224,8 +255,10 @@ public:
 	bool shouldMirror( u16 addr ) const;
 
 private:
-	u32 flushSelectedChunk( u32 maxBytes, bool deferHot, u32 screenBase,
-	                        u32 screenLen, bool screenOnly );
+	u32 flushSelectedChunk( u32 maxBytes, bool deferHot, u32 displayBase,
+	                        u32 displayLen, bool displayOnly,
+	                        u32 displayBase2 = 0xFFFFFFFF,
+	                        u32 displayLen2 = 0 );
 
 	IC64Bus  *m_Bus;
 	const u8 *m_RAM;
@@ -245,11 +278,29 @@ private:
 	// stale DRAM on screen forever.
 	u64 m_Synced[ 0x10000 / 64 ];
 	u16 m_ResyncCursor = 0;
+	u32 m_DisplayScrubScreenBase = 0xFFFFFFFF;
+	u32 m_DisplayScrubGraphicsBase = 0xFFFFFFFF;
+	u32 m_DisplayScrubGraphicsLength = 0;
+	u16 m_DisplayScrubScreenOffset = 0;
+	u16 m_DisplayScrubGraphicsOffset = 0;
+	u16 m_DisplayScrubSpriteOffset = 0;
+	u8  m_DisplayScrubTurn = 0;
 	const u64 *m_HotBlocks = 0;
 	// Relocation wiring; see attachRelocation().
 	const u8  *m_PtrReloc = 0;
 	const u8  *m_RelocInUse = 0;
 	const u8  *m_RelocCount = 0;
+	inline u8 authoritativeShadowValue( u16 a ) const
+	{
+		u8 v = m_RAM[ a ];
+		if ( m_RelocCount && *m_RelocCount && a >= 0xC000 && a < 0xCC00 )
+		{
+			const u8 srcV = m_RelocInUse[ ( (u32)a - 0xC000 ) >> 6 ];
+			if ( srcV != 0xFF )
+				v = m_RAM[ 0xC000 + ( (u32)srcV << 6 ) + ( a & 63 ) ];
+		}
+		return v;
+	}
 	// Value accepted under the policy in force at the time of the write. Keeping
 	// it here lets an optimisation-mode change take effect immediately without
 	// synchronously flushing the old queue. A later write excluded by the new

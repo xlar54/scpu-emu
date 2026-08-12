@@ -73,6 +73,7 @@ static u32 s_HeartbeatPCLow = 0xFFFFFFFF;
 static u32 s_HeartbeatPCHigh = 0;
 static u32 s_HeartbeatStalledRuns = 0;
 static bool s_HeartbeatDumped = false;
+static u32 s_DisplayScrubPhaseGeneration = 0;
 // Native-C128 bring-up may execute garbage continuously rather than settling
 // into a tight loop, so the ordinary stall detector never fires. Keep a small
 // sampled PC history and force one bounded capture early in startup.
@@ -198,6 +199,27 @@ struct SCPUResetDiagnostic
 	u32 io[ 64 ];
 	u8 preResetDD00;
 	u8 preResetDD02;
+	u8 vic11;
+	u8 vic15;
+	u8 vic16;
+	u8 vic18;
+	u8 vic20;
+	u8 vic21;
+	u32 vicScreenBase;
+	u32 vicBitmapBase;
+	u8 mirrorMode;
+	u32 mirrorPending;
+	u8 mirrorScreenPending;
+	u8 mirrorBitmapPending;
+	u64 mirrorAccepted;
+	u64 mirrorSkipped;
+	u64 mirrorFlushed;
+	u8 scrubPhaseOn;
+	u64 scrubSampledText;
+	u64 scrubSampledBitmap;
+	u64 scrubMismatchText;
+	u64 scrubMismatchBitmap;
+	u64 scrubRepaired;
 };
 
 static SCPUResetDiagnostic s_ResetDiagnostic = {};
@@ -253,6 +275,32 @@ static void scpuSnapshotResetDiagnostic( CSuperCPU *scpu )
 		d.nmiTraceExpose = m.nmiTraceStageUS( m.m_NMITraceExposeAt, m.m_NMITraceExposeGen );
 		d.nmiTraceTake   = m.nmiTraceStageUS( m.m_NMITraceTakeAt,   m.m_NMITraceTakeGen );
 		d.nmiTraceArm = (u32)m.m_NMITraceGen;
+		d.vic11 = m.m_VICRegShadow[ 0x11 ];
+		d.vic15 = m.m_VICRegShadow[ 0x15 ];
+		d.vic16 = m.m_VICRegShadow[ 0x16 ];
+		d.vic18 = m.m_VICRegShadow[ 0x18 ];
+		d.vic20 = m.m_VICRegShadow[ 0x20 ];
+		d.vic21 = m.m_VICRegShadow[ 0x21 ];
+		d.vicScreenBase = m.activeScreenBase();
+		d.vicBitmapBase = m.activeBitmapBase();
+	}
+	{
+		CWriteBuffer &w = scpu->writeBuffer();
+		d.mirrorMode = (u8)w.optMode();
+		d.mirrorPending = w.pending();
+		d.mirrorScreenPending = d.vicScreenBase < 0x10000
+		                      && w.hasPendingInRange( d.vicScreenBase, 1000 );
+		d.mirrorBitmapPending = d.vicBitmapBase < 0x10000
+		                      && w.hasPendingInRange( d.vicBitmapBase, 8000 );
+		d.mirrorAccepted = w.m_WritesAccepted;
+		d.mirrorSkipped = w.m_WritesSkipped;
+		d.mirrorFlushed = w.m_BytesFlushed;
+		d.scrubPhaseOn = scpu->displayScrubPhaseOn() ? 1 : 0;
+		d.scrubSampledText = w.m_DisplayScrubSampled[ 0 ];
+		d.scrubSampledBitmap = w.m_DisplayScrubSampled[ 1 ];
+		d.scrubMismatchText = w.m_DisplayScrubMismatches[ 0 ];
+		d.scrubMismatchBitmap = w.m_DisplayScrubMismatches[ 1 ];
+		d.scrubRepaired = w.m_DisplayScrubBytes;
 	}
 
 	for ( u32 i = 0; i < 16; i++ )
@@ -438,6 +486,23 @@ static void scpuEmitResetDiagnostic()
 		               "  pre-reset: no IEC-idle CIA sample available" );
 	s_Logger->Write( "SCPU", LogNotice,
 	               "  live CIA state not sampled while physical /RESET was asserted" );
+	s_Logger->Write( "SCPU", LogNotice,
+	               "  vic shadow: D011=$%02X D016=$%02X D018=$%02X D015=$%02X D020/21=$%02X/$%02X screen=$%04X bitmap=$%04X",
+	               d.vic11, d.vic16, d.vic18, d.vic15, d.vic20, d.vic21,
+	               (unsigned)( d.vicScreenBase & 0xFFFF ),
+	               (unsigned)( d.vicBitmapBase & 0xFFFF ) );
+	s_Logger->Write( "SCPU", LogNotice,
+	               "  mirror: mode=%u pending=%u screen/bitmap=%u/%u accepted=%llu skipped=%llu flushed=%llu",
+	               (unsigned)d.mirrorMode, (unsigned)d.mirrorPending,
+	               (unsigned)d.mirrorScreenPending,
+	               (unsigned)d.mirrorBitmapPending,
+	               (unsigned long long)d.mirrorAccepted,
+	               (unsigned long long)d.mirrorSkipped,
+	               (unsigned long long)d.mirrorFlushed );
+	s_Logger->Write( "SCPU", LogNotice,
+	               "  display scrub: phase=%s repaired=%llu (physical sampling disabled)",
+	               d.scrubPhaseOn ? "ON" : "OFF",
+	               (unsigned long long)d.scrubRepaired );
 
 	// Both should read zero. Either one non-zero means a bus wait hit its
 	// ceiling instead of seeing the signal it wanted -- which before those
@@ -716,6 +781,21 @@ static bool scpuCheckButton( void *ctx )
 			               (unsigned)eligiblePhases,
 			               writePhases ? " -- ANOTHER BUS MASTER IS WRITING" : "" );
 		}
+	}
+
+	// A timed display-scrub trial is self-controlled: report each off/on edge
+	// without touching VIC state. Physical read/compare sampling is disabled on
+	// normal hardware because this machine has no calibrated stable read window.
+	if ( scpu && scpu->displayScrubPeriodSeconds()
+	     && scpu->displayScrubPhaseGeneration() != s_DisplayScrubPhaseGeneration )
+	{
+		s_DisplayScrubPhaseGeneration = scpu->displayScrubPhaseGeneration();
+		CWriteBuffer &wb = scpu->writeBuffer();
+		CScopedLoggingIRQs irqs;
+		s_Logger->Write( "SCPU", LogNotice,
+		               "display scrub phase: %s; repaired=%llu (physical sampling disabled)",
+		               scpu->displayScrubPhaseOn() ? "ON" : "OFF",
+		               (unsigned long long)wb.m_DisplayScrubBytes );
 	}
 
 	// --- heartbeat and stall self-detection ---------------------------------
@@ -1229,6 +1309,15 @@ void scpuBootRun( CLogger *logger )
 	logger->Write( "SCPU", LogNotice, "mirror: %u bytes/drain inside the display%s",
 	               (unsigned)cfgMirrorDisplayBytes,
 	               cfgMirrorDisplayBytes ? "" : " (border-only)" );
+	superCPU.setDisplayScrub( cfgDisplayScrub != 0, cfgDisplayScrubMask != 0,
+	                         (u32)cfgDisplayScrubPeriodS );
+	logger->Write( "SCPU", LogNotice, "display scrub: %s (%s coverage), period=%us%s",
+	               cfgDisplayScrub ? "on" : "off",
+	               cfgDisplayScrubMask ? "A1=0/A3=1 masked" : "full",
+	               (unsigned)cfgDisplayScrubPeriodS,
+	               cfgDisplayScrubPeriodS
+	                 ? " (bitmap-only; clock starts at first bitmap; write-only A/B)"
+	                 : " (bitmap-only)" );
 
 	// Shape blocks a bank-3 game keeps under $D000-$DFFF are unreachable to
 	// bus writes (the halted 6510 keeps real I/O banked in), so their sprite
@@ -1408,6 +1497,253 @@ void scpuBootRun( CLogger *logger )
 		logger->Write( "SCPU", LogNotice,
 		               "C128: tolerating isolated first-transfer self-test signature;"
 		               " repeated single and burst paths passed" );
+	}
+
+	// K221-K233 diagnostic-only path. It deliberately runs before the CPU core and
+	// never boots afterward: the broad physical-RAM sentinel overwrites normal
+	// machine contents. Normal firmware behavior is unchanged unless the SD
+	// config explicitly selects a BUS_ACCESS_SENTINEL mode.
+	if ( cfgBusAccessSentinel )
+	{
+		const bool displaySentinel = cfgBusAccessSentinel == 2;
+		const bool displayAddress = cfgBusAccessSentinel == 3;
+		const bool displayRow = cfgBusAccessSentinel == 4;
+		const bool displayFetch = cfgBusAccessSentinel == 5;
+		const bool displayPersistence = cfgBusAccessSentinel == 6;
+		const bool displayTiming = cfgBusAccessSentinel == 7;
+		const bool displayBoundary = cfgBusAccessSentinel == 8;
+		const bool displayRefreshCore3 = cfgBusAccessSentinel == 9;
+		const bool displayRefreshCore0 = cfgBusAccessSentinel == 10;
+		const bool displayRW = cfgBusAccessSentinel == 11;
+		const bool displayScrub = cfgBusAccessSentinel == 12;
+		const bool displayBAGuard = cfgBusAccessSentinel == 13;
+		const bool displayRefresh = displayRefreshCore3 || displayRefreshCore0
+		                         || displayRW || displayScrub;
+		{
+		CScopedLoggingIRQs sentinelStartIRQs;
+			logger->Write( "SCPU", LogNotice,
+			               displayBAGuard
+			                 ? "K239 display BA guard: identical oracle and timed write-resume A/B"
+			               : displayRefresh
+				                 ? ( displayScrub
+				                       ? "K233 display scrub: control versus masked shadow repair"
+				                     : displayRW
+				                       ? "K232 display R/W: floating versus actively-held-high idle"
+			                     : displayRefreshCore0
+			                       ? "K231 display refresh: sustained DMA versus core0 VIC-half release"
+			                       : "K230 display refresh: sustained DMA versus core3 VIC-half release" )
+		                 : displayBoundary
+		                 ? "K229 display boundary: transition-only versus active dwell"
+		                 : displayTiming
+		                 ? "K228 display timing: exposed-map sample sweep and repair"
+		                 : displayPersistence
+		                 ? "K227 display persistence: repeated active arms and three readbacks"
+		                 : displayFetch
+		                 ? "K226 display fetch: active text/bitmap and traffic matrix"
+		                 : displayRow
+		                 ? "K225 display row: high-entropy write and retention maps"
+		                 : displayAddress
+		                 ? "K223 display address: immediate $2078 and map discriminator"
+		                 : ( displaySentinel
+		                       ? "K222 display sentinel: nine hires fetch arms"
+		                       : "K221 access sentinel: starting control/read/write arms" ) );
+			logger->Write( "SCPU", LogNotice,
+			               displayBAGuard
+			                 ? "K239: about one minute; do not reset or remove the card"
+			               : displayRefresh
+				                 ? ( displayScrub
+				                       ? "K233: about 3 minutes; do not reset or remove the card"
+				                     : displayRW
+				                       ? "K232: about 70 seconds; do not reset or remove the card"
+			                     : displayRefreshCore0
+			                       ? "K231: about 35 seconds; do not reset or remove the card"
+			                       : "K230: about 35 seconds; do not reset or remove the card" )
+		                 : displayBoundary
+		                 ? "K229: about 40 seconds; do not reset or remove the card"
+		                 : displayTiming
+		                 ? "K228: about 30 seconds; do not reset or remove the card"
+		                 : displayPersistence
+		                 ? "K227: about 60 seconds; do not reset or remove the card"
+		                 : displayFetch
+		                 ? "K226: about 75 seconds; do not reset or remove the card"
+		                 : displayRow
+		                 ? "K225: about 40 seconds; do not reset or remove the card"
+		                 : displayAddress
+		                 ? "K223: under 20 seconds; do not reset or remove the card"
+		                 : ( displaySentinel
+		                       ? "K222: about 75 seconds; border identifies each arm"
+		                       : "K221: about one minute; do not reset or remove the card" ) );
+		}
+
+		const bool sentinelCompleted = displayBAGuard
+			? radBus.runDisplayBAGuardDiagnostic()
+			: displayScrub
+			? radBus.runDisplayScrubDiagnostic( superCPU.writeBuffer() )
+			: displayRW
+			? radBus.runDisplayRWDiagnostic()
+			: displayRefreshCore0
+			? radBus.runDisplayCore0RefreshDiagnostic()
+			: displayRefreshCore3
+			? radBus.runDisplayRefreshDiagnostic()
+			: displayBoundary
+			? radBus.runDisplayBoundaryDiagnostic()
+			: displayTiming
+			? radBus.runDisplayTimingDiagnostic()
+			: displayPersistence
+			? radBus.runDisplayPersistenceDiagnostic()
+			: displayFetch
+			? radBus.runDisplayFetchDiagnostic()
+			: displayRow
+			? radBus.runDisplayRowDiagnostic()
+			: displayAddress
+			? radBus.runDisplayAddressDiagnostic()
+			: ( displaySentinel
+			      ? radBus.runDisplaySentinelDiagnostic()
+			      : radBus.runAccessSentinelDiagnostic() );
+		static char sentinelDiag[ 196608 ];
+		const u32 sentinelDiagSize =
+			radBus.formatSelfTestResults( sentinelDiag, sizeof sentinelDiag );
+		{
+		CScopedLoggingIRQs sentinelResultIRQs;
+		if ( displayBAGuard ) radBus.logDisplayBAGuardResults( logger );
+		else if ( displayRefresh ) radBus.logDisplayRefreshResults( logger );
+		else if ( displayBoundary ) radBus.logDisplayBoundaryResults( logger );
+		else if ( displayTiming ) radBus.logDisplayTimingResults( logger );
+		else if ( displayPersistence ) radBus.logDisplayPersistenceResults( logger );
+		else if ( displayFetch ) radBus.logDisplayFetchResults( logger );
+		else if ( displayRow ) radBus.logDisplayRowResults( logger );
+		else if ( displayAddress ) radBus.logDisplayAddressResults( logger );
+		else if ( displaySentinel ) radBus.logDisplaySentinelResults( logger );
+		else radBus.logAccessSentinelResults( logger );
+		if ( sentinelDiagSize
+		     && writeFile( logger, SCPU_DRIVE, SCPU_BUS_DIAG_FILE,
+		                   (u8 *)sentinelDiag, sentinelDiagSize ) )
+			logger->Write( "SCPU", LogNotice,
+			               displayBAGuard
+			                 ? "K239: saved display BA guard result to %s"
+			               : displayRefresh
+				                 ? ( displayScrub
+				                       ? "K233: saved display scrub result to %s"
+				                     : displayRW
+				                       ? "K232: saved display R/W result to %s"
+			                     : displayRefreshCore0
+			                       ? "K231: saved display refresh result to %s"
+			                       : "K230: saved display refresh result to %s" )
+			                 : displayBoundary
+			                 ? "K229: saved display boundary result to %s"
+			                 : displayTiming
+			                 ? "K228: saved display timing result to %s"
+			                 : displayPersistence
+			                 ? "K227: saved display persistence result to %s"
+			                 : displayFetch
+			                 ? "K226: saved display fetch result to %s"
+			                 : displayRow
+			                 ? "K225: saved display row result to %s"
+			                 : displayAddress
+			                 ? "K223: saved display address result to %s"
+			                 : ( displaySentinel
+			                       ? "K222: saved display sentinel to %s"
+			                       : "K221: saved access sentinel to %s" ),
+			               SCPU_BUS_DIAG_FILE );
+		else
+			logger->Write( "SCPU", LogError,
+			               displayBAGuard
+			                 ? "K239: could not save display BA guard result to %s"
+			               : displayRefresh
+				                 ? ( displayScrub
+				                       ? "K233: could not save display scrub result to %s"
+				                     : displayRW
+				                       ? "K232: could not save display R/W result to %s"
+			                     : displayRefreshCore0
+			                       ? "K231: could not save display refresh result to %s"
+			                       : "K230: could not save display refresh result to %s" )
+			                 : displayBoundary
+			                 ? "K229: could not save display boundary result to %s"
+			                 : displayTiming
+			                 ? "K228: could not save display timing result to %s"
+			                 : displayPersistence
+			                 ? "K227: could not save display persistence result to %s"
+			                 : displayFetch
+			                 ? "K226: could not save display fetch result to %s"
+			                 : displayRow
+			                 ? "K225: could not save display row result to %s"
+			                 : displayAddress
+			                 ? "K223: could not save display address result to %s"
+			                 : ( displaySentinel
+			                       ? "K222: could not save display sentinel to %s"
+			                       : "K221: could not save access sentinel to %s" ),
+			               SCPU_BUS_DIAG_FILE );
+		logger->Write( "SCPU", sentinelCompleted ? LogNotice : LogError,
+			               sentinelCompleted
+			                 ? ( displayBAGuard
+			                       ? "K239 COMPLETE -- cyan border, thirteen blinks; return card"
+			                     : displayRefresh
+				                       ? ( displayScrub
+				                             ? "K233 COMPLETE -- cyan border, twelve blinks; return card"
+				                           : displayRW
+				                             ? "K232 COMPLETE -- cyan border, eleven blinks; return card"
+			                           : displayRefreshCore0
+			                             ? "K231 COMPLETE -- cyan border, ten blinks; return card"
+			                             : "K230 COMPLETE -- cyan border, nine blinks; return card" )
+			                       : displayBoundary
+			                       ? "K229 COMPLETE -- cyan border, eight blinks; return card"
+			                       : displayTiming
+			                       ? "K228 COMPLETE -- cyan border, seven blinks; return card"
+			                       : displayPersistence
+			                       ? "K227 COMPLETE -- cyan border, six blinks; return card"
+			                       : displayFetch
+			                       ? "K226 COMPLETE -- cyan border, five blinks; return card"
+			                       : displayRow
+			                       ? "K225 COMPLETE -- cyan border, five blinks; return card"
+			                       : displayAddress
+			                       ? "K223 COMPLETE -- cyan border, five blinks; return card"
+		                       : ( displaySentinel
+		                             ? "K222 COMPLETE -- cyan border, five blinks; return card"
+		                             : "K221 COMPLETE -- cyan border, five blinks; return card" ) )
+			                 : ( displayBAGuard
+			                       ? "K239 NOT RUN -- requires a detected C64; releasing machine"
+			                     : displayRefresh
+				                       ? ( displayScrub
+				                             ? "K233 NOT RUN -- requires a detected C64; releasing machine"
+				                           : displayRW
+				                             ? "K232 NOT RUN -- requires a detected C64; releasing machine"
+			                           : displayRefreshCore0
+			                             ? "K231 NOT RUN -- requires a detected C64; releasing machine"
+			                             : "K230 NOT RUN -- requires a detected C64; releasing machine" )
+			                       : displayBoundary
+			                       ? "K229 NOT RUN -- requires a detected C64; releasing machine"
+			                       : displayTiming
+			                       ? "K228 NOT RUN -- requires a detected C64; releasing machine"
+			                       : displayPersistence
+			                       ? "K227 NOT RUN -- requires a detected C64; releasing machine"
+			                       : displayFetch
+			                       ? "K226 NOT RUN -- requires a detected C64; releasing machine"
+			                       : displayRow
+			                       ? "K225 NOT RUN -- requires a detected C64; releasing machine"
+			                       : displayAddress
+			                       ? "K223 NOT RUN -- requires a detected C64; releasing machine"
+		                       : ( displaySentinel
+		                             ? "K222 NOT RUN -- requires a detected C64; releasing machine"
+		                             : "K221 NOT RUN -- requires a detected C64; releasing machine" ) ) );
+		}
+
+		if ( !sentinelCompleted )
+		{
+			radBus.release();
+			actLED.Blink( 8 );
+			scpuWaitForButtonThenReboot();
+		}
+
+		// Final two physical writes are only a completion marker. The result was
+		// already captured and saved, and no access follows them.
+		radBus.write( 0xD020, 0x03 );
+		radBus.write( 0xD020, 0x03 );
+		radBus.setTrafficHalted( true );
+		actLED.Blink( displayBAGuard ? 13 : displayScrub ? 12 : displayRW ? 11 : displayRefreshCore0 ? 10
+		            : displayRefreshCore3 ? 9
+		            : displayBoundary ? 8
+		            : displayTiming ? 7 : displayPersistence ? 6 : 5 );
+		for ( ;; ) asm volatile( "wfe" );
 	}
 
 	// E18N is a diagnostic-only C128 image. It deliberately stops before the

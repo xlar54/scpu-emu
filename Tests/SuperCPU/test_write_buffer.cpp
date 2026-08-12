@@ -473,6 +473,108 @@ TEST( writebuf_resync_sweep_converges_dram_to_shadow )
 	CHECK_EQ( bus.m_Memory[ 0x8000 ], 0x11 );	// delivered by the queue
 }
 
+TEST( writebuf_display_scrub_uses_measured_mask_and_matrix_bitmap_cadence )
+{
+	CHostBus bus;
+	u8 ram[ 0x10000 ];
+	for ( u32 i = 0; i < 0x10000; i++ ) ram[ i ] = (u8)( i ^ 0x5A );
+	CWriteBuffer wb;
+	wb.attach( &bus, ram );
+	wb.setOptMode( SCPU_OPT_NONE );
+	bus.resetStats();
+	bus.m_LogEnabled = true;
+	bus.clearLog();
+
+	// One matrix installment followed by eight bitmap installments is one
+	// cadence group. Every emitted address must satisfy A1=0/A3=1.
+	for ( u32 i = 0; i < 9; i++ )
+		CHECK_EQ( wb.resyncDisplayed( 0x0400, 0x2000, 64, true ), 64u );
+
+	CHECK_EQ( bus.m_BurstWrites, 576u );
+	CHECK_EQ( bus.m_LogCount, 576u );
+	CHECK_EQ( wb.m_DisplayScrubBytes, 576u );
+	CHECK_EQ( wb.m_DisplayScrubMatrixBytes, 64u );
+	CHECK_EQ( wb.m_DisplayScrubBitmapBytes, 512u );
+	for ( u32 i = 0; i < bus.m_LogCount; i++ )
+	{
+		CHECK_EQ( bus.m_Log[ i ].op, (u8)HOSTOP_BURST_WRITE );
+		CHECK_EQ( bus.m_Log[ i ].addr & 0x000A, 0x0008 );
+		CHECK_EQ( bus.m_Log[ i ].value, ram[ bus.m_Log[ i ].addr ] );
+	}
+}
+
+TEST( writebuf_display_scrub_skips_dirty_and_supports_full_coverage )
+{
+	WBFixture f;
+	f.wb.setOptMode( SCPU_OPT_NONE );
+	for ( u32 i = 0; i < 0x10000; i++ ) f.ram[ i ] = (u8)( i * 3u );
+
+	// $0408 is in the measured mask, but the pending queue owns it. Scrub must
+	// leave physical memory alone until the queued value is flushed.
+	f.bus.m_Memory[ 0x0408 ] = 0xA5;
+	f.poke( 0x0408, 0x37 );
+	CHECK_EQ( f.wb.resyncDisplayed( 0x0400, 0xFFFFFFFF, 64, true ), 64u );
+	CHECK_EQ( f.bus.m_Memory[ 0x0408 ], 0xA5 );
+	CHECK_EQ( f.wb.pending(), 1u );
+	f.wb.flush();
+	CHECK_EQ( f.bus.m_Memory[ 0x0408 ], 0x37 );
+
+	// Full-coverage fallback is deliberately not restricted by the empirical
+	// mask. A fresh buffer begins at the first byte of the matrix.
+	CHostBus bus2;
+	CWriteBuffer wb2;
+	wb2.attach( &bus2, f.ram );
+	wb2.setOptMode( SCPU_OPT_NONE );
+	bus2.m_LogEnabled = true;
+	bus2.clearLog();
+	CHECK_EQ( wb2.resyncDisplayed( 0x0400, 0xFFFFFFFF, 64, false ), 64u );
+	CHECK_EQ( bus2.m_Log[ 0 ].addr, 0x0400 );
+	CHECK_EQ( bus2.m_Log[ 1 ].addr, 0x0401 );
+}
+
+TEST( writebuf_display_scrub_covers_charset_sprites_and_samples_controls )
+{
+	CHostBus bus;
+	u8 ram[ 0x10000 ] = { 0 };
+	u64 hot[ 1024 / 64 ] = { 0 };
+	CWriteBuffer wb;
+	wb.attach( &bus, ram );
+	wb.setOptMode( SCPU_OPT_NONE );
+	wb.attachHotShapeBlocks( hot );
+
+	// Enabled sprite shape block $3000-$303F joins matrix + 2K charset.
+	hot[ 0xC0 >> 6 ] |= 1ULL << ( 0xC0 & 63 );
+	for ( u32 a = 0; a < 0x10000; a++ ) ram[ a ] = (u8)( a ^ 0xA5 );
+
+	// One matrix slot, two charset slots and one sprite slot at 32 bytes each.
+	for ( u32 i = 0; i < 3; i++ )
+		CHECK_EQ( wb.resyncDisplayed( 0x0400, 0x2000, 2048,
+		                                  32, true, true, false ), 32u );
+	CHECK_EQ( wb.resyncDisplayed( 0x0400, 0x2000, 2048,
+		                                32, true, true, false ), 16u );
+	CHECK_EQ( wb.m_DisplayScrubMatrixBytes, 32u );
+	CHECK_EQ( wb.m_DisplayScrubCharsetBytes, 64u );
+	CHECK_EQ( wb.m_DisplayScrubSpriteBytes, 16u );
+
+	// A control sample observes but does not repair physical divergence.
+	CWriteBuffer sample;
+	sample.attach( &bus, ram );
+	sample.setOptMode( SCPU_OPT_NONE );
+	for ( u32 a = 0x0400; a < 0x0800; a++ ) bus.m_Memory[ a ] = ram[ a ];
+	bus.m_Memory[ 0x0408 ] = (u8)( ram[ 0x0408 ] ^ 1 );
+	CHECK_EQ( sample.resyncDisplayed( 0x0400, 0xFFFFFFFF, 0,
+		                                32, true, false, true ), 0u );
+	CHECK_EQ( sample.m_DisplayScrubSampled[ 0 ], 32u );
+	CHECK_EQ( sample.m_DisplayScrubMismatches[ 0 ], 1u );
+	CHECK( bus.m_Memory[ 0x0408 ] != ram[ 0x0408 ] );
+
+	// Reattach resets the cursor; sampled repair counts and restores the byte.
+	sample.attach( &bus, ram );
+	CHECK_EQ( sample.resyncDisplayed( 0x0400, 0xFFFFFFFF, 0,
+		                                32, true, true, true ), 32u );
+	CHECK_EQ( bus.m_Memory[ 0x0408 ], ram[ 0x0408 ] );
+}
+
 TEST( writebuf_hot_shape_blocks_wait_for_the_border )
 {
 	// A re-rendered sprite shape must reach real DRAM whole. The render
@@ -533,6 +635,24 @@ TEST( writebuf_visible_drain_skips_screen_and_keeps_making_progress )
 	CHECK( f.bus.m_Memory[ 0x7400 ] != (u8)( 0 ^ 0x5A ) );
 	CHECK_EQ( f.wb.pending(), 1000u );
 	CHECK( f.wb.hasPendingInRange( 0x7400, 1000 ) );
+}
+
+TEST( writebuf_visible_drain_skips_bitmap_and_keeps_making_progress )
+{
+	WBFixture f;
+	f.wb.setOptMode( SCPU_OPT_NONE );
+
+	for ( u32 i = 0; i < 80; i++ )
+		f.poke( (u16)( 0x8000 + i ), (u8)( i ^ 0xA5 ) );
+	f.poke( 0x2000, 0x11 );
+	f.poke( 0x2001, 0x22 );
+
+	f.wb.flushUpToPolicy( 64, false, 0x0400, 0x8000 );
+	CHECK_EQ( f.bus.m_Memory[ 0x2000 ], 0x11 );
+	CHECK_EQ( f.bus.m_Memory[ 0x2001 ], 0x22 );
+	CHECK( f.bus.m_Memory[ 0x8000 ] != (u8)( 0 ^ 0xA5 ) );
+	CHECK_EQ( f.wb.pending(), 80u );
+	CHECK( f.wb.hasPendingInRange( 0x8000, 8000 ) );
 }
 
 TEST( writebuf_hidden_drain_prioritizes_screen_and_keeps_latest_values )
@@ -616,6 +736,7 @@ struct RelocFixture
 		mem.write8( 0xDD00, 0xC4 );
 		mem.write8( 0xD011, 0x3B );
 		mem.write8( 0xD018, 0x38 );
+		mem.write8( 0xD015, 0xFF );
 	}
 
 	// Bank I/O out, store into RAM under it, bank I/O back in -- the game's

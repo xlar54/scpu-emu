@@ -29,7 +29,7 @@
 #define _config_h
 
 
-#define TIMING_NAMES 37
+#define TIMING_NAMES 41
 const char timingNames[TIMING_NAMES][32] = {
 	"WAIT_FOR_SIGNALS", 
 	"WAIT_CYCLE_READ", 
@@ -114,7 +114,24 @@ const char timingNames[TIMING_NAMES][32] = {
 	"C128_MODE",
 	// Diagnostic: stop every physical expansion-bus read and write after N
 	// seconds while leaving the emulated CPU alive. 0 disables it.
-	"BUS_HALT_AFTER_S"
+	"BUS_HALT_AFTER_S",
+	// Diagnostic-only C64 image mode. 1 runs the broad non-display RAM oracle;
+	// 2 runs the displayed-hires VIC-fetch oracle; 3 distinguishes immediate
+	// write/address failure from delayed retention at $2078; 4 maps display-RAM
+	// row sensitivity with high-entropy single/repeated writes and independent
+	// retention delays; 5 crosses the same oracle with active text/bitmap VIC
+	// fetches and controlled bus traffic. All save and halt before CPU-core
+	// startup. 0 keeps the normal boot path.
+	"BUS_ACCESS_SENTINEL",
+	// Repair the empirically vulnerable quarter of the active bitmap fetch set
+	// from bank-0 shadow during raster-safe opportunities. Text mode is excluded.
+	"DISPLAY_SCRUB",
+	// 1 uses the measured A1=0/A3=1 address mask; 0 scrubs full coverage.
+	"DISPLAY_SCRUB_MASK",
+	// Trial instrumentation: when nonzero, alternate scrub off/on at this
+	// interval. 0 is static mode. The production scheduler remains write-only:
+	// some physical machines have no stable expansion-bus read window.
+	"DISPLAY_SCRUB_PERIOD_S"
 };
 
 // Which CPU core boot.cpp should install. Set from CPU_CORE in the config file;
@@ -173,6 +190,10 @@ extern int cfgNMINativeDefer;
 extern int cfgMirrorStretch;
 extern int cfgC128Mode;
 extern int cfgBusHaltAfterS;
+extern int cfgBusAccessSentinel;
+extern int cfgDisplayScrub;
+extern int cfgDisplayScrubMask;
+extern int cfgDisplayScrubPeriodS;
 
 #define SCPU_CFG_MIRROR_DISPLAY_DEFAULT 1024
 
