@@ -178,7 +178,7 @@ void CHDMIDisplay::fillFrameBuffer( u8 colour )
 
 void CHDMIDisplay::showReady()
 {
-	fillFrameBuffer( 6 );	// C64 blue: RAD is ready; power on the Commodore
+	fillFrameBuffer( 5 );	// green: RAD is ready; power on the Commodore
 }
 
 void CHDMIDisplay::showFailure()

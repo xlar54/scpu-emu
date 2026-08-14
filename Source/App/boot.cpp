@@ -727,11 +727,11 @@ static bool scpuCheckButton( void *ctx )
 			CScopedLoggingIRQs saveIRQs;
 			if ( !scpuSaveRuntimeBusDiag( runtime ) )
 				s_Logger->Write( "SCPU", LogError,
-						               "K358 could not save post-handoff runtime to %s",
+						               "K359 could not save post-handoff runtime to %s",
 				               SCPU_BUS_DIAG_FILE );
 			else
 				s_Logger->Write( "SCPU", LogNotice,
-						               "K358 saved post-handoff runtime to %s",
+						               "K359 saved post-handoff runtime to %s",
 				               SCPU_BUS_DIAG_FILE );
 		}
 		s_RebootRequested = true;
@@ -764,11 +764,11 @@ static bool scpuCheckButton( void *ctx )
 			CScopedLoggingIRQs saveIRQs;
 			if ( !scpuSaveRuntimeBusDiag( s_ResetDiagnostic.runtime ) )
 				s_Logger->Write( "SCPU", LogError,
-						               "K358 could not save post-handoff runtime to %s",
+						               "K359 could not save post-handoff runtime to %s",
 				               SCPU_BUS_DIAG_FILE );
 			else
 				s_Logger->Write( "SCPU", LogNotice,
-						               "K358 saved post-handoff runtime to %s",
+						               "K359 saved post-handoff runtime to %s",
 				               SCPU_BUS_DIAG_FILE );
 		}
 
@@ -1248,7 +1248,7 @@ static void scpuAppendRuntimeBusDiag( char *dst, u32 capacity, u32 &length,
 		scpuLineChar( dst, capacity, length, '\n' );
 	}
 	scpuLineText( dst, capacity, length,
-	              "post-handoff runtime: build=358 handoff=" );
+	              "post-handoff runtime: build=359 handoff=" );
 	scpuLineDecimal( dst, capacity, length, r.valid ? 1 : 0 );
 	if ( r.valid )
 	{
@@ -2254,7 +2254,7 @@ void scpuBootRun( CLogger *logger )
 		superCPU.memory().enableVICLog( true );
 		if ( s_HDMIDisplay->start() )
 		{
-			// The first passive frame naturally replaces the blue ready screen.
+			// The first passive frame naturally replaces the green ready screen.
 			// K356 makes one bounded wait before emulation begins: prove that
 			// core 1 is actively rendering
 			// and repeat the read-eye scan under that exact electrical/thermal
