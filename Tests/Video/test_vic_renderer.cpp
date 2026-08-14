@@ -176,13 +176,14 @@ TEST( vic_renderer_multicolor_bitmap_decodes_all_four_sources )
 	CHECK_EQ( f.pixel( 39, 36 ), 7 );
 }
 
-TEST( vic_renderer_illegal_mode_is_deterministic_background )
+TEST( vic_renderer_illegal_mode_drives_graphics_black )
 {
 	VICFixture f;
 	f.state.vic[ 0x11 ] = 0x7B;
 	CHECK_EQ( f.renderer.render( f.state, f.pixels, VIC_RENDER_WIDTH ),
-	          VIC_RENDER_UNSUPPORTED );
-	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X, VIC_RENDER_DISPLAY_Y ), 6 );
+	          VIC_RENDER_INVALID );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X, VIC_RENDER_DISPLAY_Y ), 0 );
+	CHECK_EQ( f.pixel( 0, 0 ), 14 );
 }
 
 TEST( vic_renderer_applies_fine_scroll_and_reduced_border_apertures )
@@ -266,6 +267,58 @@ TEST( vic_renderer_sprite_priority_respects_foreground_graphics )
 	f.renderer.render( f.state, f.pixels, VIC_RENDER_WIDTH );
 	CHECK_EQ( f.pixel( 32, 36 ), 5 );
 	CHECK_EQ( f.pixel( 33, 36 ), 2 );
+}
+
+TEST( vic_renderer_multicolor_value_01_does_not_occlude_behind_sprite )
+{
+	VICFixture f;
+	f.state.vic[ 0x16 ] = 0x18;
+	f.state.vic[ 0x22 ] = 5;
+	f.state.vic[ 0x23 ] = 6;
+	f.ram[ 0x0400 ] = 1;
+	f.colours[ 0 ] = 0x0B;
+	f.chars[ 8 ] = 0x60;              // 01 then 10
+	f.sprite( 0, 24, 50, 0x20, 2 );
+	f.state.vic[ 0x1B ] = 1;
+	f.ram[ 0x0800 ] = 0xF0;
+	f.renderer.render( f.state, f.pixels, VIC_RENDER_WIDTH );
+	CHECK_EQ( f.pixel( 32, 36 ), 2 );  // sprite over background-colour 1
+	CHECK_EQ( f.pixel( 34, 36 ), 6 );  // value 10 remains foreground
+
+	// The same foreground rule applies to multicolour bitmap data.
+	f.state.vic[ 0x11 ] = 0x3B;
+	f.state.bitmapBase = 0x2000;
+	f.ram[ 0x0400 ] = 0xA5;
+	f.ram[ 0x2000 ] = 0x60;
+	f.renderer.render( f.state, f.pixels, VIC_RENDER_WIDTH );
+	CHECK_EQ( f.pixel( 32, 36 ), 2 );
+	CHECK_EQ( f.pixel( 34, 36 ), 5 );
+}
+
+TEST( vic_renderer_reports_sprite_collision_latches )
+{
+	VICFixture f;
+	f.ram[ 0x0400 ] = 1;
+	f.colours[ 0 ] = 5;
+	f.chars[ 8 ] = 0x80;
+	f.sprite( 0, 24, 50, 0x20, 2 );
+	f.sprite( 1, 24, 50, 0x21, 3 );
+	f.ram[ 0x0800 ] = 0x80;
+	f.ram[ 0x0840 ] = 0x80;
+	VICRenderCollisions collisions = {};
+	f.renderer.render( f.state, f.pixels, VIC_RENDER_WIDTH, &collisions );
+	CHECK_EQ( collisions.spriteSprite, 0x03 );
+	CHECK_EQ( collisions.spriteBackground, 0x03 );
+
+	// Collision detection is independent of D01B visual priority and ORs into
+	// an existing latch just as separate render bands do.
+	f.state.vic[ 0x1B ] = 0x03;
+	collisions.spriteSprite = 0x80;
+	collisions.spriteBackground = 0x40;
+	f.renderer.renderRows( f.state, f.pixels, VIC_RENDER_WIDTH,
+	                       VIC_RENDER_DISPLAY_Y, 1, &collisions );
+	CHECK_EQ( collisions.spriteSprite, 0x83 );
+	CHECK_EQ( collisions.spriteBackground, 0x43 );
 }
 
 TEST( vic_renderer_lower_numbered_sprite_wins_overlap )

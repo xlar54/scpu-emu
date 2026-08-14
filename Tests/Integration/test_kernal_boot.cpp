@@ -628,6 +628,97 @@ TEST( integration_d0b5_defaults_on_and_bit7_is_a_writable_virtual_jiffy_switch )
 	CHECK( !f.regs.hardwareRegsEnabled() );
 }
 
+TEST( integration_runtime_video_control_requires_one_shot_knock )
+{
+	SystemFixture f;
+	bool hdmiActive = true;
+	f.regs.configureVideoSwitch( true, true );
+	f.regs.trackVideoHDMIActive( &hdmiActive );
+	f.start();
+
+	// A bare access retains the decoded/no-effect CMD behavior.
+	CHECK( f.regs.videoHDMIRequested() );
+	CHECK( f.regs.ioWrite( SCPU_REG_EMU_VIDEO, SCPU_EMU_VIDEO_VIC ) );
+	CHECK( f.regs.videoHDMIRequested() );
+
+	// Only the access following $A5 is interpreted as an emulator command.
+	CHECK( f.regs.ioWrite( SCPU_REG_EMU_VIDEO, SCPU_EMU_VIDEO_KNOCK ) );
+	CHECK( f.regs.ioWrite( SCPU_REG_EMU_VIDEO, SCPU_EMU_VIDEO_VIC ) );
+	CHECK( !f.regs.videoHDMIRequested() );
+
+	// Query reports the completed mode, not the still-pending request.
+	u8 value = 0xFF;
+	CHECK( f.regs.ioWrite( SCPU_REG_EMU_VIDEO, SCPU_EMU_VIDEO_KNOCK ) );
+	CHECK( f.regs.ioRead( SCPU_REG_EMU_VIDEO, value ) );
+	CHECK_EQ( value, SCPU_EMU_VIDEO_HDMI );
+	hdmiActive = false;
+	CHECK( f.regs.ioWrite( SCPU_REG_EMU_VIDEO, SCPU_EMU_VIDEO_KNOCK ) );
+	CHECK( f.regs.ioRead( SCPU_REG_EMU_VIDEO, value ) );
+	CHECK_EQ( value, SCPU_EMU_VIDEO_VIC );
+
+	// Invalid values consume the latch without changing the request. Reset also
+	// closes an unfinished latch and restores the configured boot preference.
+	CHECK( f.regs.ioWrite( SCPU_REG_EMU_VIDEO, SCPU_EMU_VIDEO_KNOCK ) );
+	CHECK( f.regs.ioWrite( SCPU_REG_EMU_VIDEO, 2 ) );
+	CHECK( !f.regs.videoHDMIRequested() );
+	f.regs.reset();
+	CHECK( f.regs.videoHDMIRequested() );
+	CHECK( f.regs.ioWrite( SCPU_REG_EMU_VIDEO, SCPU_EMU_VIDEO_VIC ) );
+	CHECK( f.regs.videoHDMIRequested() );
+}
+
+TEST( integration_runtime_video_control_is_unavailable_without_hdmi_renderer )
+{
+	CSuperCPURegisters regs;
+	regs.configureVideoSwitch( false, false );
+	CHECK( regs.ioWrite( SCPU_REG_EMU_VIDEO, SCPU_EMU_VIDEO_KNOCK ) );
+	CHECK( regs.ioWrite( SCPU_REG_EMU_VIDEO, SCPU_EMU_VIDEO_HDMI ) );
+	CHECK( !regs.videoHDMIRequested() );
+}
+
+TEST( integration_hdmi_collision_reads_use_and_clear_rendered_latches )
+{
+	SystemFixture f;
+	f.start();
+	volatile u32 spriteSprite = 0x85;
+	volatile u32 spriteBackground = 0x42;
+	bool hdmiActive = true;
+	f.mem.attachHDMICollisionLatches( &spriteSprite, &spriteBackground,
+	                                  &hdmiActive );
+	f.bus.m_Memory[ 0xD01E ] = 0xAA;
+	f.bus.m_Memory[ 0xD01F ] = 0xBB;
+	const u64 physicalReads = f.bus.m_Reads;
+
+	CHECK_EQ( f.mem.read8( 0xD01E ), 0x85 );
+	CHECK_EQ( spriteSprite, 0u );
+	CHECK_EQ( f.mem.read8( 0xD01E ), 0x00 );
+	CHECK_EQ( f.mem.read8( 0xD01F ), 0x42 );
+	CHECK_EQ( spriteBackground, 0u );
+	CHECK_EQ( f.bus.m_Reads, physicalReads );
+
+	// VIC registers mirror every $40 bytes through $D3FF. Their aliases have
+	// the same read-to-clear behaviour and must not fall through to stale DRAM.
+	spriteSprite = 0x24;
+	spriteBackground = 0x18;
+	CHECK_EQ( f.mem.read8( 0xD05E ), 0x24 );
+	CHECK_EQ( f.mem.read8( 0xD09F ), 0x18 );
+	CHECK_EQ( spriteSprite, 0u );
+	CHECK_EQ( spriteBackground, 0u );
+	CHECK_EQ( f.bus.m_Reads, physicalReads );
+
+	// VIDEO_MODE 0 and the physical side of a runtime switch retain the exact
+	// established VIC-register path.
+	hdmiActive = false;
+	CHECK_EQ( f.mem.read8( 0xD01E ), 0xAA );
+	CHECK_EQ( f.mem.read8( 0xD01F ), 0xBB );
+	CHECK_EQ( f.bus.m_Reads, physicalReads + 2 );
+
+	spriteSprite = spriteBackground = 0xFF;
+	f.mem.reset();
+	CHECK_EQ( spriteSprite, 0u );
+	CHECK_EQ( spriteBackground, 0u );
+}
+
 TEST( integration_configured_jiffy_switch_survives_supercpu_init_and_reset )
 {
 	CHostBus bus;
@@ -705,6 +796,32 @@ TEST( integration_hdmi_exclusive_mode_discards_delivery_but_keeps_posted_timing 
 	CHECK( scpu.mirrorHalted() );
 	scpu.memory().write8( 0x0402, 0x43 );
 	CHECK_EQ( scpu.writeBuffer().pending(), 0u );
+}
+
+TEST( integration_runtime_vic_handoff_requeues_visible_shadow )
+{
+	CHostBus bus;
+	CSuperCPU scpu;
+	u8 basic[ C64_BASIC_SIZE ] = {};
+	u8 kernal[ C64_KERNAL_SIZE ] = {};
+	kernal[ 0x1FFC ] = 0x00;
+	kernal[ 0x1FFD ] = 0xE0;
+	scpu.setBasicROM( basic );
+	scpu.setKernalROM( kernal );
+	CHECK( scpu.init( &bus, SCPU_CORE_6502, 0 ) );
+	scpu.writeBuffer().setOptMode( SCPU_OPT_NONE );
+	scpu.disablePhysicalMirror();
+
+	// HDMI-only writes update authoritative shadow without queuing DRAM work.
+	scpu.memory().write8( 0x0400, 0x41 );
+	CHECK_EQ( scpu.writeBuffer().pending(), 0u );
+	const u64 physicalWrites = bus.m_Writes;
+
+	scpu.enablePhysicalMirror();
+	CHECK( !scpu.mirrorHalted() );
+	CHECK( scpu.writeBuffer().deliveryEnabled() );
+	CHECK( scpu.writeBuffer().pending() >= 1024u );
+	CHECK_EQ( bus.m_Writes, physicalWrites );
 }
 
 TEST( integration_hdmi_posted_timing_respects_full_optimization )

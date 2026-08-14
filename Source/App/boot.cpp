@@ -651,12 +651,12 @@ static void scpuHoldC128FreezeDiagnostic( CSuperCPU *scpu )
 	}
 }
 
-static void scpuPromoteHDMIExclusive( CSuperCPU *scpu );
+static void scpuUpdateVideoSelection( CSuperCPU *scpu );
 
 static bool scpuCheckButton( void *ctx )
 {
 	CSuperCPU *scpu = (CSuperCPU *)ctx;
-	scpuPromoteHDMIExclusive( scpu );
+	scpuUpdateVideoSelection( scpu );
 	const bool hardwareResetPressed = radBusHardwareResetPressed();
 
 	// Do not wait for a formal stall during initial native-C128 bring-up. A bad
@@ -727,11 +727,11 @@ static bool scpuCheckButton( void *ctx )
 			CScopedLoggingIRQs saveIRQs;
 			if ( !scpuSaveRuntimeBusDiag( runtime ) )
 				s_Logger->Write( "SCPU", LogError,
-						               "K359 could not save post-handoff runtime to %s",
+							               "K361 could not save post-handoff runtime to %s",
 				               SCPU_BUS_DIAG_FILE );
 			else
 				s_Logger->Write( "SCPU", LogNotice,
-						               "K359 saved post-handoff runtime to %s",
+							               "K361 saved post-handoff runtime to %s",
 				               SCPU_BUS_DIAG_FILE );
 		}
 		s_RebootRequested = true;
@@ -764,11 +764,11 @@ static bool scpuCheckButton( void *ctx )
 			CScopedLoggingIRQs saveIRQs;
 			if ( !scpuSaveRuntimeBusDiag( s_ResetDiagnostic.runtime ) )
 				s_Logger->Write( "SCPU", LogError,
-						               "K359 could not save post-handoff runtime to %s",
+							               "K361 could not save post-handoff runtime to %s",
 				               SCPU_BUS_DIAG_FILE );
 			else
 				s_Logger->Write( "SCPU", LogNotice,
-						               "K359 saved post-handoff runtime to %s",
+							               "K361 saved post-handoff runtime to %s",
 				               SCPU_BUS_DIAG_FILE );
 		}
 
@@ -1022,6 +1022,18 @@ static CActLED   actLED;
 static CSuperCPU superCPU;
 static bool s_HDMIPictureActive = false;
 static bool s_HDMIExclusive = false;
+enum SCPURuntimeVideoTransition
+{
+	SCPU_VIDEO_TRANSITION_NONE,
+	SCPU_VIDEO_TRANSITION_TO_HDMI,
+	SCPU_VIDEO_TRANSITION_TO_VIC
+};
+static SCPURuntimeVideoTransition s_VideoTransition =
+	SCPU_VIDEO_TRANSITION_NONE;
+static u32 s_VideoTransitionFrame = 0;
+static u32 s_VideoFrames = 0;
+static u32 s_VideoLastSwitchFrame = 0;
+static bool s_VideoHasSwitched = false;
 static SCPURuntimeSample s_RuntimeBaseline = {};
 static u32 s_PiThrottledStartup = 0;
 static u32 s_PiThrottledPostSelfTest = 0;
@@ -1039,25 +1051,93 @@ static bool s_PiARMClockCore1Valid = false;
 static const u32 SCPU_PI_UNDERVOLTAGE_NOW = 1u << 0;
 static const u32 SCPU_PI_UNDERVOLTAGE_OCCURRED = 1u << 16;
 
-static void scpuPromoteHDMIExclusive( CSuperCPU *scpu )
+static void scpuUpdateVideoSelection( CSuperCPU *scpu )
 {
-	// Do not give up the known physical presentation path merely because the
-	// HDMI task was scheduled. Wait for proof that core 1 completed a frame;
-	// the next core-0 frame hook then performs the mirror handoff without ever
-	// waiting on core 1. This path exists only for VIDEO_MODE 1.
-	if ( !scpu || s_HDMIExclusive || !s_HDMIPictureActive
-	     || !s_HDMIDisplay || !s_HDMIDisplay->firstFrameReady() )
+	// Runtime selection exists only when VIDEO_MODE 1 created core 1. A
+	// deliberate two-access register knock changes the request; this frame hook
+	// performs the electrical handoff only at an IEC-quiet frame boundary.
+	if ( !scpu || !s_HDMIPictureActive || !s_HDMIDisplay )
+		return;
+	s_VideoFrames++;
+	const bool wantHDMI = scpu->registers().videoHDMIRequested();
+	static const u32 debounceFrames = 30;
+	const bool debounceDone = !s_VideoHasSwitched
+	                       || (u32)( s_VideoFrames - s_VideoLastSwitchFrame )
+	                          >= debounceFrames;
+
+	if ( s_VideoTransition == SCPU_VIDEO_TRANSITION_TO_VIC )
+	{
+		// A reversed request cancels cleanly because physical delivery has not
+		// yet been re-enabled. Wake core 1 and leave the active mode unchanged.
+		if ( wantHDMI )
+		{
+			s_HDMIDisplay->setPictureEnabled( true );
+			s_VideoTransition = SCPU_VIDEO_TRANSITION_NONE;
+			return;
+		}
+		if ( !s_HDMIDisplay->pictureParked()
+		     || scpu->memory().iecBusActive() || !debounceDone )
+			return;
+
+		// Core 1 now generates no shared-memory traffic. Restore the physical
+		// write path and queue only the currently visible working set; the
+		// existing raster scheduler converges it in bounded installments.
+		scpu->memory().enableBusKeepalive( false );
+		scpu->enablePhysicalMirror();
+		scpu->memory().enableVICLog( false );
+		s_HDMIExclusive = false;
+		s_VideoTransition = SCPU_VIDEO_TRANSITION_NONE;
+		s_VideoLastSwitchFrame = s_VideoFrames;
+		s_VideoHasSwitched = true;
+		return;
+	}
+
+	if ( s_VideoTransition == SCPU_VIDEO_TRANSITION_TO_HDMI )
+	{
+		if ( !wantHDMI )
+		{
+			s_HDMIDisplay->setPictureEnabled( false );
+			scpu->memory().enableVICLog( false );
+			s_VideoTransition = SCPU_VIDEO_TRANSITION_NONE;
+			return;
+		}
+		// Never detach physical presentation until core 1 proves it completed
+		// a frame newer than the one visible when the request was accepted.
+		if ( s_HDMIDisplay->presentedFrames() == s_VideoTransitionFrame
+		     || scpu->memory().iecBusActive() || !debounceDone )
+			return;
+
+		scpu->memory().enableBusKeepalive( true );
+		scpu->disablePhysicalMirror();
+		s_HDMIExclusive = true;
+		s_VideoTransition = SCPU_VIDEO_TRANSITION_NONE;
+		s_VideoLastSwitchFrame = s_VideoFrames;
+		s_VideoHasSwitched = true;
+		scpuBeginRuntimeDiagnostic( scpu );
+		return;
+	}
+
+	if ( wantHDMI == s_HDMIExclusive || !debounceDone
+	     || scpu->memory().iecBusActive() )
 		return;
 
-	// Physical mirroring was also keeping the expansion bus electrically warm.
-	// Arm its low-bandwidth replacement before detaching it so the first idle
-	// interval cannot expose another cold production access. This promotion is
-	// reachable only in VIDEO_MODE 1; VIDEO_MODE 0 remains byte-for-byte on its
-	// established physical-mirror path.
-	scpu->memory().enableBusKeepalive( true );
-	scpu->disablePhysicalMirror();
-	s_HDMIExclusive = true;
-	scpuBeginRuntimeDiagnostic( scpu );
+	if ( wantHDMI )
+	{
+		// Capture starts before core 1 wakes; after one complete new frame the
+		// transition above may safely make HDMI authoritative.
+		scpu->memory().enableVICLog( true );
+		s_HDMIDisplay->resetCollisionLatches();
+		s_VideoTransitionFrame = s_HDMIDisplay->presentedFrames();
+		s_HDMIDisplay->setPictureEnabled( true );
+		s_VideoTransition = SCPU_VIDEO_TRANSITION_TO_HDMI;
+	}
+	else
+	{
+		// Stop presentation first. The next frame hook observes the parked
+		// acknowledgement before it lets any physical mirror burst resume.
+		s_HDMIDisplay->setPictureEnabled( false );
+		s_VideoTransition = SCPU_VIDEO_TRANSITION_TO_VIC;
+	}
 }
 
 static SCPURuntimeSample scpuCaptureRuntimeSample( CSuperCPU *scpu,
@@ -1248,7 +1328,7 @@ static void scpuAppendRuntimeBusDiag( char *dst, u32 capacity, u32 &length,
 		scpuLineChar( dst, capacity, length, '\n' );
 	}
 	scpuLineText( dst, capacity, length,
-	              "post-handoff runtime: build=359 handoff=" );
+	              "post-handoff runtime: build=361 handoff=" );
 	scpuLineDecimal( dst, capacity, length, r.valid ? 1 : 0 );
 	if ( r.valid )
 	{
@@ -1664,6 +1744,11 @@ void scpuBootRun( CLogger *logger )
 	// chooses which KERNAL to install. A later $D0B5 POKE remains in effect until
 	// the Pi is rebooted and this configuration is read again.
 	superCPU.registers().setJiffyDOSSwitch( cfgJiffyDOS != 0 );
+	// A deliberate $D0BA knock may request runtime VIC/HDMI selection, but only
+	// when this boot actually creates the passive HDMI renderer. Track the live
+	// handoff flag so its unlocked read reports completed hardware state.
+	superCPU.registers().configureVideoSwitch( false, false );
+	superCPU.registers().trackVideoHDMIActive( &s_HDMIExclusive );
 	logger->Write( "SCPU", LogNotice, "JiffyDOS: %s (scpu.cfg)",
 	               cfgJiffyDOS ? "enabled" : "disabled" );
 
@@ -1721,8 +1806,13 @@ void scpuBootRun( CLogger *logger )
 			CHDMIDisplay *display = new CHDMIDisplay( superCPU.memory() );
 			if ( display && display->initialize( logger ) )
 			{
-				display->watchBusActivity( radBus.serialCounter() );
-				s_HDMIDisplay = display;
+					display->watchBusActivity( radBus.serialCounter() );
+					s_HDMIDisplay = display;
+					superCPU.memory().attachHDMICollisionLatches(
+						display->spriteSpriteCollisionLatch(),
+						display->spriteBackgroundCollisionLatch(),
+						&s_HDMIExclusive );
+					superCPU.registers().configureVideoSwitch( true, true );
 				if ( scpuPiUndervoltageSeen( s_PiThrottledStartupValid,
 				                             s_PiThrottledStartup ) )
 					s_HDMIDisplay->showFailure();

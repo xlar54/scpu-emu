@@ -141,6 +141,10 @@ public:
 	// register accesses remain live because they are part of machine semantics,
 	// not display mirroring. VIDEO_MODE 0 never calls this method.
 	void disablePhysicalMirror();
+	// Reverse the HDMI handoff. The physical VIC has continued to receive chip
+	// register writes, but its DRAM may be stale, so queue the current visible
+	// matrix, bitmap/charset and enabled sprite shapes for raster-aware repair.
+	void enablePhysicalMirror();
 
 	// Under-I/O sprite-shape relocation (MIRROR_D000_RELOCATE); see
 	// CC64Memory's relocation section. On by default; the switch exists so a

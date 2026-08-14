@@ -71,6 +71,7 @@
 #define SCPU_REG_BOOTMAP_ON     0xD0B7	// write: bootmap on
 #define SCPU_REG_SPEEDFLAGS     0xD0B8	// b7 software 1MHz, b6 1MHz from any source
 #define SCPU_REG_SPEEDFLAGS_ALT 0xD0B9	// 53433: mirror of $D0B8
+#define SCPU_REG_EMU_VIDEO      0xD0BA	// emulator extension, only after $A5 knock
 #define SCPU_REG_DOSEXT         0xD0BC	// b7 DOS extension, b6 RAMLink
 #define SCPU_REG_DOSEXT_ALT     0xD0BD	// mirror of $D0BF
 #define SCPU_REG_DOSEXT_ON      0xD0BE
@@ -97,6 +98,13 @@
 
 #define SCPU_DOS_EXTENSION      0x80	// $D0BC
 #define SCPU_DOS_RAMLINK        0x40
+
+// One-shot emulator extension at otherwise-normal $D0BA. A bare access keeps
+// CMD semantics. Only the access immediately following a write of $A5 is
+// interpreted: write 0/1 requests VIC/HDMI, while a read returns active 0/1.
+#define SCPU_EMU_VIDEO_KNOCK    0xA5
+#define SCPU_EMU_VIDEO_VIC      0x00
+#define SCPU_EMU_VIDEO_HDMI     0x01
 
 // Optimization mode, bits 7-6 of the optimization register.
 #define SCPU_OPTIM_VICBANK2     0x00	// GEOS
@@ -142,6 +150,21 @@ public:
 	// is virtual in this build and can also be changed through $D0B5 bit 7.
 	void setSpeedSwitchAllowsTurbo( bool allow );	// false = switch selects 1MHz
 	void setJiffyDOSSwitch( bool on ) { m_SwitchJiffy = on; }
+
+	// Runtime video selection is available only when boot.cpp created the HDMI
+	// renderer (VIDEO_MODE 1). The request is consumed at a safe frame boundary;
+	// the tracked active flag lets the unlocked read report the completed mode,
+	// not a request still waiting for IEC to become idle.
+	void configureVideoSwitch( bool available, bool defaultHDMI )
+	{
+		m_VideoSwitchAvailable = available;
+		m_VideoDefaultHDMI = available && defaultHDMI;
+		m_VideoRequestedHDMI = m_VideoDefaultHDMI;
+		m_VideoKnockArmed = false;
+	}
+	void trackVideoHDMIActive( const bool *active ) { m_VideoHDMIActive = active; }
+	bool videoHDMIRequested() const { return m_VideoRequestedHDMI; }
+	bool videoSwitchAvailable() const { return m_VideoSwitchAvailable; }
 
 	// BOOT_ANIMATION: run the C64 startup animation that SuperCPU DOS 2.04
 	// carries but skips. See ioRead for the mechanism and the fidelity note.
@@ -251,6 +274,11 @@ private:
 	bool m_SwitchSlow;		// physical speed switch in the 1MHz position
 	bool m_SwitchJiffy;		// virtual JiffyDOS switch; persists across reset
 	bool m_BootAnimHack = false;	// see setBootAnimationHack
+	bool m_VideoSwitchAvailable = false;
+	bool m_VideoDefaultHDMI = false;
+	bool m_VideoRequestedHDMI = false;
+	bool m_VideoKnockArmed = false;
+	const bool *m_VideoHDMIActive = 0;
 
 	bool m_HWRegsEnabled;
 	bool  m_Bootmap;

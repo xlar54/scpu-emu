@@ -40,6 +40,52 @@ void CSuperCPU::disablePhysicalMirror()
 	m_MirrorHalted = true;
 }
 
+void CSuperCPU::enablePhysicalMirror()
+{
+	// Forget any timing-only history, restore the ordinary delivery policy, and
+	// rebuild just the VIC-visible working set. runFrame() performs the actual
+	// writes in its established raster-safe installments; this call itself does
+	// not touch the physical bus.
+	// Collision bits accumulated by the physical VIC while it displayed stale
+	// memory must not leak into the newly-selected mode's first guest read.
+	m_Memory.clearPhysicalVICCollisionLatches();
+	m_WriteBuffer.discard();
+	m_WriteBuffer.setDeliveryEnabled( true );
+	m_Memory.setMirrorSink( &m_WriteBuffer );
+	m_Memory.enablePostedWriteTiming( false );
+	m_MirrorHalted = false;
+
+	const u32 screen = m_Memory.activeScreenBase();
+	if ( screen < 0x10000 )
+		m_WriteBuffer.invalidateRange( (u16)screen, 1024 );
+
+	const u32 bitmap = m_Memory.activeBitmapBase();
+	if ( bitmap < 0x10000 )
+		m_WriteBuffer.invalidateRange( (u16)bitmap, 8192 );
+	else
+	{
+		const u32 charset = m_Memory.activeCharsetBase();
+		if ( charset < 0x10000 )
+			m_WriteBuffer.invalidateRange( (u16)charset, 2048 );
+	}
+
+	// Sprite data is independent of text/bitmap mode. Read pointers from the
+	// authoritative Pi shadow even when the matrix itself is under I/O; the
+	// existing relocation policy handles any shape selected from $D000-$DFFF.
+	const u8 enabled = m_Memory.vicRegister( 0x15 );
+	const u32 logicalScreen = m_Memory.activeVICScreenBase();
+	const u32 bank = m_Memory.activeVICBankBase();
+	const u8 *ram = m_Memory.ramShadow();
+	for ( u32 sprite = 0; sprite < 8; sprite++ )
+	{
+		if ( !( enabled & ( 1u << sprite ) ) ) continue;
+		const u8 pointer = ram[ ( logicalScreen + 0x3F8 + sprite ) & 0xFFFF ];
+		const u32 shape = bank + (u32)pointer * 64;
+		if ( shape < 0x10000 )
+			m_WriteBuffer.invalidateRange( (u16)shape, 64 );
+	}
+}
+
 bool CSuperCPU::init( IC64Bus *bus, SCPUCoreType core, u32 simmMB )
 {
 	m_Bus = bus;

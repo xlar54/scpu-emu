@@ -25,7 +25,17 @@ enum VICRenderMode
 	VIC_RENDER_EXTENDED_TEXT,
 	VIC_RENDER_STANDARD_BITMAP,
 	VIC_RENDER_MULTICOLOR_BITMAP,
+	// Legal display-enable state with an illegal ECM/BMM/MCM combination. The
+	// VIC-II drives graphics black in these modes; this is distinct from an
+	// implementation/input failure represented by UNSUPPORTED.
+	VIC_RENDER_INVALID,
 	VIC_RENDER_UNSUPPORTED
+};
+
+struct VICRenderCollisions
+{
+	u8 spriteSprite;
+	u8 spriteBackground;
 };
 
 struct VICRenderState
@@ -53,13 +63,15 @@ public:
 	// Render one complete bordered frame into one-byte VIC colour indices.
 	// pitch is measured in bytes and must be at least VIC_RENDER_WIDTH.
 	VICRenderMode render( const VICRenderState &state, u8 *pixels,
-	                      u32 pitch ) const;
+	                      u32 pitch,
+	                      VICRenderCollisions *collisions = 0 ) const;
 
 	// Render only the selected output scanlines. pixels points at storage for
 	// firstRow (not at the start of a full-frame image), so callers can reuse a
 	// small band buffer. The result is byte-for-byte identical to render().
 	VICRenderMode renderRows( const VICRenderState &state, u8 *pixels,
-	                          u32 pitch, u32 firstRow, u32 rowCount ) const;
+	                          u32 pitch, u32 firstRow, u32 rowCount,
+	                          VICRenderCollisions *collisions = 0 ) const;
 };
 
 #endif

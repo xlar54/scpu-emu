@@ -21,7 +21,7 @@ static inline u8 vicColour( const VICRenderState &state, u32 reg )
 static VICRenderContext makeContext( const VICRenderState &state )
 {
 	VICRenderContext context;
-	context.mode = VIC_RENDER_UNSUPPORTED;
+	context.mode = VIC_RENDER_INVALID;
 	context.patterns = 0;
 	context.patternBase = 0;
 	for ( u32 i = 0; i < 4; i++ )
@@ -124,7 +124,10 @@ static inline void decodeGraphicsCell( const VICRenderState &state,
 				                : value == 2 ? context.background[ 2 ]
 				                             : cellColour & 0x07;
 				pixels[ pair * 2 ] = pixels[ pair * 2 + 1 ] = colour;
-				if ( value ) opaqueMask |= (u8)( 0xC0 >> ( pair * 2 ) );
+				// VIC-II multicolour value 01 is background colour 1 and does
+				// not occlude a sprite whose D01B priority bit is set. Only
+				// values 10 and 11 belong to foreground graphics.
+				if ( value >= 2 ) opaqueMask |= (u8)( 0xC0 >> ( pair * 2 ) );
 			}
 		}
 		break;
@@ -167,7 +170,7 @@ static inline void decodeGraphicsCell( const VICRenderState &state,
 			                : value == 2 ? screen & 0x0F
 			                             : cellColour;
 			pixels[ pair * 2 ] = pixels[ pair * 2 + 1 ] = colour;
-			if ( value ) opaqueMask |= (u8)( 0xC0 >> ( pair * 2 ) );
+			if ( value >= 2 ) opaqueMask |= (u8)( 0xC0 >> ( pair * 2 ) );
 		}
 		break;
 	}
@@ -206,12 +209,16 @@ static void renderSpritesOnRow( const VICRenderState &state,
 	                            const VICRenderContext &context, u8 *dst,
 	                            u32 y, u32 activeLeft, u32 activeRight,
 	                            u32 activeTop, u32 activeBottom,
-	                            const u8 opaqueCells[ 40 ] )
+	                            const u8 opaqueCells[ 40 ],
+	                            VICRenderCollisions *collisions )
 {
 	const u8 enabled = state.vic[ 0x15 ];
 	if ( !enabled || !state.ram || state.screenBase >= 0x10000
 	     || y < activeTop || y >= activeBottom )
 		return;
+
+	u8 spriteCoverage[ VIC_RENDER_WIDTH ];
+	if ( collisions ) memset( spriteCoverage, 0, sizeof spriteCoverage );
 
 	// Sprite zero has the highest sprite-to-sprite priority, so composite from
 	// seven down to zero and let the lower-numbered sprite win.
@@ -262,7 +269,28 @@ static void renderSpritesOnRow( const VICRenderState &state,
 				colour = vicColour( state, 0x27 + (u32)n );
 			}
 
-			if ( behind && context.mode != VIC_RENDER_UNSUPPORTED )
+			if ( collisions )
+			{
+				const u8 previous = spriteCoverage[ x ];
+				if ( previous )
+					collisions->spriteSprite |= (u8)( previous | mask );
+				spriteCoverage[ x ] = (u8)( previous | mask );
+
+				if ( context.mode != VIC_RENDER_UNSUPPORTED
+				     && context.mode != VIC_RENDER_INVALID )
+				{
+					u32 sourceX, sourceY;
+					if ( outputToSource( state, x, y, activeLeft, activeRight,
+					                     activeTop, activeBottom,
+					                     sourceX, sourceY )
+					     && ( opaqueCells[ sourceX >> 3 ]
+					          & ( 0x80 >> ( sourceX & 7 ) ) ) )
+						collisions->spriteBackground |= mask;
+				}
+			}
+
+			if ( behind && context.mode != VIC_RENDER_UNSUPPORTED
+			     && context.mode != VIC_RENDER_INVALID )
 			{
 				u32 sourceX, sourceY;
 				if ( outputToSource( state, x, y, activeLeft, activeRight,
@@ -278,14 +306,22 @@ static void renderSpritesOnRow( const VICRenderState &state,
 }
 
 VICRenderMode CVICRenderer::render( const VICRenderState &state, u8 *pixels,
-	                                u32 pitch ) const
+	                                u32 pitch,
+	                                VICRenderCollisions *collisions ) const
 {
-	return renderRows( state, pixels, pitch, 0, VIC_RENDER_HEIGHT );
+	if ( collisions )
+	{
+		collisions->spriteSprite = 0;
+		collisions->spriteBackground = 0;
+	}
+	return renderRows( state, pixels, pitch, 0, VIC_RENDER_HEIGHT,
+	                   collisions );
 }
 
 VICRenderMode CVICRenderer::renderRows( const VICRenderState &state,
 	                                    u8 *pixels, u32 pitch,
-	                                    u32 firstRow, u32 rowCount ) const
+	                                    u32 firstRow, u32 rowCount,
+	                                    VICRenderCollisions *collisions ) const
 {
 	if ( !pixels || pitch < VIC_RENDER_WIDTH ) return VIC_RENDER_BLANK;
 	if ( firstRow >= VIC_RENDER_HEIGHT ) rowCount = 0;
@@ -295,6 +331,8 @@ VICRenderMode CVICRenderer::renderRows( const VICRenderState &state,
 	const VICRenderContext context = makeContext( state );
 	const u8 border = vicColour( state, 0x20 );
 	const u8 background = vicColour( state, 0x21 );
+	const u8 graphicsFill = context.mode == VIC_RENDER_INVALID
+	                      ? 0 : background;
 	const bool displayEnabled = context.mode != VIC_RENDER_BLANK;
 	const bool columns40 = ( state.vic[ 0x16 ] & 0x08 ) != 0;
 	const bool rows25 = ( state.vic[ 0x11 ] & 0x08 ) != 0;
@@ -317,7 +355,7 @@ VICRenderMode CVICRenderer::renderRows( const VICRenderState &state,
 
 		memset( dst, border, activeLeft );
 		memset( dst + activeRight, border, VIC_RENDER_WIDTH - activeRight );
-		memset( dst + activeLeft, background, activeRight - activeLeft );
+		memset( dst + activeLeft, graphicsFill, activeRight - activeLeft );
 
 		u8 opaqueCells[ 40 ];
 		memset( opaqueCells, 0, sizeof opaqueCells );
@@ -327,6 +365,7 @@ VICRenderMode CVICRenderer::renderRows( const VICRenderState &state,
 		                      ? 0 : (int)( state.vic[ 0x11 ] & 7 ) - 3 );
 		const int sourceY = (int)y - originY;
 		if ( context.mode != VIC_RENDER_UNSUPPORTED
+		     && context.mode != VIC_RENDER_INVALID
 		     && sourceY >= 0 && sourceY < VIC_RENDER_DISPLAY_H )
 		{
 			const u32 cellRow = (u32)sourceY >> 3;
@@ -348,7 +387,7 @@ VICRenderMode CVICRenderer::renderRows( const VICRenderState &state,
 			}
 		}
 		renderSpritesOnRow( state, context, dst, y, activeLeft, activeRight,
-		                    activeTop, activeBottom, opaqueCells );
+		                    activeTop, activeBottom, opaqueCells, collisions );
 	}
 
 	return context.mode;

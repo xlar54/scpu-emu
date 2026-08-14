@@ -107,6 +107,7 @@ corrected that. Implemented in full.
 | `$D0B5` | 53429 | bit7 JiffyDOS switch, bit6 speed switch (1 = Normal) | **confirmed** |
 | `$D0B6` | 53430 | bit7 processor emulation mode, bit6 reset switch (v1) | **confirmed** |
 | `$D0B8` | 53432 | bit7 software speed flag, bit6 master speed flag (1 = Normal) | **confirmed** |
+| `$D0BA` | 53434 | SCPU-EMU video control, for one access after an `$A5` unlock | **emulator extension** |
 | `$D0BC` | 53436 | bit7 DOS extension mode, bit6 RAMLink registers | **confirmed** |
 
 On a physical SuperCPU `$D0B5` reports switches and VICE treats writes as a
@@ -129,6 +130,33 @@ position; the built-in default is enabled. A direct `$D0B5` POKE overrides that
 position and persists across an emulated reset, matching a physical switch. A
 Pi reboot reads `scpu.cfg` again. Reset the emulated C64 after changing the
 switch so CMD's boot code installs the selected KERNAL image.
+
+### Runtime VIC / HDMI selection (SCPU-EMU)
+
+When the Pi booted with `VIDEO_MODE 1`, SCPU-EMU can hand presentation between
+its HDMI renderer and the physical VIC-II without rebooting. `$D0BA` keeps its
+ordinary decoded/no-effect CMD behavior unless it receives a one-shot `$A5`
+unlock. The immediately following access selects or queries the mode:
+
+```basic
+POKE 53434,165:POKE 53434,0:REM PHYSICAL VIC-II OUTPUT
+POKE 53434,165:POKE 53434,1:REM HDMI OUTPUT
+POKE 53434,165:PRINT PEEK(53434):REM 0=VIC, 1=HDMI
+```
+
+The query reports the mode whose handoff has actually completed, rather than a
+request still waiting to run. A switch is deferred while IEC is active and is
+performed at a frame boundary; repeated requests are debounced. Selecting the
+physical VIC parks the HDMI renderer on its last complete picture, restores
+physical mirroring, and requeues the current screen, bitmap/character data and
+enabled sprite shapes so real DRAM converges through the normal raster-aware
+scheduler. Returning to HDMI captures and completes a fresh frame before it
+stops physical mirroring.
+
+The extension is unavailable with `VIDEO_MODE 0`: deliberate knock commands are
+ignored and the established physical-VIC path is unchanged. The two-access
+unlock avoids permanently assigning undocumented `$D0BA` semantics that real
+SuperCPU software might encounter.
 
 `$D0B0` bits 7-6:
 

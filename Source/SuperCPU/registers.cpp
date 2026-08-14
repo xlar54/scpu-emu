@@ -50,6 +50,8 @@ void CSuperCPURegisters::reset()
 	m_Bootmap       = true;
 	m_DOSExt        = false;
 	m_RAMLink       = false;
+	m_VideoRequestedHDMI = m_VideoDefaultHDMI;
+	m_VideoKnockArmed = false;
 	m_SpeedChanged  = true;
 	m_RegWrites     = 0;
 	// SCPU64 v2 resets to $C7. The real SCPU128 capture consistently reports
@@ -174,6 +176,18 @@ bool CSuperCPURegisters::ioRead( u16 addr, u8 &value )
 	if ( addr < SCPU_REG_STATUS_FIRST || addr > SCPU_REG_STATUS_LAST )
 		return false;			// $D07x is write-only; let it fall through
 
+	// Preserve the real register map unless software deliberately unlocked this
+	// one access. A read after the knock is a one-shot query: 0 = physical VIC,
+	// 1 = HDMI. Returning before the common optimisation-bit OR is intentional.
+	if ( addr == SCPU_REG_EMU_VIDEO && m_VideoKnockArmed )
+	{
+		m_VideoKnockArmed = false;
+		const bool active = m_VideoHDMIActive
+		                  ? *m_VideoHDMIActive : m_VideoRequestedHDMI;
+		value = active ? SCPU_EMU_VIDEO_HDMI : SCPU_EMU_VIDEO_VIC;
+		return true;
+	}
+
 	u8 v = 0x00;
 
 	switch ( addr )
@@ -294,6 +308,24 @@ bool CSuperCPURegisters::ioWrite( u16 addr, u8 value )
 
 	const bool wasFast = fastMode();
 	m_RegWrites++;
+
+	// Emulator-only video control. Without the $A5 knock, $D0BA remains the
+	// decoded/no-effect CMD register it has always been. The second write is
+	// accepted only for the two documented mode values, then the latch closes.
+	if ( addr == SCPU_REG_EMU_VIDEO )
+	{
+		if ( m_VideoKnockArmed )
+		{
+			m_VideoKnockArmed = false;
+			if ( m_VideoSwitchAvailable
+			     && ( value == SCPU_EMU_VIDEO_VIC
+			       || value == SCPU_EMU_VIDEO_HDMI ) )
+				m_VideoRequestedHDMI = value == SCPU_EMU_VIDEO_HDMI;
+		}
+		else
+			m_VideoKnockArmed = value == SCPU_EMU_VIDEO_KNOCK;
+		return true;
+	}
 
 	switch ( addr )
 	{

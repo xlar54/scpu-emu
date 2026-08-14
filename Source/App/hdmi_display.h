@@ -35,6 +35,19 @@ public:
 	// Register the renderer on otherwise-idle core 1. Returns immediately.
 	bool start();
 	bool firstFrameReady() const;
+	// Core 1 is permanent once registered with Circle. Runtime VIC/HDMI
+	// switching therefore parks the renderer instead of returning from it.
+	// presentedFrames() lets core 0 wait for one newly completed frame without
+	// ever waiting on core 1 inside an IEC-critical interval.
+	void setPictureEnabled( bool enabled );
+	bool pictureEnabled() const;
+	bool pictureParked() const;
+	u32 presentedFrames() const;
+	volatile u32 *spriteSpriteCollisionLatch()
+		{ return &m_SpriteSpriteCollision; }
+	volatile u32 *spriteBackgroundCollisionLatch()
+		{ return &m_SpriteBackgroundCollision; }
+	void resetCollisionLatches();
 	u32 maxBandUS() const;
 	u32 missedBandDeadlines() const;
 	u32 rasterResyncs() const { return m_RasterReplay.resyncs(); }
@@ -81,6 +94,11 @@ private:
 	u32                m_FrameHz;
 	volatile u32       m_Started;
 	volatile u32       m_FirstFrame;
+	volatile u32       m_PictureEnabled;
+	volatile u32       m_PictureParked;
+	volatile u32       m_PresentedFrames;
+	volatile u32       m_SpriteSpriteCollision;
+	volatile u32       m_SpriteBackgroundCollision;
 	volatile u64       m_MaxBandTicks;
 	volatile u32       m_MissedBandDeadlines;
 	const volatile u64 *m_SerialTransfers;

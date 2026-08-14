@@ -120,6 +120,25 @@ public:
 		m_IO = io;
 		m_DOSExtState = io ? io->dosExtensionStatePtr() : 0;
 	}
+	// VIDEO_MODE 1 computes collision latches from the same authoritative
+	// shadow frame it presents. While HDMI is active, D01E/D01F reads consume
+	// these latches instead of asking the physical VIC, whose DRAM is stale.
+	void attachHDMICollisionLatches( volatile u32 *spriteSprite,
+	                                 volatile u32 *spriteBackground,
+	                                 const bool *hdmiActive )
+	{
+		m_HDMISpriteSpriteCollision = spriteSprite;
+		m_HDMISpriteBackgroundCollision = spriteBackground;
+		m_HDMIActive = hdmiActive;
+	}
+	void clearPhysicalVICCollisionLatches()
+	{
+		if ( m_C64 )
+		{
+			(void)m_C64->read( 0xD01E );
+			(void)m_C64->read( 0xD01F );
+		}
+	}
 
 	// Reset the emulated 6510 port to its power-on state ($00 = $2F, $01 = $37)
 	// and clear shadow DRAM. Does not touch the ROM images.
@@ -870,6 +889,9 @@ private:
 	IMirrorSink    *m_Mirror;
 	IIOInterceptor *m_IO;
 	const bool *m_DOSExtState = 0;
+	volatile u32 *m_HDMISpriteSpriteCollision = 0;
+	volatile u32 *m_HDMISpriteBackgroundCollision = 0;
+	const bool *m_HDMIActive = 0;
 	const u8       *m_BootmapROM;
 	u32             m_BootmapROMLength;
 	u8             *m_ROMShadow;

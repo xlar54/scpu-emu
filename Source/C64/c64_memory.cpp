@@ -404,6 +404,11 @@ void CC64Memory::reset()
 	m_LastPreciseLine = 0xFFFF;
 	__atomic_store_n( &m_RasterAnchor, 0ULL, __ATOMIC_RELAXED );
 	__atomic_store_n( &m_VICLogHead, 0u, __ATOMIC_RELEASE );
+	if ( m_HDMISpriteSpriteCollision )
+		__atomic_store_n( m_HDMISpriteSpriteCollision, 0u, __ATOMIC_RELEASE );
+	if ( m_HDMISpriteBackgroundCollision )
+		__atomic_store_n( m_HDMISpriteBackgroundCollision, 0u,
+		                  __ATOMIC_RELEASE );
 	// The keepalive deadline is on the host clock. Carrying it across an
 	// emulated reset can leave it arbitrarily far in the future relative to a
 	// restarted session, allowing the physical bus to go cold permanently.
@@ -669,7 +674,23 @@ u8 CC64Memory::read8( scpu_addr_t addr )
 			// behind us, so a marginal physical read must never poison the shadow.
 			// Still charge the ordinary I/O stretch above: shadowing correctness
 			// must not turn a 1MHz-class access into a fast private-register access.
-			if ( a == 0xDD02 && m_HaveCIA2DDRA )
+			const u8 vicReadRegister = (u8)( a & 0x3F );
+			const bool hdmiCollisionRead = a >= 0xD000 && a < 0xD400
+			                            && ( vicReadRegister == 0x1E
+			                              || vicReadRegister == 0x1F )
+			                            && m_HDMIActive && *m_HDMIActive;
+			if ( hdmiCollisionRead )
+			{
+				// VIC-II registers repeat every $40 bytes through $D3FF.
+				// Treat collision-register mirrors exactly like $D01E/$D01F,
+				// including their read-to-clear side effect.
+				volatile u32 *latch = vicReadRegister == 0x1E
+				                    ? m_HDMISpriteSpriteCollision
+				                    : m_HDMISpriteBackgroundCollision;
+				v = latch ? (u8)__atomic_exchange_n( latch, 0u,
+				                                      __ATOMIC_ACQ_REL ) : 0;
+			}
+			else if ( a == 0xDD02 && m_HaveCIA2DDRA )
 				v = m_CIA2DDRA;
 			else
 				v = m_C64 ? m_C64->read( a ) : 0xFF;

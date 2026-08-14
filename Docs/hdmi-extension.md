@@ -1,7 +1,28 @@
 # HDMI extension — specification
 
 Optional HDMI output showing the VIC-II picture, rendered on the Pi from shadow
-memory. Status: **specification only, nothing implemented.**
+memory. This began as the design specification; `VIDEO_MODE 1` is now an
+implemented HDMI-exclusive mode and can be selected at runtime through the
+emulator control register documented in
+`Docs/SuperCPU64/supercpu-registers.md`.
+
+### Current renderer fidelity
+
+- Text, bitmap, multicolour, extended-colour, sprites, sprite priority, and
+  sprite/background and sprite/sprite collision latches are rendered locally.
+  `$D01E/$D01F` and their VIC register mirrors are read-to-clear in HDMI mode.
+  Collision results are produced from completed HDMI frames, so software can
+  observe them up to one displayed frame later than on a cycle-exact VIC-II.
+- Illegal ECM/BMM/MCM combinations drive the active graphics area black, while
+  the border and sprites retain their independent rendering paths.
+- Open-border sprites are not yet modelled. The renderer clips them to its
+  current border aperture because it does not yet emulate the VIC-II border
+  flip-flops cycle by cycle. HDMI-derived `$D01E/$D01F` collision detection is
+  clipped to the same aperture, so entirely off-screen or border-only sprite
+  overlaps are not latched yet.
+- In 40-column mode, pixels revealed by horizontal fine scroll are currently
+  filled with the background colour. Exact behaviour requires the same future
+  character/bitmap shift-register model as open borders.
 
 ## 1. What makes this cheap
 

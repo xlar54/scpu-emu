@@ -72,7 +72,10 @@ CHDMIDisplay::CHDMIDisplay( const CC64Memory &memory )
 	  m_RasterTiming{ 65, 263, VIC_RENDER_HEIGHT, 5,
 	                  VIC_RENDER_DISPLAY_Y, VIC_RENDER_DISPLAY_H },
 	  m_FrameHz( 60 ),
-	  m_Started( 0 ), m_FirstFrame( 0 ), m_MaxBandTicks( 0 ),
+	  m_Started( 0 ), m_FirstFrame( 0 ), m_PictureEnabled( 1 ),
+	  m_PictureParked( 0 ),
+	  m_PresentedFrames( 0 ), m_SpriteSpriteCollision( 0 ),
+	  m_SpriteBackgroundCollision( 0 ), m_MaxBandTicks( 0 ),
 	  m_MissedBandDeadlines( 0 ), m_SerialTransfers( 0 ),
 	  m_LastSerialTransfers( 0 ), m_FrameStartSerialTransfers( 0 ),
 	  m_SerialThrottled( false ), m_SerialThrottleFrames( 0 )
@@ -191,6 +194,33 @@ bool CHDMIDisplay::firstFrameReady() const
 	return __atomic_load_n( &m_FirstFrame, __ATOMIC_ACQUIRE ) != 0;
 }
 
+void CHDMIDisplay::setPictureEnabled( bool enabled )
+{
+	__atomic_store_n( &m_PictureEnabled, enabled ? 1u : 0u,
+	                  __ATOMIC_RELEASE );
+}
+
+bool CHDMIDisplay::pictureEnabled() const
+{
+	return __atomic_load_n( &m_PictureEnabled, __ATOMIC_ACQUIRE ) != 0;
+}
+
+bool CHDMIDisplay::pictureParked() const
+{
+	return __atomic_load_n( &m_PictureParked, __ATOMIC_ACQUIRE ) != 0;
+}
+
+u32 CHDMIDisplay::presentedFrames() const
+{
+	return __atomic_load_n( &m_PresentedFrames, __ATOMIC_ACQUIRE );
+}
+
+void CHDMIDisplay::resetCollisionLatches()
+{
+	__atomic_store_n( &m_SpriteSpriteCollision, 0u, __ATOMIC_RELEASE );
+	__atomic_store_n( &m_SpriteBackgroundCollision, 0u, __ATOMIC_RELEASE );
+}
+
 u32 CHDMIDisplay::maxBandUS() const
 {
 	const u64 ticks = __atomic_load_n( &m_MaxBandTicks, __ATOMIC_ACQUIRE );
@@ -223,12 +253,23 @@ void CHDMIDisplay::run()
 		const u64 frameStart = hdmiCounter();
 		const u64 frameTicks = hdmiCounterFrequency()
 		                     / ( m_FrameHz ? m_FrameHz : 60 );
+		if ( !pictureEnabled() )
+		{
+			// radSetCore1Task() cannot be undone. WFE on the counter event
+			// stream parks this core without shared-memory traffic while the
+			// physical VIC owns presentation.
+			__atomic_store_n( &m_PictureParked, 1u, __ATOMIC_RELEASE );
+			hdmiWaitUntil( frameStart + frameTicks );
+			continue;
+		}
+		__atomic_store_n( &m_PictureParked, 0u, __ATOMIC_RELEASE );
 		renderFrame( frameStart, frameTicks );
 	}
 }
 
 void CHDMIDisplay::renderFrame( u64 frameStart, u64 frameTicks )
 {
+	VICRenderCollisions collisions = {};
 	// A real IEC transfer produces hundreds of CIA2 accesses per millisecond.
 	// K355 held the last complete picture during those frames. Preserve its
 	// protection without freezing the display: an active frame enters a
@@ -327,7 +368,7 @@ void CHDMIDisplay::renderFrame( u64 frameStart, u64 frameTicks )
 			observeSerialActivity();
 			const u64 bandStart = hdmiCounter();
 			m_Renderer.renderRows( state, m_BandPixels, VIC_RENDER_WIDTH,
-			                       first, HDMI_RENDER_BAND_ROWS );
+			                       first, HDMI_RENDER_BAND_ROWS, &collisions );
 			observeSerialActivity();
 			presentRows( m_BandPixels, first, HDMI_RENDER_BAND_ROWS );
 			const u64 bandEnd = hdmiCounter();
@@ -349,7 +390,14 @@ void CHDMIDisplay::renderFrame( u64 frameStart, u64 frameTicks )
 				hdmiWaitUntil( target );
 		}
 	}
+	if ( collisions.spriteSprite )
+		__atomic_fetch_or( &m_SpriteSpriteCollision,
+		                   (u32)collisions.spriteSprite, __ATOMIC_RELEASE );
+	if ( collisions.spriteBackground )
+		__atomic_fetch_or( &m_SpriteBackgroundCollision,
+		                   (u32)collisions.spriteBackground, __ATOMIC_RELEASE );
 	__atomic_store_n( &m_FirstFrame, 1, __ATOMIC_RELEASE );
+	__atomic_add_fetch( &m_PresentedFrames, 1u, __ATOMIC_RELEASE );
 }
 
 bool CHDMIDisplay::serialActive() const
