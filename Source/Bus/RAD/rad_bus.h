@@ -177,6 +177,17 @@ public:
 
 	// Statistics, useful for judging how much bus bandwidth a workload burns.
 	u64 m_Reads, m_Writes, m_BurstWrites;
+	// A physical transfer which follows a long idle gap needs one sacrificial
+	// transfer of the same polarity.  Keep the timestamp and counters here so
+	// runtime diagnostics can prove that the protection is active.
+	u64 m_LastTransferCycles;
+	volatile u64 m_Transfers;
+	volatile u64 m_SerialTransfers;
+	u64 m_ReadPrimes;
+	void primeAfterIdle();
+	u64 readPrimes() const { return m_ReadPrimes; }
+	u64 transfers() const { return m_Transfers; }
+	u64 serialTransfers() const { return m_SerialTransfers; }
 
 	bool acquired() const { return m_Acquired; }
 	void setTrafficHalted( bool halted );

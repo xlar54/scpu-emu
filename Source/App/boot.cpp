@@ -152,6 +152,7 @@ static bool scpuLineDecimal( char *dst, u32 capacity, u32 &length, u32 v )
 }
 static void scpuWaitForButtonThenReboot();
 static CLogger *s_Logger;
+static CHDMIDisplay *s_HDMIDisplay = 0;
 static bool s_RebootRequested = false;
 
 // Frame hook: reboot the Pi when the RAD's button is pressed, so the card can
@@ -521,6 +522,11 @@ static void scpuEmitResetDiagnostic()
 	               "  display scrub: phase=%s repaired=%llu (physical sampling disabled)",
 	               d.scrubPhaseOn ? "ON" : "OFF",
 	               (unsigned long long)d.scrubRepaired );
+	if ( s_HDMIDisplay )
+		s_Logger->Write( "SCPU", LogNotice,
+		               "  hdmi renderer: max-band=%uus missed-deadlines=%u",
+		               (unsigned)s_HDMIDisplay->maxBandUS(),
+		               (unsigned)s_HDMIDisplay->missedBandDeadlines() );
 
 	// Both should read zero. Either one non-zero means a bus wait hit its
 	// ceiling instead of seeing the signal it wanted -- which before those
@@ -953,12 +959,8 @@ static bool scpuRunFrameAndCheckButtons( CSuperCPU &scpu )
 static CRADBus   radBus;
 static CActLED   actLED;
 static CSuperCPU superCPU;
-static CBcmFrameBuffer *s_BootFrameBuffer = 0;
-static CDevice *s_BootScreenTarget = 0;
-static CHDMIDisplay *s_HDMIDisplay = 0;
 static bool s_HDMIPictureActive = false;
 static bool s_HDMIExclusive = false;
-static bool s_HDMILoggerDetached = false;
 static u32 s_PiThrottledStartup = 0;
 static u32 s_PiThrottledPostSelfTest = 0;
 static bool s_PiThrottledStartupValid = false;
@@ -977,6 +979,12 @@ static void scpuPromoteHDMIExclusive( CSuperCPU *scpu )
 	     || !s_HDMIDisplay || !s_HDMIDisplay->firstFrameReady() )
 		return;
 
+	// Physical mirroring was also keeping the expansion bus electrically warm.
+	// Arm its low-bandwidth replacement before detaching it so the first idle
+	// interval cannot expose another cold production access. This promotion is
+	// reachable only in VIDEO_MODE 1; VIDEO_MODE 0 remains byte-for-byte on its
+	// established physical-mirror path.
+	scpu->memory().enableBusKeepalive( true );
 	scpu->disablePhysicalMirror();
 	s_HDMIExclusive = true;
 }
@@ -1054,21 +1062,9 @@ static void scpuAppendPiThrottledDiag( char *dst, u32 capacity, u32 &length )
 	              " bits 0-3=live 16-19=sticky\r\n" );
 }
 
-void scpuBootSetFrameBuffer( CBcmFrameBuffer *frameBuffer,
-	                         CDevice *screenTarget )
-{
-	s_BootFrameBuffer = frameBuffer;
-	s_BootScreenTarget = screenTarget;
-}
-
-static void scpuHDMIShowFailure( CLogger *logger )
+static void scpuHDMIShowFailure()
 {
 	if ( !s_HDMIDisplay ) return;
-	// Reattach first, as agreed: the following logger writes must have a live
-	// target. Painting red second leaves the failure text visible over it.
-	if ( s_HDMILoggerDetached && s_BootScreenTarget )
-		logger->SetNewTarget( s_BootScreenTarget );
-	s_HDMILoggerDetached = false;
 	s_HDMIPictureActive = false;
 	s_HDMIDisplay->showFailure();
 }
@@ -1469,21 +1465,34 @@ void scpuBootRun( CLogger *logger )
 	logger->Write( "SCPU", LogNotice, "mirror: under-I/O sprite relocation %s",
 	               cfgMirrorD000Relocate ? "on" : "off" );
 
-	// Construct and validate while Circle's framebuffer and logger are still
-	// fully available, but do not start core 1 until all physical bus
-	// calibration and self-test work is complete.
+	// VIDEO_MODE 1 replaces the console with a small indexed framebuffer. The
+	// GPU scales it to the configured HDMI mode; core 1 is not started until
+	// all physical-bus calibration and self-test work is complete. Diagnostic
+	// images retain the firmware console because their text is the result.
 	if ( cfgVideoMode == SCPU_CFG_VIDEO_VICII )
 	{
-		CHDMIDisplay *display = new CHDMIDisplay( superCPU.memory() );
-		if ( display && display->initialize( s_BootFrameBuffer, logger ) )
-		{
-			s_HDMIDisplay = display;
+		if ( cfgBusAccessSentinel != 0 )
 			logger->Write( "SCPU", LogNotice,
-			               "video: VIC-II shadow renderer armed for HDMI" );
-		}
+			               "video: diagnostic image retains firmware console" );
 		else
-			logger->Write( "SCPU", LogError,
-			               "video: HDMI renderer unavailable; retaining console" );
+		{
+			CHDMIDisplay *display = new CHDMIDisplay( superCPU.memory() );
+			if ( display && display->initialize( logger ) )
+			{
+				s_HDMIDisplay = display;
+				if ( scpuPiUndervoltageSeen( s_PiThrottledStartupValid,
+				                             s_PiThrottledStartup ) )
+					s_HDMIDisplay->showFailure();
+				else
+					s_HDMIDisplay->showReady();
+				// The old CScreenDevice owns the superseded console buffer. Stop
+				// the logger writing into it; mode 1 now communicates by colour.
+				logger->SetNewTarget( 0 );
+			}
+			else
+				logger->Write( "SCPU", LogError,
+				               "video: HDMI renderer unavailable; retaining console" );
+		}
 	}
 	else if ( cfgVideoMode == SCPU_CFG_VIDEO_VDC )
 		logger->Write( "SCPU", LogWarning,
@@ -1525,21 +1534,6 @@ void scpuBootRun( CLogger *logger )
 	// live. Logging is bought back the other way instead -- CScopedLoggingIRQs
 	// unmasks around individual log writes, which happen between bus
 	// operations, never inside one.
-	// VIDEO_MODE 1 uses a status screen instead of startup text. Blue means the
-	// RAD is initialised and is now waiting for the Commodore to be powered on.
-	// Diagnostic-only images retain the console because their text is the test
-	// result. VIDEO_MODE 0 never enters this block.
-	if ( s_HDMIDisplay && cfgBusAccessSentinel == 0 )
-	{
-		if ( scpuPiUndervoltageSeen( s_PiThrottledStartupValid,
-		                             s_PiThrottledStartup ) )
-			s_HDMIDisplay->showFailure();
-		else
-			s_HDMIDisplay->showReady();
-		logger->SetNewTarget( 0 );
-		s_HDMILoggerDetached = true;
-	}
-
 	DisableIRQs();
 
 	if ( !superCPU.init( &radBus, core, SCPU_SIMM_16MB ) )
@@ -1548,7 +1542,7 @@ void scpuBootRun( CLogger *logger )
 		// own CPU again and is usable -- it simply has no accelerator.
 		{
 		CScopedLoggingIRQs failIRQs;
-		scpuHDMIShowFailure( logger );
+		scpuHDMIShowFailure();
 		logger->Write( "SCPU", LogError,
 		               "startup failed: no machine detected, no safe DMA handover "
 		               "point found, or no usable KERNAL. The C64 has been released "
@@ -1651,7 +1645,7 @@ void scpuBootRun( CLogger *logger )
 		// unusable. Hand the C64 back instead: it returns to its own CPU and
 		// the log above stays on screen to be read.
 		CScopedLoggingIRQs failIRQs;
-		scpuHDMIShowFailure( logger );
+		scpuHDMIShowFailure();
 		radBus.logSelfTestResults( logger );
 		if ( cfgBusHaltAfterS > 0 )
 		{
@@ -2002,10 +1996,9 @@ void scpuBootRun( CLogger *logger )
 	}
 
 	// Measurements are finished. Core 1 may now read Pi shadow and write the
-	// existing framebuffer without sharing any physical-bus path with core 0.
+	// indexed framebuffer without sharing any physical-bus path with core 0.
 	if ( s_HDMIDisplay )
 	{
-		superCPU.memory().setHDMISerialObservation( true );
 		if ( s_HDMIDisplay->start() )
 		{
 			// Do not wait on core 1. The first passive frame naturally replaces
@@ -2014,9 +2007,8 @@ void scpuBootRun( CLogger *logger )
 		}
 		else
 		{
-			superCPU.memory().setHDMISerialObservation( false );
 			CScopedLoggingIRQs failIRQs;
-			scpuHDMIShowFailure( logger );
+			scpuHDMIShowFailure();
 			logger->Write( "SCPU", LogError,
 			               "HDMI renderer did not start; retaining the console" );
 		}

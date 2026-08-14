@@ -20,25 +20,27 @@
 enum VICRenderMode
 {
 	VIC_RENDER_BLANK = 0,
-	VIC_RENDER_TEXT,
-	VIC_RENDER_ABORTED,
+	VIC_RENDER_STANDARD_TEXT,
+	VIC_RENDER_MULTICOLOR_TEXT,
+	VIC_RENDER_EXTENDED_TEXT,
+	VIC_RENDER_STANDARD_BITMAP,
+	VIC_RENDER_MULTICOLOR_BITMAP,
 	VIC_RENDER_UNSUPPORTED
 };
-
-typedef bool (*VICRenderAbortCheck)( void *context );
 
 struct VICRenderState
 {
 	const u8 *ram;
 	const u8 *charROM;
 	const u8 *colourRAM;
+	u32 bankBase;
 	u32 screenBase;
 	u32 charsetBase;
-	u8 d011;
-	u8 d016;
-	u8 d018;
-	u8 border;
-	u8 background;
+	u32 bitmapBase;
+	// Last value written to each VIC-II register. Keeping the register file in
+	// the render snapshot makes graphics and sprite decoding self-contained and
+	// avoids dozens of independently-racing scalar reads on core 1.
+	u8 vic[ 0x40 ];
 };
 
 class CVICRenderer
@@ -47,13 +49,13 @@ public:
 	// Render one complete bordered frame into one-byte VIC colour indices.
 	// pitch is measured in bytes and must be at least VIC_RENDER_WIDTH.
 	VICRenderMode render( const VICRenderState &state, u8 *pixels,
-	                      u32 pitch, VICRenderAbortCheck abort = 0,
-	                      void *abortContext = 0 ) const;
+	                      u32 pitch ) const;
 
-private:
-	static bool fillRect( u8 *pixels, u32 pitch, u32 x, u32 y,
-	                     u32 width, u32 height, u8 colour,
-	                     VICRenderAbortCheck abort, void *abortContext );
+	// Render only the selected output scanlines. pixels points at storage for
+	// firstRow (not at the start of a full-frame image), so callers can reuse a
+	// small band buffer. The result is byte-for-byte identical to render().
+	VICRenderMode renderRows( const VICRenderState &state, u8 *pixels,
+	                          u32 pitch, u32 firstRow, u32 rowCount ) const;
 };
 
 #endif

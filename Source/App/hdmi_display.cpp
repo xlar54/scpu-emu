@@ -33,86 +33,63 @@ static inline u64 hdmiCounterFrequency()
 	return value ? value : 19200000;
 }
 
-static inline void hdmiPauseMicroseconds( u32 microseconds )
-{
-	const u64 end = hdmiCounter()
-	              + hdmiCounterFrequency() * microseconds / 1000000u;
-	while ( (s64)( hdmiCounter() - end ) < 0 ) asm volatile( "yield" );
-}
-
-// Hold the picture for three milliseconds after the last observed IEC event.
-// Repeated serial edges refresh this on core 1, so a transfer holds one still
-// frame and a dead protocol always releases the renderer on its own.
-static const u32 HDMI_SERIAL_QUIET_US = 3000;
-static const u32 HDMI_SOURCE_PIXELS_PER_CHUNK = 8;
-static const u32 HDMI_FRAMEBUFFER_BURST_BYTES = 16384;
-static const u32 HDMI_FRAMEBUFFER_PAUSE_US = 25;
-
 CHDMIDisplay::CHDMIDisplay( const CC64Memory &memory )
 	: m_Memory( memory ), m_FrameBuffer( 0 ), m_FramePixels( 0 ),
-	  m_FBWidth( 0 ), m_FBHeight( 0 ), m_FBPitchPixels( 0 ),
-	  m_Scale( 1 ), m_OriginX( 0 ), m_OriginY( 0 ),
-	  m_LastSerialAccess( 0 ), m_SerialBlockUntil( 0 ),
-	  m_SerialBusySkips( 0 ), m_SerialAborts( 0 ),
-	  m_Started( 0 ), m_FirstFrame( 0 )
+	  m_FBPitchBytes( 0 ),
+	  m_Started( 0 ), m_FirstFrame( 0 ), m_MaxBandTicks( 0 ),
+	  m_MissedBandDeadlines( 0 )
 {
-	memset( m_Palette, 0, sizeof m_Palette );
 	memset( m_Colours, 14, sizeof m_Colours );
-	memset( m_Pixels, 0, sizeof m_Pixels );
-	memset( m_Previous, 0xFF, sizeof m_Previous );
+	memset( m_BandPixels, 0, sizeof m_BandPixels );
 }
 
-bool CHDMIDisplay::initialize( CBcmFrameBuffer *frameBuffer, CLogger *logger )
+bool CHDMIDisplay::initialize( CLogger *logger )
 {
-	m_FrameBuffer = frameBuffer;
+	// Circle uses this same small indexed-framebuffer model for its Spectrum
+	// emulator. The VideoCore performs the final HDMI scaling; the ARM writes
+	// exactly one palette index for each VIC output pixel.
+	m_FrameBuffer = new CBcmFrameBuffer( VIC_RENDER_WIDTH,
+	                                     VIC_RENDER_HEIGHT, 8 );
 	if ( !m_FrameBuffer )
 	{
-		if ( logger ) logger->Write( "HDMI", LogError, "no console framebuffer" );
-		return false;
-	}
-	if ( m_FrameBuffer->GetDepth() != 16 )
-	{
 		if ( logger ) logger->Write( "HDMI", LogError,
-		                              "framebuffer is %u bpp; 16 required",
-		                              (unsigned)m_FrameBuffer->GetDepth() );
+		                              "cannot allocate indexed framebuffer" );
 		return false;
 	}
-
-	m_FramePixels = (u16 *)(uintptr)m_FrameBuffer->GetBuffer();
-	m_FBWidth = m_FrameBuffer->GetWidth();
-	m_FBHeight = m_FrameBuffer->GetHeight();
-	m_FBPitchPixels = m_FrameBuffer->GetPitch() / sizeof( u16 );
-	if ( !m_FramePixels || m_FBWidth < VIC_RENDER_WIDTH
-	     || m_FBHeight < VIC_RENDER_HEIGHT )
-	{
-		if ( logger ) logger->Write( "HDMI", LogError,
-		                              "framebuffer %ux%u is too small",
-		                              (unsigned)m_FBWidth, (unsigned)m_FBHeight );
-		m_FramePixels = 0;
-		return false;
-	}
-
-	const u32 sx = m_FBWidth / VIC_RENDER_WIDTH;
-	const u32 sy = m_FBHeight / VIC_RENDER_HEIGHT;
-	m_Scale = sx < sy ? sx : sy;
-	if ( m_Scale < 1 ) m_Scale = 1;
-	m_OriginX = ( m_FBWidth - VIC_RENDER_WIDTH * m_Scale ) / 2;
-	m_OriginY = ( m_FBHeight - VIC_RENDER_HEIGHT * m_Scale ) / 2;
 
 	for ( u32 i = 0; i < 16; i++ )
 	{
 		const u32 rgb = s_VICPalette[ i ];
-		// Circle's COLOR16 convention uses five-bit channels at 11, 6 and 0.
-		m_Palette[ i ] = (u16)( ( ( ( rgb >> 19 ) & 0x1F ) << 11 )
-		                         | ( ( ( rgb >> 11 ) & 0x1F ) << 6 )
-		                         | ( ( rgb >> 3 ) & 0x1F ) );
+		const u16 rgb565 = (u16)( ( ( ( rgb >> 19 ) & 0x1F ) << 11 )
+		                             | ( ( ( rgb >> 10 ) & 0x3F ) << 5 )
+		                             | ( ( rgb >> 3 ) & 0x1F ) );
+		m_FrameBuffer->SetPalette( (u8)i, rgb565 );
+	}
+
+	if ( !m_FrameBuffer->Initialize() )
+	{
+		if ( logger ) logger->Write( "HDMI", LogError,
+		                              "indexed framebuffer initialization failed" );
+		delete m_FrameBuffer;
+		m_FrameBuffer = 0;
+		return false;
+	}
+
+	m_FramePixels = (u8 *)(uintptr)m_FrameBuffer->GetBuffer();
+	m_FBPitchBytes = m_FrameBuffer->GetPitch();
+	if ( !m_FramePixels || m_FrameBuffer->GetDepth() != 8
+	     || m_FBPitchBytes < VIC_RENDER_WIDTH )
+	{
+		if ( logger ) logger->Write( "HDMI", LogError,
+		                              "indexed framebuffer has invalid layout" );
+		m_FramePixels = 0;
+		return false;
 	}
 
 	if ( logger ) logger->Write( "HDMI", LogNotice,
-	                            "VIC-II renderer armed: %ux%u at %ux in %ux%u",
+	                            "VIC-II renderer armed: %ux%u indexed, pitch=%u",
 	                            VIC_RENDER_WIDTH, VIC_RENDER_HEIGHT,
-	                            (unsigned)m_Scale,
-	                            (unsigned)m_FBWidth, (unsigned)m_FBHeight );
+	                            (unsigned)m_FBPitchBytes );
 	return true;
 }
 
@@ -120,42 +97,17 @@ bool CHDMIDisplay::start()
 {
 	if ( !m_FramePixels || __atomic_load_n( &m_Started, __ATOMIC_ACQUIRE ) )
 		return false;
-	m_LastSerialAccess = m_Memory.hdmiSerialAccessCount();
-	m_SerialBlockUntil = 0;
 	__atomic_store_n( &m_Started, 1, __ATOMIC_RELEASE );
 	radSetCore1Task( core1Entry, this );
 	return true;
 }
 
-bool CHDMIDisplay::serialBlocked()
-{
-	const u32 nowAccess = m_Memory.hdmiSerialAccessCount();
-	const u64 now = hdmiCounter();
-	if ( nowAccess != m_LastSerialAccess )
-	{
-		m_LastSerialAccess = nowAccess;
-		m_SerialBlockUntil = now
-		                   + hdmiCounterFrequency() * HDMI_SERIAL_QUIET_US
-		                     / 1000000u;
-	}
-	return (s64)( now - m_SerialBlockUntil ) < 0;
-}
-
-bool CHDMIDisplay::serialAbortCheck( void *context )
-{
-	const CHDMIDisplay *display = (const CHDMIDisplay *)context;
-	return display && display->serialBlocked();
-}
-
 void CHDMIDisplay::fillFrameBuffer( u8 colour )
 {
 	if ( !m_FramePixels ) return;
-	const u16 pixel = m_Palette[ colour & 0x0F ];
-	for ( u32 y = 0; y < m_FBHeight; y++ )
-	{
-		u16 *dst = m_FramePixels + y * m_FBPitchPixels;
-		for ( u32 x = 0; x < m_FBWidth; x++ ) dst[ x ] = pixel;
-	}
+	for ( u32 y = 0; y < VIC_RENDER_HEIGHT; y++ )
+		memset( m_FramePixels + y * m_FBPitchBytes,
+		        colour & 0x0F, VIC_RENDER_WIDTH );
 }
 
 void CHDMIDisplay::showReady()
@@ -173,6 +125,17 @@ bool CHDMIDisplay::firstFrameReady() const
 	return __atomic_load_n( &m_FirstFrame, __ATOMIC_ACQUIRE ) != 0;
 }
 
+u32 CHDMIDisplay::maxBandUS() const
+{
+	const u64 ticks = __atomic_load_n( &m_MaxBandTicks, __ATOMIC_ACQUIRE );
+	return (u32)( ticks * 1000000ull / hdmiCounterFrequency() );
+}
+
+u32 CHDMIDisplay::missedBandDeadlines() const
+{
+	return __atomic_load_n( &m_MissedBandDeadlines, __ATOMIC_ACQUIRE );
+}
+
 void CHDMIDisplay::core1Entry( void *context )
 {
 	CHDMIDisplay *display = (CHDMIDisplay *)context;
@@ -185,102 +148,74 @@ void CHDMIDisplay::run()
 	const u64 frameTicks = hdmiCounterFrequency() / 60;
 	for ( ;; )
 	{
-		const u64 next = hdmiCounter() + frameTicks;
-		renderFrame();
-		// A passive renderer must yield memory bandwidth too, not merely avoid
-		// the physical bus. This counter is per-system and needs no core setup.
-		while ( (s64)( hdmiCounter() - next ) < 0 ) asm volatile( "yield" );
+		const u64 frameStart = hdmiCounter();
+		renderFrame( frameStart, frameTicks );
 	}
 }
 
-void CHDMIDisplay::renderFrame()
+void CHDMIDisplay::renderFrame( u64 frameStart, u64 frameTicks )
 {
-	if ( serialBlocked() )
-	{
-		m_SerialBusySkips++;
-		return;
-	}
-
 	// Colour RAM is cached in the v2 bank-1 SRAM shadow, not bank-0 $D800.
 	for ( u32 i = 0; i < 1024; i++ )
-	{
-		if ( ( i & 63 ) == 0 && serialBlocked() )
-		{
-			m_SerialAborts++;
-			return;
-		}
 		m_Colours[ i ] = m_Memory.colourRAM( i );
-	}
 
 	VICRenderState state;
+	memset( &state, 0, sizeof state );
 	state.ram = m_Memory.ramShadow();
 	state.charROM = m_Memory.charROMShadow();
 	state.colourRAM = m_Colours;
-	state.screenBase = m_Memory.activeScreenBase();
+	state.bankBase = m_Memory.activeVICBankBase();
+	state.screenBase = m_Memory.activeVICScreenBase();
 	state.charsetBase = m_Memory.activeCharsetBase();
-	state.d011 = m_Memory.vicRegister( 0x11 );
-	state.d016 = m_Memory.vicRegister( 0x16 );
-	state.d018 = m_Memory.vicRegister( 0x18 );
-	state.border = m_Memory.vicRegister( 0x20 );
-	state.background = m_Memory.vicRegister( 0x21 );
-	if ( m_Renderer.render( state, m_Pixels, VIC_RENDER_WIDTH,
-	                       serialAbortCheck, this ) == VIC_RENDER_ABORTED )
+	state.bitmapBase = m_Memory.activeBitmapBase();
+	for ( u32 i = 0; i < sizeof state.vic; i++ )
+		state.vic[ i ] = m_Memory.vicRegister( (u8)i );
+
+	// Work one line at a time and distribute the writes uniformly through the
+	// frame. Besides lowering the instantaneous memory-system pressure, the
+	// 384-byte reusable buffer stays in L1 instead of dirtying a 104KB shared
+	// full-frame scratch image on every pass.
+	for ( u32 first = 0; first < VIC_RENDER_HEIGHT;
+	      first += HDMI_RENDER_BAND_ROWS )
 	{
-		m_SerialAborts++;
-		return;
-	}
-	if ( !presentChangedRows() )
-	{
-		m_SerialAborts++;
-		return;
+		const u32 rows = first + HDMI_RENDER_BAND_ROWS <= VIC_RENDER_HEIGHT
+		               ? HDMI_RENDER_BAND_ROWS : VIC_RENDER_HEIGHT - first;
+		const u64 bandStart = hdmiCounter();
+		m_Renderer.renderRows( state, m_BandPixels, VIC_RENDER_WIDTH, first, rows );
+		presentRows( m_BandPixels, first, rows );
+		const u64 bandEnd = hdmiCounter();
+		const u64 elapsed = bandEnd - bandStart;
+		u64 previousMax = __atomic_load_n( &m_MaxBandTicks, __ATOMIC_RELAXED );
+		while ( elapsed > previousMax
+		        && !__atomic_compare_exchange_n( &m_MaxBandTicks, &previousMax,
+		                                         elapsed, false,
+		                                         __ATOMIC_RELAXED,
+		                                         __ATOMIC_RELAXED ) ) {}
+
+		const u64 target = frameStart
+		                 + frameTicks * ( first + rows ) / VIC_RENDER_HEIGHT;
+		if ( (s64)( bandEnd - target ) >= 0 )
+			__atomic_add_fetch( &m_MissedBandDeadlines, 1, __ATOMIC_RELAXED );
+		else
+			while ( (s64)( hdmiCounter() - target ) < 0 ) asm volatile( "yield" );
 	}
 	__atomic_store_n( &m_FirstFrame, 1, __ATOMIC_RELEASE );
 }
 
-bool CHDMIDisplay::presentChangedRows()
+void CHDMIDisplay::presentRows( const u8 *source, u32 firstRow, u32 rowCount )
 {
-	u32 bytesSincePause = 0;
-	for ( u32 y = 0; y < VIC_RENDER_HEIGHT; y++ )
+	// At the normal 384-byte pitch each band is one wide copy. Keep the row
+	// fallback for firmware that pads an 8bpp scanline beyond its alignment.
+	if ( m_FBPitchBytes == VIC_RENDER_WIDTH )
 	{
-		if ( serialBlocked() ) return false;
-		const u8 *src = m_Pixels + y * VIC_RENDER_WIDTH;
-		u8 *old = m_Previous + y * VIC_RENDER_WIDTH;
-		if ( memcmp( src, old, VIC_RENDER_WIDTH ) == 0 ) continue;
-
-		for ( u32 repeatY = 0; repeatY < m_Scale; repeatY++ )
-		{
-			u16 *row = m_FramePixels
-			         + ( m_OriginY + y * m_Scale + repeatY ) * m_FBPitchPixels
-			         + m_OriginX;
-			for ( u32 first = 0; first < VIC_RENDER_WIDTH;
-			      first += HDMI_SOURCE_PIXELS_PER_CHUNK )
-			{
-				if ( serialBlocked() ) return false;
-				const u32 stop = first + HDMI_SOURCE_PIXELS_PER_CHUNK
-				               < VIC_RENDER_WIDTH
-				               ? first + HDMI_SOURCE_PIXELS_PER_CHUNK
-				               : VIC_RENDER_WIDTH;
-				u16 *dst = row + first * m_Scale;
-				for ( u32 x = first; x < stop; x++ )
-				{
-					const u16 colour = m_Palette[ src[ x ] & 0x0F ];
-					for ( u32 repeatX = 0; repeatX < m_Scale; repeatX++ )
-						*dst++ = colour;
-				}
-				bytesSincePause += ( stop - first ) * m_Scale * sizeof( u16 );
-				if ( serialBlocked() ) return false;
-				if ( bytesSincePause >= HDMI_FRAMEBUFFER_BURST_BYTES )
-				{
-					bytesSincePause = 0;
-					hdmiPauseMicroseconds( HDMI_FRAMEBUFFER_PAUSE_US );
-					if ( serialBlocked() ) return false;
-				}
-			}
-		}
-		// Commit the change record only after every scaled copy of the source
-		// row reached the framebuffer. An interrupted row therefore retries in
-		// full on the next measured-quiet frame.
-		memcpy( old, src, VIC_RENDER_WIDTH );
+		memcpy( m_FramePixels + firstRow * VIC_RENDER_WIDTH,
+		        source,
+		        rowCount * VIC_RENDER_WIDTH );
+		return;
 	}
-	return !serialBlocked();
+
+	for ( u32 y = firstRow; y < firstRow + rowCount; y++ )
+		memcpy( m_FramePixels + y * m_FBPitchBytes,
+		        source + ( y - firstRow ) * VIC_RENDER_WIDTH,
+		        VIC_RENDER_WIDTH );
 }

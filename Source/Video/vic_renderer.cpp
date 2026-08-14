@@ -3,81 +3,351 @@
 */
 #include "vic_renderer.h"
 
-bool CVICRenderer::fillRect( u8 *pixels, u32 pitch, u32 x, u32 y,
-	                         u32 width, u32 height, u8 colour,
-	                         VICRenderAbortCheck abort, void *abortContext )
+#include <string.h>
+
+struct VICRenderContext
 {
-	for ( u32 row = 0; row < height; row++ )
+	VICRenderMode mode;
+	const u8 *patterns;
+	u32 patternBase;
+	u8 background[ 4 ];
+};
+
+static inline u8 vicColour( const VICRenderState &state, u32 reg )
+{
+	return state.vic[ reg & 0x3F ] & 0x0F;
+}
+
+static VICRenderContext makeContext( const VICRenderState &state )
+{
+	VICRenderContext context;
+	context.mode = VIC_RENDER_UNSUPPORTED;
+	context.patterns = 0;
+	context.patternBase = 0;
+	for ( u32 i = 0; i < 4; i++ )
+		context.background[ i ] = vicColour( state, 0x21 + i );
+
+	if ( !( state.vic[ 0x11 ] & 0x10 ) )
 	{
-		if ( abort && abort( abortContext ) ) return false;
-		u8 *dst = pixels + ( y + row ) * pitch + x;
-		for ( u32 col = 0; col < width; col++ ) dst[ col ] = colour;
+		context.mode = VIC_RENDER_BLANK;
+		return context;
 	}
+
+	const bool ecm = ( state.vic[ 0x11 ] & 0x40 ) != 0;
+	const bool bmm = ( state.vic[ 0x11 ] & 0x20 ) != 0;
+	const bool mcm = ( state.vic[ 0x16 ] & 0x10 ) != 0;
+	if ( !ecm && !bmm )
+		context.mode = mcm ? VIC_RENDER_MULTICOLOR_TEXT
+		                   : VIC_RENDER_STANDARD_TEXT;
+	else if ( ecm && !bmm && !mcm )
+		context.mode = VIC_RENDER_EXTENDED_TEXT;
+	else if ( !ecm && bmm )
+		context.mode = mcm ? VIC_RENDER_MULTICOLOR_BITMAP
+		                   : VIC_RENDER_STANDARD_BITMAP;
+
+	if ( !state.ram || state.screenBase >= 0x10000 )
+	{
+		context.mode = VIC_RENDER_UNSUPPORTED;
+		return context;
+	}
+
+	if ( context.mode == VIC_RENDER_STANDARD_TEXT
+	     || context.mode == VIC_RENDER_MULTICOLOR_TEXT
+	     || context.mode == VIC_RENDER_EXTENDED_TEXT )
+	{
+		if ( state.charsetBase == 0xFFFFFFFF )
+		{
+			context.patterns = state.charROM;
+			context.patternBase = ( state.vic[ 0x18 ] & 0x02 ) ? 0x0800 : 0;
+		}
+		else if ( state.charsetBase < 0x10000 )
+		{
+			context.patterns = state.ram;
+			context.patternBase = state.charsetBase;
+		}
+		if ( !context.patterns ) context.mode = VIC_RENDER_UNSUPPORTED;
+	}
+	else if ( ( context.mode == VIC_RENDER_STANDARD_BITMAP
+	           || context.mode == VIC_RENDER_MULTICOLOR_BITMAP )
+	          && state.bitmapBase >= 0x10000 )
+		context.mode = VIC_RENDER_UNSUPPORTED;
+
+	return context;
+}
+
+// Decode one complete character-cell scanline. The former per-pixel decoder
+// fetched the same screen, colour and pattern bytes eight times and made an
+// out-of-line call for every visible pixel. Cell decoding keeps those values
+// live in registers and reduces the hot-loop call count by eight.
+static inline void decodeGraphicsCell( const VICRenderState &state,
+	                                   const VICRenderContext &context,
+	                                   u32 cell, u32 glyphLine,
+	                                   u8 pixels[ 8 ], u8 &opaqueMask )
+{
+	const u8 screen = state.ram[ (u16)( state.screenBase + cell ) ];
+	const u8 cellColour = state.colourRAM
+	                    ? state.colourRAM[ cell & 0x03FF ] & 0x0F : 14;
+	opaqueMask = 0;
+	switch ( context.mode )
+	{
+	case VIC_RENDER_STANDARD_TEXT:
+	{
+		const u8 bits = context.patterns[ (u16)( context.patternBase
+		                                           + (u32)screen * 8
+		                                           + glyphLine ) ];
+		opaqueMask = bits;
+		for ( u32 pixel = 0; pixel < 8; pixel++ )
+			pixels[ pixel ] = bits & ( 0x80 >> pixel )
+			                ? cellColour : context.background[ 0 ];
+		break;
+	}
+
+	case VIC_RENDER_MULTICOLOR_TEXT:
+	{
+		const u8 bits = context.patterns[ (u16)( context.patternBase
+		                                           + (u32)screen * 8
+		                                           + glyphLine ) ];
+		if ( !( cellColour & 0x08 ) )
+		{
+			opaqueMask = bits;
+			for ( u32 pixel = 0; pixel < 8; pixel++ )
+				pixels[ pixel ] = bits & ( 0x80 >> pixel )
+				                ? cellColour & 0x07 : context.background[ 0 ];
+		}
+		else
+		{
+			for ( u32 pair = 0; pair < 4; pair++ )
+			{
+				const u8 value = (u8)( bits >> ( 6 - pair * 2 ) ) & 3;
+				const u8 colour = value == 0 ? context.background[ 0 ]
+				                : value == 1 ? context.background[ 1 ]
+				                : value == 2 ? context.background[ 2 ]
+				                             : cellColour & 0x07;
+				pixels[ pair * 2 ] = pixels[ pair * 2 + 1 ] = colour;
+				if ( value ) opaqueMask |= (u8)( 0xC0 >> ( pair * 2 ) );
+			}
+		}
+		break;
+	}
+
+	case VIC_RENDER_EXTENDED_TEXT:
+	{
+		const u8 code = screen & 0x3F;
+		const u8 bits = context.patterns[ (u16)( context.patternBase
+		                                           + (u32)code * 8
+		                                           + glyphLine ) ];
+		opaqueMask = bits;
+		const u8 background = context.background[ screen >> 6 ];
+		for ( u32 pixel = 0; pixel < 8; pixel++ )
+			pixels[ pixel ] = bits & ( 0x80 >> pixel )
+			                ? cellColour : background;
+		break;
+	}
+
+	case VIC_RENDER_STANDARD_BITMAP:
+	{
+		const u8 bits = state.ram[ (u16)( state.bitmapBase + cell * 8
+		                                      + glyphLine ) ];
+		opaqueMask = bits;
+		for ( u32 pixel = 0; pixel < 8; pixel++ )
+			pixels[ pixel ] = bits & ( 0x80 >> pixel )
+			                ? screen >> 4 : screen & 0x0F;
+		break;
+	}
+
+	case VIC_RENDER_MULTICOLOR_BITMAP:
+	{
+		const u8 bits = state.ram[ (u16)( state.bitmapBase + cell * 8
+		                                      + glyphLine ) ];
+		for ( u32 pair = 0; pair < 4; pair++ )
+		{
+			const u8 value = (u8)( bits >> ( 6 - pair * 2 ) ) & 3;
+			const u8 colour = value == 0 ? context.background[ 0 ]
+			                : value == 1 ? screen >> 4
+			                : value == 2 ? screen & 0x0F
+			                             : cellColour;
+			pixels[ pair * 2 ] = pixels[ pair * 2 + 1 ] = colour;
+			if ( value ) opaqueMask |= (u8)( 0xC0 >> ( pair * 2 ) );
+		}
+		break;
+	}
+
+	default:
+		memset( pixels, context.background[ 0 ], 8 );
+		break;
+	}
+}
+
+static inline bool outputToSource( const VICRenderState &state,
+	                               u32 x, u32 y, u32 activeLeft,
+	                               u32 activeRight, u32 activeTop,
+	                               u32 activeBottom, u32 &sourceX,
+	                               u32 &sourceY )
+{
+	if ( x < activeLeft || x >= activeRight || y < activeTop || y >= activeBottom )
+		return false;
+	const int originX = VIC_RENDER_DISPLAY_X + ( state.vic[ 0x16 ] & 7 );
+	// $1B is the KERNAL's neutral 25-row value; changing YSCROLL moves the
+	// matrix relative to that position while RSEL controls the border aperture.
+	const int originY = VIC_RENDER_DISPLAY_Y
+	                  + (int)( state.vic[ 0x11 ] & 7 ) - 3;
+	const int sx = (int)x - originX;
+	const int sy = (int)y - originY;
+	if ( sx < 0 || sx >= VIC_RENDER_DISPLAY_W
+	     || sy < 0 || sy >= VIC_RENDER_DISPLAY_H )
+		return false;
+	sourceX = (u32)sx;
+	sourceY = (u32)sy;
 	return true;
 }
 
-VICRenderMode CVICRenderer::render( const VICRenderState &state, u8 *pixels,
-	                                u32 pitch, VICRenderAbortCheck abort,
-	                                void *abortContext ) const
+static void renderSpritesOnRow( const VICRenderState &state,
+	                            const VICRenderContext &context, u8 *dst,
+	                            u32 y, u32 activeLeft, u32 activeRight,
+	                            u32 activeTop, u32 activeBottom,
+	                            const u8 opaqueCells[ 40 ] )
 {
-	if ( !pixels || pitch < VIC_RENDER_WIDTH ) return VIC_RENDER_BLANK;
+	const u8 enabled = state.vic[ 0x15 ];
+	if ( !enabled || !state.ram || state.screenBase >= 0x10000
+	     || y < activeTop || y >= activeBottom )
+		return;
 
-	const u8 border = state.border & 0x0F;
-	const u8 background = state.background & 0x0F;
-	if ( !fillRect( pixels, pitch, 0, 0,
-	                VIC_RENDER_WIDTH, VIC_RENDER_HEIGHT, border,
-	                abort, abortContext ) )
-		return VIC_RENDER_ABORTED;
-
-	// DEN clear leaves only the border colour visible.
-	if ( !( state.d011 & 0x10 ) ) return VIC_RENDER_BLANK;
-
-	if ( !fillRect( pixels, pitch, VIC_RENDER_DISPLAY_X, VIC_RENDER_DISPLAY_Y,
-	                VIC_RENDER_DISPLAY_W, VIC_RENDER_DISPLAY_H, background,
-	                abort, abortContext ) )
-		return VIC_RENDER_ABORTED;
-
-	// Stage one is intentionally honest: do not draw bitmap, ECM or
-	// multicolour data using the standard-text rules.
-	if ( ( state.d011 & 0x60 ) || ( state.d016 & 0x10 )
-	     || !state.ram || state.screenBase == 0xFFFFFFFF )
-		return VIC_RENDER_UNSUPPORTED;
-
-	const u8 *patterns = 0;
-	u32 patternBase = 0;
-	if ( state.charsetBase == 0xFFFFFFFF )
+	// Sprite zero has the highest sprite-to-sprite priority, so composite from
+	// seven down to zero and let the lower-numbered sprite win.
+	for ( int n = 7; n >= 0; n-- )
 	{
-		patterns = state.charROM;
-		if ( patterns ) patternBase = ( state.d018 & 0x02 ) ? 0x0800 : 0;
-	}
-	else
-	{
-		patterns = state.ram;
-		patternBase = state.charsetBase;
-	}
-	if ( !patterns ) return VIC_RENDER_UNSUPPORTED;
+		const u8 mask = (u8)( 1u << n );
+		if ( !( enabled & mask ) ) continue;
+		const bool expandY = ( state.vic[ 0x17 ] & mask ) != 0;
+		const bool expandX = ( state.vic[ 0x1D ] & mask ) != 0;
+		const bool multicolor = ( state.vic[ 0x1C ] & mask ) != 0;
+		const bool behind = ( state.vic[ 0x1B ] & mask ) != 0;
+		const int top = (int)state.vic[ n * 2 + 1 ] - 14;
+		const int outputLine = (int)y - top;
+		const int outputHeight = expandY ? 42 : 21;
+		if ( outputLine < 0 || outputLine >= outputHeight ) continue;
+		const u32 spriteLine = (u32)( expandY ? outputLine >> 1 : outputLine );
 
-	for ( u32 row = 0; row < 25; row++ )
-	{
-		if ( abort && abort( abortContext ) ) return VIC_RENDER_ABORTED;
-		for ( u32 col = 0; col < 40; col++ )
+		u32 spriteX = state.vic[ n * 2 ];
+		if ( state.vic[ 0x10 ] & mask ) spriteX += 256;
+		const int left = (int)spriteX + 8;
+		const u32 pointerAddr = state.screenBase + 0x3F8 + (u32)n;
+		const u8 pointer = state.ram[ (u16)pointerAddr ];
+		const u32 shape = state.bankBase + (u32)pointer * 64 + spriteLine * 3;
+		const u32 bits = ( (u32)state.ram[ (u16)shape ] << 16 )
+		               | ( (u32)state.ram[ (u16)( shape + 1 ) ] << 8 )
+		               | state.ram[ (u16)( shape + 2 ) ];
+		const u32 outputWidth = expandX ? 48 : 24;
+		for ( u32 outputPixel = 0; outputPixel < outputWidth; outputPixel++ )
 		{
-			const u32 cell = row * 40 + col;
-			const u8 code = state.ram[ (u16)( state.screenBase + cell ) ];
-			const u8 foreground = state.colourRAM
-			                    ? state.colourRAM[ cell & 0x03FF ] & 0x0F : 14;
-			const u32 glyph = patternBase + (u32)code * 8;
-			for ( u32 line = 0; line < 8; line++ )
+			const int xSigned = left + (int)outputPixel;
+			if ( xSigned < (int)activeLeft || xSigned >= (int)activeRight ) continue;
+			const u32 x = (u32)xSigned;
+			const u32 sourcePixel = expandX ? outputPixel >> 1 : outputPixel;
+			u8 value;
+			u8 colour;
+			if ( multicolor )
 			{
-				const u8 bits = patterns[ (u16)( glyph + line ) ];
-				u8 *dst = pixels
-				        + ( VIC_RENDER_DISPLAY_Y + row * 8 + line ) * pitch
-				        + VIC_RENDER_DISPLAY_X + col * 8;
-				for ( u32 bit = 0; bit < 8; bit++ )
-					dst[ bit ] = ( bits & ( 0x80 >> bit ) )
-					           ? foreground : background;
+				value = (u8)( bits >> ( 22 - ( ( sourcePixel >> 1 ) * 2 ) ) ) & 3;
+				if ( !value ) continue;
+				colour = value == 1 ? vicColour( state, 0x25 )
+				       : value == 2 ? vicColour( state, 0x27 + (u32)n )
+				                    : vicColour( state, 0x26 );
 			}
+			else
+			{
+				value = ( bits & ( 1u << ( 23 - sourcePixel ) ) ) ? 1 : 0;
+				if ( !value ) continue;
+				colour = vicColour( state, 0x27 + (u32)n );
+			}
+
+			if ( behind && context.mode != VIC_RENDER_UNSUPPORTED )
+			{
+				u32 sourceX, sourceY;
+				if ( outputToSource( state, x, y, activeLeft, activeRight,
+				                     activeTop, activeBottom, sourceX, sourceY ) )
+				{
+					if ( opaqueCells[ sourceX >> 3 ]
+					     & ( 0x80 >> ( sourceX & 7 ) ) ) continue;
+				}
+			}
+			dst[ x ] = colour;
 		}
 	}
-	return VIC_RENDER_TEXT;
+}
+
+VICRenderMode CVICRenderer::render( const VICRenderState &state, u8 *pixels,
+	                                u32 pitch ) const
+{
+	return renderRows( state, pixels, pitch, 0, VIC_RENDER_HEIGHT );
+}
+
+VICRenderMode CVICRenderer::renderRows( const VICRenderState &state,
+	                                    u8 *pixels, u32 pitch,
+	                                    u32 firstRow, u32 rowCount ) const
+{
+	if ( !pixels || pitch < VIC_RENDER_WIDTH ) return VIC_RENDER_BLANK;
+	if ( firstRow >= VIC_RENDER_HEIGHT ) rowCount = 0;
+	else if ( rowCount > VIC_RENDER_HEIGHT - firstRow )
+		rowCount = VIC_RENDER_HEIGHT - firstRow;
+
+	const VICRenderContext context = makeContext( state );
+	const u8 border = vicColour( state, 0x20 );
+	const u8 background = vicColour( state, 0x21 );
+	const bool displayEnabled = context.mode != VIC_RENDER_BLANK;
+	const bool columns40 = ( state.vic[ 0x16 ] & 0x08 ) != 0;
+	const bool rows25 = ( state.vic[ 0x11 ] & 0x08 ) != 0;
+	const u32 activeLeft = VIC_RENDER_DISPLAY_X + ( columns40 ? 0 : 8 );
+	const u32 activeRight = VIC_RENDER_DISPLAY_X + VIC_RENDER_DISPLAY_W
+	                      - ( columns40 ? 0 : 8 );
+	const u32 activeTop = VIC_RENDER_DISPLAY_Y + ( rows25 ? 0 : 4 );
+	const u32 activeBottom = VIC_RENDER_DISPLAY_Y + VIC_RENDER_DISPLAY_H
+	                       - ( rows25 ? 0 : 4 );
+
+	const u32 endRow = firstRow + rowCount;
+	for ( u32 y = firstRow; y < endRow; y++ )
+	{
+		u8 *dst = pixels + ( y - firstRow ) * pitch;
+		if ( !displayEnabled || y < activeTop || y >= activeBottom )
+		{
+			memset( dst, border, VIC_RENDER_WIDTH );
+			continue;
+		}
+
+		memset( dst, border, activeLeft );
+		memset( dst + activeRight, border, VIC_RENDER_WIDTH - activeRight );
+		memset( dst + activeLeft, background, activeRight - activeLeft );
+
+		u8 opaqueCells[ 40 ];
+		memset( opaqueCells, 0, sizeof opaqueCells );
+		const int originX = VIC_RENDER_DISPLAY_X + ( state.vic[ 0x16 ] & 7 );
+		const int originY = VIC_RENDER_DISPLAY_Y
+		                  + (int)( state.vic[ 0x11 ] & 7 ) - 3;
+		const int sourceY = (int)y - originY;
+		if ( context.mode != VIC_RENDER_UNSUPPORTED
+		     && sourceY >= 0 && sourceY < VIC_RENDER_DISPLAY_H )
+		{
+			const u32 cellRow = (u32)sourceY >> 3;
+			const u32 glyphLine = (u32)sourceY & 7;
+			for ( u32 col = 0; col < 40; col++ )
+			{
+				u8 cellPixels[ 8 ];
+				decodeGraphicsCell( state, context, cellRow * 40 + col,
+				                    glyphLine, cellPixels, opaqueCells[ col ] );
+				const int cellLeft = originX + (int)col * 8;
+				const int copyLeft = cellLeft < (int)activeLeft
+				                   ? (int)activeLeft : cellLeft;
+				const int cellRight = cellLeft + 8;
+				const int copyRight = cellRight > (int)activeRight
+				                    ? (int)activeRight : cellRight;
+				if ( copyLeft < copyRight )
+					memcpy( dst + copyLeft, cellPixels + copyLeft - cellLeft,
+					        (u32)( copyRight - copyLeft ) );
+			}
+		}
+		renderSpritesOnRow( state, context, dst, y, activeLeft, activeRight,
+		                    activeTop, activeBottom, opaqueCells );
+	}
+
+	return context.mode;
 }

@@ -38,7 +38,9 @@ static u64 armCycleCounter;
 #include "../../SuperCPU/write_buffer.h"
 
 CRADBus::CRADBus()
-	: m_Reads( 0 ), m_Writes( 0 ), m_BurstWrites( 0 ), m_Acquired( false ),
+	: m_Reads( 0 ), m_Writes( 0 ), m_BurstWrites( 0 ),
+	  m_LastTransferCycles( 0 ), m_Transfers( 0 ), m_SerialTransfers( 0 ),
+	  m_ReadPrimes( 0 ), m_Acquired( false ),
 	  m_TrafficHalted( false ),
 	  m_SelfTestFailure( 0 ),
 	  m_ReadTimingConfigured( 0 ), m_ReadTimingStart( 0 ), m_ReadTimingEnd( 0 ),
@@ -6468,6 +6470,14 @@ u32 CRADBus::formatSelfTestResults( char *dst, u32 capacity ) const
 	busDiagDecimal( dst, capacity, n, m_SelfTestFailure );
 	busDiagEndLine( dst, capacity, n );
 	busDiagText( dst, capacity, n,
+	             "runtime transfers/IEC-line-transfers/idle-primes: " );
+	busDiagDecimal( dst, capacity, n, (u32)m_Transfers );
+	busDiagChar( dst, capacity, n, '/' );
+	busDiagDecimal( dst, capacity, n, (u32)m_SerialTransfers );
+	busDiagChar( dst, capacity, n, '/' );
+	busDiagDecimal( dst, capacity, n, (u32)m_ReadPrimes );
+	busDiagEndLine( dst, capacity, n );
+	busDiagText( dst, capacity, n,
 	             "read-eye configured/selected/stable-start/stable-end/best-sample/best-errors: " );
 	busDiagDecimal( dst, capacity, n, m_ReadTimingConfigured );
 	busDiagChar( dst, capacity, n, '/' );
@@ -8011,6 +8021,45 @@ void CRADBus::signalAlive()
 	m_Writes += 24;
 }
 
+// The first transfer of a run is not trustworthy. Every diagnostic in this
+// file already assumes it -- sacrificial writes before a marker, discarded
+// first reads before a target -- but CRADBus::read() never needed the same
+// care, because the write buffer kept the bus continuously busy and a read was
+// effectively never first in its run.
+//
+// VIDEO_MODE 1 removed that traffic. With no DRAM mirroring the bus can sit
+// idle for milliseconds between one keyboard scan and the next, so every CIA
+// read became a cold first transfer, and a garbage keyboard matrix reads as
+// keys being held down -- symbols typing themselves across the screen.
+//
+// So a read that follows an idle gap is primed with a throwaway transfer first.
+// $02FE is the tail of the cassette buffer: RAM on every machine and unused
+// while we hold the bus. It is the same address the calibration path primes
+// with, for the same reason.
+//
+// The gap threshold matters, and 10us -- the first value shipped -- was a bug:
+// it sits exactly on JiffyDOS's own rhythm. A JiffyDOS byte is timed reads
+// spaced roughly 10-15us apart, so at a 10us threshold the prime fired randomly
+// between bit reads, inserting a bus transaction that shifted the next sample
+// late. 150us is above anything inside an active transfer and far below the
+// interval between keyboard scans.
+void CRADBus::primeAfterIdle()
+{
+	const u64 now  = hostCycles();
+	const u64 rate = hostCyclesPerSec();
+	const u64 idle = rate ? ( rate * 150 / 1000000 ) : 0;	// 150us
+
+	if ( idle && ( now - m_LastTransferCycles ) >= idle )
+	{
+		u8 discard;
+		RAD_SPEEK( 0x02FE, discard );
+		(void)discard;
+		m_ReadPrimes++;
+		m_Transfers++;
+	}
+	m_LastTransferCycles = now;
+}
+
 u8 CRADBus::read( u16 addr )
 {
 	if ( m_TrafficHalted ) return 0xFF;
@@ -8021,7 +8070,14 @@ u8 CRADBus::read( u16 addr )
 	else if ( !m_SIDPhysicalReliable && ( addr == 0xD419 || addr == 0xD41A ) )
 		v = sidReadPOTFiltered( addr );
 	else
+	{
+		// Do not reread the target itself: $DC0D and $DD0D clear interrupt
+		// flags when read.  Prime through harmless RAM instead.
+		primeAfterIdle();
 		RAD_SPEEK( addr, v );
+		m_Transfers++;
+		if ( addr == 0xDD00 || addr == 0xDD02 ) m_SerialTransfers++;
+	}
 	m_Reads++;
 	return v;
 }
@@ -8031,7 +8087,24 @@ void CRADBus::write( u16 addr, u8 value )
 	if ( m_TrafficHalted ) return;
 
 	sidObserveWrite( addr, value );
+	// Writes require a same-polarity prime.  A read prime here creates the
+	// read-to-write turnaround which previously lost interrupt acknowledges
+	// ($DC0D/$D019) and IEC handshakes ($DD00).
+	{
+		const u64 nowW  = hostCycles();
+		const u64 rateW = hostCyclesPerSec();
+		const u64 idleW = rateW ? ( rateW * 150 / 1000000 ) : 0;
+		if ( idleW && ( nowW - m_LastTransferCycles ) >= idleW )
+		{
+			RAD_SPOKE( 0x02FE, 0xA6 );
+			m_Transfers++;
+			m_ReadPrimes++;
+		}
+	}
 	RAD_SPOKE( addr, value );
+	m_LastTransferCycles = hostCycles();
+	m_Transfers++;
+	if ( addr == 0xDD00 || addr == 0xDD02 ) m_SerialTransfers++;
 	m_Writes++;
 }
 
@@ -8056,6 +8129,8 @@ void CRADBus::writeBurst( const C64BusWrite *writes, u32 count )
 		for ( u32 i = 0; i < count; i++ )
 			RAD_SPOKE( writes[ i ].addr, writes[ i ].value );
 		m_BurstWrites += count;
+		m_LastTransferCycles = hostCycles();
+		m_Transfers += count;
 		return;
 	}
 	u32 offset = 0;
@@ -8090,6 +8165,8 @@ void CRADBus::writeBurst( const C64BusWrite *writes, u32 count )
 	}
 
 	m_BurstWrites += count;
+	m_LastTransferCycles = hostCycles();
+	m_Transfers += count;
 }
 
 void CRADBus::readBlock( u16 addr, u8 *dst, u32 length )
@@ -8177,6 +8254,9 @@ u16 CRADBus::rasterLine()
 	// notably $1FF). Bracket the low byte with two high-bit reads and accept the
 	// sample only when both sides agree. The range check is a second line of
 	// defence and also keeps a bad bus read out of the transfer scheduler.
+	// Raster polling is real bus traffic, so it must both receive the cold-read
+	// protection and warm the idle-transfer clock for the next caller.
+	primeAfterIdle();
 	for ( u32 attempt = 0; attempt < 4; attempt++ )
 	{
 		u8 hiBefore = 0, lo = 0, hiAfter = 0;
@@ -8185,6 +8265,8 @@ u16 CRADBus::rasterLine()
 		RAD_SPEEK( 0xD012, lo );
 		RAD_SPEEK( 0xD011, hiAfter );
 		m_Reads += 3;
+		m_Transfers += 3;
+		m_LastTransferCycles = hostCycles();
 
 		if ( ( ( hiBefore ^ hiAfter ) & 0x80 ) != 0 )
 			continue;

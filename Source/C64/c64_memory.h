@@ -666,6 +666,10 @@ public:
 	// Setting a rate of 0 disables pacing, which is what the host tests want.
 	void setPacing( u64 hostCyclesPerSecond, u32 emulatedHz );
 	void resyncPacing();
+	// Replace the background bus activity lost when HDMI becomes the exclusive
+	// display and physical DRAM mirroring is detached. This is intentionally a
+	// separate policy switch: VIDEO_MODE 0 must never pay for it.
+	void enableBusKeepalive( bool on ) { m_BusKeepalive = on; }
 
 	// --- automatic 1MHz for serial bus activity ---------------------------
 	// The KERNAL's IEC routines count cycles to time the bits they bang out on
@@ -701,21 +705,6 @@ public:
 	// raster polling: the slow protocol assigns meaning to pauses, so the CPU
 	// must not be stalled mid-transaction whatever the pacing mode.
 	bool iecBusActive() const { return m_IECActivityCycles != 0; }
-
-	// VIDEO_MODE 1's renderer is a one-way observer of serial-port activity.
-	// Core 0 publishes an epoch BEFORE each $DD00/$DD02 access; core 1 may then
-	// abandon cached rendering or uncached framebuffer writes, but can never
-	// make the timed IEC path wait. Disabled by default so VIDEO_MODE 0 does no
-	// atomic work and follows its established bus path unchanged.
-	void setHDMISerialObservation( bool enabled )
-	{
-		__atomic_store_n( &m_HDMISerialObservation, enabled ? 1u : 0u,
-		                  __ATOMIC_RELEASE );
-	}
-	u32 hdmiSerialAccessCount() const
-	{
-		return __atomic_load_n( &m_HDMISerialAccesses, __ATOMIC_ACQUIRE );
-	}
 	typedef void (*TimingHook)( void *ctx );
 	void setTimingHook( TimingHook hook, void *ctx ) { m_TimingHook = hook; m_TimingHookCtx = ctx; }
 	u64  m_IECThrottleEvents;
@@ -847,6 +836,8 @@ private:
 	u64 m_HostPerEmuQ16Slow;	// the same at 1MHz, for IEC hold-off
 	u64 m_PacingAnchor;
 	u32 m_SelectedEmulatedHz;
+	bool m_BusKeepalive = false;
+	u64 m_NextKeepalive = 0;
 
 	bool m_IECThrottleEnabled;
 	u32  m_IECHoldCycles;		// emulated cycles left at forced 1MHz
@@ -856,8 +847,6 @@ private:
 	// m_IECHoldCycles because iecBusActive() -- the MIRROR gate -- must never
 	// see it: polls suppressing mirroring is the blackout latch-up.
 	u32  m_IECPollHoldCycles = 0;
-	volatile u32 m_HDMISerialObservation = 0;
-	volatile u32 m_HDMISerialAccesses = 0;
 public:
 	// Largest single tickFast() chunk seen. The 65816 run() loop batches bus
 	// ticks for speed but must drop to per-instruction ticks while the serial
@@ -866,12 +855,6 @@ public:
 	// so a test can PROVE the granularity contract instead of trusting it.
 	u32  m_MaxTickChunk = 0;
 private:
-	inline void noteHDMISerialAccess()
-	{
-		if ( __atomic_load_n( &m_HDMISerialObservation, __ATOMIC_RELAXED ) )
-			__atomic_add_fetch( &m_HDMISerialAccesses, 1u, __ATOMIC_RELEASE );
-	}
-
 	// CIA2 port A has three different pieces of state. A port read contains
 	// live PA6/PA7 input pins, so it must never replace the output-latch
 	// baseline used to recognise PA3-PA5 IEC transitions. DDRA determines
@@ -903,6 +886,19 @@ public:
 		return m_ROMShadow
 		     ? m_ROMShadow[ 0xD800 + ( offset & 0x03FF ) ] & 0x0F : 14;
 	}
+	u32 activeVICBankBase() const
+	{
+		const u8 outputs = m_HaveCIA2DDRA ? m_CIA2DDRA : 0x03;
+		const u8 bank = m_HaveCIA2PortALatch
+		              ? (u8)( ~m_CIA2PortALatch & outputs & 3 ) : 0;
+		return (u32)bank << 14;
+	}
+	u32 activeVICScreenBase() const
+	{
+		// Unlike activeScreenBase(), this is a logical Pi-shadow address and is
+		// therefore valid even when the selected matrix lies below physical I/O.
+		return activeVICBankBase() + ( (u32)( m_LastD018 >> 4 ) << 10 );
+	}
 
 	u32 activeScreenBase() const
 	{
@@ -917,10 +913,7 @@ public:
 	{
 		if ( !( m_VICRegShadow[ 0x11 ] & 0x20 ) )
 			return 0xFFFFFFFF;
-		const u8 outputs = m_HaveCIA2DDRA ? m_CIA2DDRA : 0x03;
-		const u8 bank = m_HaveCIA2PortALatch
-		              ? (u8)( ~m_CIA2PortALatch & outputs & 3 ) : 0;
-		return ( (u32)bank << 14 ) + ( ( m_LastD018 & 0x08 ) ? 0x2000 : 0 );
+		return activeVICBankBase() + ( ( m_LastD018 & 0x08 ) ? 0x2000 : 0 );
 	}
 	// First byte of the active 2K character-pattern region, or the sentinel
 	// while bitmap mode is selected or the VIC is fetching its internal
@@ -931,11 +924,9 @@ public:
 	{
 		if ( m_VICRegShadow[ 0x11 ] & 0x20 )
 			return 0xFFFFFFFF;
-		const u8 outputs = m_HaveCIA2DDRA ? m_CIA2DDRA : 0x03;
-		const u8 bank = m_HaveCIA2PortALatch
-		              ? (u8)( ~m_CIA2PortALatch & outputs & 3 ) : 0;
+		const u8 bank = (u8)( activeVICBankBase() >> 14 );
 		const u32 offset = (u32)( m_LastD018 & 0x0E ) << 10;
-		if ( ( bank & 1 ) == 0 && offset >= 0x1000 )
+		if ( ( bank & 1 ) == 0 && offset >= 0x1000 && offset < 0x2000 )
 			return 0xFFFFFFFF;
 		return ( (u32)bank << 14 ) + offset;
 	}

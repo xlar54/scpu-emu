@@ -21,8 +21,6 @@
 #define _scpu_boot_h
 
 #include <circle/logger.h>
-#include <circle/bcmframebuffer.h>
-#include <circle/device.h>
 #include "../Common/types.h"
 
 #define SCPU_DRIVE          "SD:"
@@ -33,11 +31,6 @@
 // Read the RAD timing configuration and snapshot it into the bus timing block.
 // Must run before any bus access.
 bool scpuBootLoadConfig( CLogger *logger );
-
-// Borrow the already-initialised console framebuffer. VIDEO_MODE 0 never
-// consumes it; mode 1 starts a passive core-1 renderer after bus self-test.
-void scpuBootSetFrameBuffer( CBcmFrameBuffer *frameBuffer,
-	                         CDevice *screenTarget );
 
 // Bring up the accelerator and hand control to it. Does not return while the
 // machine is running.

@@ -387,6 +387,10 @@ void CC64Memory::reset()
 	m_CIALogPos = 0;
 	m_CIALastRead = 0xFFFFFFFF;
 	m_EmuCycles = 0;
+	// The keepalive deadline is on the host clock. Carrying it across an
+	// emulated reset can leave it arbitrarily far in the future relative to a
+	// restarted session, allowing the physical bus to go cold permanently.
+	m_NextKeepalive = 0;
 	for ( u32 i = 0; i < 64; i++ )
 	{
 		m_IOLog[ i ] = 0;
@@ -627,11 +631,6 @@ u8 CC64Memory::read8( scpu_addr_t addr )
 					noteBusAccess( a, false );
 				return v;
 			}
-			// Reading PRA is how the serial receive path polls CLK/DATA on
-			// bits 6-7. DDRA reads are not traffic and must not stop a renderer.
-			if ( a == 0xDD00 )
-				noteHDMISerialAccess();
-
 			// Deliberately no flush here. Flushing before every I/O access
 			// meant a booting KERNAL -- which touches I/O constantly -- drove
 			// a continuous stream of unscheduled bursts across the visible
@@ -811,19 +810,6 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 			                             | ( 1u << 24 ) | ( 1u << 25 );
 			return;
 		}
-		// $DD00 also selects the VIC bank in bits 0-1. Publishing every write
-		// made bank-flipping games look like permanent disk traffic, so arm HDMI
-		// only when an IEC output bit changes. Likewise, only changes to the IEC
-		// direction bits of DDRA matter. Unknown initial latch state counts once.
-		const bool hdmiSerialWrite =
-			( a == 0xDD00
-			  && ( !m_HaveCIA2PortALatch
-			       || ( ( m_CIA2PortALatch ^ value ) & 0x38 ) != 0 ) )
-		 || ( a == 0xDD02
-			  && ( !m_HaveCIA2DDRA
-			       || ( ( m_CIA2DDRA ^ value ) & 0x38 ) != 0 ) );
-		if ( hdmiSerialWrite ) noteHDMISerialAccess();
-
 		// Work out whether this can affect a physical IEC output. Unknown CIA
 		// state is deliberately treated as a change: a harmless initial 1MHz
 		// interval is preferable to delaying the first protocol edge.
@@ -985,6 +971,27 @@ void CC64Memory::tick( u32 nCycles )
 
 void CC64Memory::tickSettle( bool iecActive )
 {
+	u64 now = m_C64->hostCycles();
+	// VIDEO_MODE 1 keepalive. Mode 0's physical DRAM mirroring naturally keeps
+	// the bus busy; exclusive HDMI removes that traffic and exposes unreliable
+	// cold first transfers. Keep the bus warm with one harmless same-polarity
+	// write every 90 REAL microseconds, comfortably below CRADBus's 150us
+	// per-access backstop. Host time is load-independent; the former emulated-
+	// cycle deadline ran late precisely when HDMI reduced the achieved CPU rate.
+	//
+	// Suspend only for evidence of a real IEC transaction. The poll-only speed
+	// hold is deliberately excluded: a poll without line activity supplies no
+	// physical bus warmth, so suppressing here would recreate the cold gap.
+	const bool realIEC = m_IECHoldCycles != 0 || m_IECActivityCycles != 0;
+	if ( m_BusKeepalive && !realIEC && m_C64
+	     && ( m_NextKeepalive == 0 || (s64)( now - m_NextKeepalive ) >= 0 ) )
+	{
+		m_C64->write( 0x02FE, 0xA6 );
+		now = m_C64->hostCycles();
+		const u64 hostRate = m_C64->hostCyclesPerSec();
+		m_NextKeepalive = now + ( hostRate ? hostRate * 90 / 1000000 : 1 );
+	}
+
 	// While the serial bus is active, run at 1MHz whatever speed is selected --
 	// the KERNAL's bit timing depends on it. See setIECThrottle().
 	const u64 rate = iecActive ? m_HostPerEmuQ16Slow : m_HostPerEmuQ16;
@@ -996,8 +1003,6 @@ void CC64Memory::tickSettle( bool iecActive )
 	// system-register read, and this runs after every instruction -- the
 	// previous version called it four times, which at 20MHz was a serious
 	// fraction of the whole per-instruction budget.
-	u64 now = m_C64->hostCycles();
-
 	if ( ( now - m_PacingAnchor ) >= owed )
 	{
 		// Behind, or exactly on time. Settle up and carry on rather than

@@ -67,6 +67,15 @@ struct CIA2SeedBus : CHostBus
 	}
 };
 
+struct TimedHostBus : CHostBus
+{
+	u64 now = 0;
+	u32 rate = 1000000;
+
+	u64 hostCycles() override { return now++; }
+	u32 hostCyclesPerSec() override { return rate; }
+};
+
 TEST( integration_reset_vector_comes_from_shadowed_kernal )
 {
 	SystemFixture f;
@@ -619,48 +628,58 @@ TEST( integration_hdmi_exclusive_mode_detaches_and_discards_physical_mirror )
 	CHECK_EQ( scpu.writeBuffer().pending(), 0u );
 }
 
-TEST( integration_hdmi_serial_observer_counts_only_iec_port_accesses_when_enabled )
+TEST( integration_hdmi_bus_keepalive_uses_host_time_and_is_opt_in )
 {
-	CHostBus bus;
+	TimedHostBus bus;
 	CC64Memory mem;
 	mem.attachBus( &bus );
+	mem.setPacing( bus.rate, SCPU_NORMAL_HZ );
+
+	// VIDEO_MODE 0 never enables this policy. Advancing far beyond the cadence
+	// must therefore produce no physical transfer.
+	bus.now = 1000;
+	mem.tickFast( 1 );
+	CHECK_EQ( bus.m_Writes, (u64)0 );
+
+	mem.enableBusKeepalive( true );
+	mem.tickFast( 1 );
+	CHECK_EQ( bus.m_Writes, (u64)1 );
+	CHECK_EQ( bus.m_Memory[ 0x02FE ], (u8)0xA6 );
+
+	// The deadline is 90 host microseconds, independent of emulated cycles.
+	// Leave a little room for hostCycles() itself: this fake clock advances on
+	// every sample, while the real ARM counter advances continuously.
+	bus.now += 80;
+	mem.tickFast( 1 );
+	CHECK_EQ( bus.m_Writes, (u64)1 );
+	bus.now += 20;
+	mem.tickFast( 1 );
+	CHECK_EQ( bus.m_Writes, (u64)2 );
+}
+
+TEST( integration_hdmi_bus_keepalive_ignores_poll_hold_but_resets_its_deadline )
+{
+	TimedHostBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.setPacing( bus.rate, SCPU_TURBO_HZ );
+	mem.enableBusKeepalive( true );
+
+	// An idle $DD00 poll selects slow pacing but is not a real IEC transaction.
+	bus.m_Memory[ 0xDD00 ] = 0xFF;
+	mem.read8( 0xDD00 );
+	CHECK( mem.iecThrottleActive() );
+	CHECK( !mem.iecBusActive() );
+	mem.tickFast( 1 );
+	CHECK_EQ( bus.m_Writes, (u64)1 );
+	CHECK_EQ( bus.m_Memory[ 0x02FE ], (u8)0xA6 );
+
+	// Reset preserves the enabled policy but invalidates the old host deadline,
+	// so the new emulated session is warmed on its first paced settlement.
 	mem.reset();
-
-	mem.read8( 0xDD00 );
-	mem.write8( 0xDD02, 0x3F );
-	CHECK_EQ( mem.hdmiSerialAccessCount(), 0u );
-
-	mem.setHDMISerialObservation( true );
-	mem.read8( 0xDC00 );
-	mem.write8( 0xD020, 6 );
-	CHECK_EQ( mem.hdmiSerialAccessCount(), 0u );
-	// DDRA reads and VIC-bank-only writes are not serial activity.
-	mem.read8( 0xDD02 );
-	CHECK_EQ( mem.hdmiSerialAccessCount(), 0u );
-	mem.read8( 0xDD00 );
-	CHECK_EQ( mem.hdmiSerialAccessCount(), 1u );
-	// The first PRA write has no authoritative old latch and counts once.
-	mem.write8( 0xDD00, 0x03 );
-	CHECK_EQ( mem.hdmiSerialAccessCount(), 2u );
-	mem.write8( 0xDD00, 0x00 );	// bits 0-1 only: VIC bank
-	CHECK_EQ( mem.hdmiSerialAccessCount(), 2u );
-	mem.write8( 0xDD00, 0x08 );	// IEC bit 3 changes
-	CHECK_EQ( mem.hdmiSerialAccessCount(), 3u );
-	mem.write8( 0xDD00, 0x08 );	// same value
-	CHECK_EQ( mem.hdmiSerialAccessCount(), 3u );
-
-	// DDRA was established as $3F before observation. Same-value and changes
-	// outside bits 3-5 do not count; an IEC direction change does.
-	mem.write8( 0xDD02, 0x3F );
-	CHECK_EQ( mem.hdmiSerialAccessCount(), 3u );
-	mem.write8( 0xDD02, 0x3B );	// bit 2 only
-	CHECK_EQ( mem.hdmiSerialAccessCount(), 3u );
-	mem.write8( 0xDD02, 0x33 );	// bit 3 direction changes
-	CHECK_EQ( mem.hdmiSerialAccessCount(), 4u );
-
-	mem.setHDMISerialObservation( false );
-	mem.write8( 0xDD00, 0x00 );
-	CHECK_EQ( mem.hdmiSerialAccessCount(), 4u );
+	bus.now += 1;
+	mem.tickFast( 1024 );
+	CHECK_EQ( bus.m_Writes, (u64)2 );
 }
 
 TEST( integration_enhanced_optimisation_bits_select_the_vice_mirror_ranges )
@@ -1464,10 +1483,14 @@ TEST( integration_active_screen_base_tracks_d018_and_vic_bank )
 	f.start();
 
 	CHECK_EQ( f.mem.activeScreenBase(), 0x0400u );
+	CHECK_EQ( f.mem.activeVICBankBase(), 0x0000u );
+	CHECK_EQ( f.mem.activeVICScreenBase(), 0x0400u );
 	f.mem.write8( 0xD018, 0xDF );			// matrix offset $3400
 	CHECK_EQ( f.mem.activeScreenBase(), 0x3400u );
 	f.mem.write8( 0xDD00, 0xC6 );			// VIC bank 1 ($4000)
 	CHECK_EQ( f.mem.activeScreenBase(), 0x7400u );	// Metal Dust snapshot
+	CHECK_EQ( f.mem.activeVICBankBase(), 0x4000u );
+	CHECK_EQ( f.mem.activeVICScreenBase(), 0x7400u );
 	f.mem.write8( 0xDD02, 0x00 );			// PA0/PA1 inputs float high
 	CHECK_EQ( f.mem.activeScreenBase(), 0x3400u );	// back to VIC bank 0
 	f.mem.write8( 0xDD02, 0x03 );			// drive both bank-select pins
@@ -1478,6 +1501,8 @@ TEST( integration_active_screen_base_tracks_d018_and_vic_bank )
 	f.mem.write8( 0xDD00, 0xC4 );			// VIC bank 3 ($C000)
 	f.mem.write8( 0xD018, 0x40 );			// matrix offset $1000
 	CHECK_EQ( f.mem.activeScreenBase(), 0xFFFFFFFFu );
+	CHECK_EQ( f.mem.activeVICBankBase(), 0xC000u );
+	CHECK_EQ( f.mem.activeVICScreenBase(), 0xD000u );
 }
 
 TEST( integration_active_bitmap_base_tracks_mode_d018_and_vic_bank )
@@ -1520,6 +1545,8 @@ TEST( integration_active_charset_base_tracks_d018_bank_and_character_rom )
 	CHECK_EQ( f.mem.activeCharsetBase(), 0x8800u );
 	f.mem.write8( 0xD018, 0x06 );			// offset $1800 is character ROM
 	CHECK_EQ( f.mem.activeCharsetBase(), 0xFFFFFFFFu );
+	f.mem.write8( 0xD018, 0x08 );			// offset $2000 is DRAM again
+	CHECK_EQ( f.mem.activeCharsetBase(), 0xA000u );
 	f.mem.write8( 0xD011, 0x3B );			// bitmap mode suppresses charset
 	CHECK_EQ( f.mem.activeCharsetBase(), 0xFFFFFFFFu );
 }
