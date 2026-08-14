@@ -117,7 +117,6 @@ sdcard:
 		|| echo "  (no SuperCPU ROM staged -- optional, see ROMs/README.md)"
 	@cp -f Source/kernel8.img $(SDDIR)/ 2>/dev/null \
 		|| echo "  MISSING kernel8.img       -- run 'make firmware' first (needs a Circle tree, see Docs/build.md)"
-	@cp -f Tools/sdcard_readme.txt $(SDDIR)/README.txt 2>/dev/null || true
 	@echo ""
 	@echo "SD card staged in $(SDDIR)/ :"
 	@cd $(SDDIR) && find . -type f | sort | sed 's|^\./|  |'

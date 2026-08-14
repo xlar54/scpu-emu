@@ -99,6 +99,7 @@ int cfgBusAccessSentinel = 0;
 int cfgDisplayScrub = 0;
 int cfgDisplayScrubMask = 1;
 int cfgDisplayScrubPeriodS = 0;
+int cfgVideoMode = SCPU_CFG_VIDEO_DEFAULT;
 
 char cfg[ 65536 ];
 
@@ -130,6 +131,7 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	cfgDisplayScrub = 0;
 	cfgDisplayScrubMask = 1;
 	cfgDisplayScrubPeriodS = 0;
+	cfgVideoMode = SCPU_CFG_VIDEO_DEFAULT;
 
 	// Leave a byte spare so cfg is always NUL-terminated for the line scanner.
 	if ( !readFile( logger, DRIVE, FILENAME, (u8*)cfg, &cfgBytes, sizeof( cfg ) - 1 ) )
@@ -155,6 +157,7 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	bool displayScrubSeen = false;
 	bool displayScrubMaskSeen = false;
 	bool displayScrubPeriodSeen = false;
+	bool videoModeSeen = false;
 
 	while ( *cfgPos != 0 )
 	{
@@ -192,6 +195,7 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 						if ( i == 38 ) displayScrubSeen = true;
 						if ( i == 39 ) displayScrubMaskSeen = true;
 						if ( i == 40 ) displayScrubPeriodSeen = true;
+						if ( i == 41 ) videoModeSeen = true;
 						while ( *ptr == '\t' || *ptr == ' ' ) ptr++;
 					#ifdef DEBUG_OUT
 						logger->Write( "RaspiMenu", LogNotice, "  %s >%d< (%s)", timingNames[ i ], timingValues[ i ], ptr );
@@ -303,6 +307,17 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 		cfgDisplayScrubMask = timingValues[ 39 ] != 0 ? 1 : 0;
 	if ( displayScrubPeriodSeen && timingValues[ 40 ] > 0 )
 		cfgDisplayScrubPeriodS = timingValues[ 40 ];
+
+	// Accept the two planned picture sources, but fall back to the existing
+	// console path for malformed values. Nothing consumes this value in the
+	// stage-1 baseline, so VIDEO_MODE 0 is behaviourally identical to master.
+	if ( videoModeSeen )
+	{
+		cfgVideoMode = timingValues[ 41 ];
+		if ( cfgVideoMode < SCPU_CFG_VIDEO_CONSOLE
+		     || cfgVideoMode > SCPU_CFG_VIDEO_VDC )
+			cfgVideoMode = SCPU_CFG_VIDEO_DEFAULT;
+	}
 
 	return 1;
 }

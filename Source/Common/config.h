@@ -29,7 +29,7 @@
 #define _config_h
 
 
-#define TIMING_NAMES 41
+#define TIMING_NAMES 42
 const char timingNames[TIMING_NAMES][32] = {
 	"WAIT_FOR_SIGNALS", 
 	"WAIT_CYCLE_READ", 
@@ -131,7 +131,11 @@ const char timingNames[TIMING_NAMES][32] = {
 	// Trial instrumentation: when nonzero, alternate scrub off/on at this
 	// interval. 0 is static mode. The production scheduler remains write-only:
 	// some physical machines have no stable expansion-bus read window.
-	"DISPLAY_SCRUB_PERIOD_S"
+	"DISPLAY_SCRUB_PERIOD_S",
+	// Selects the eventual HDMI presentation source. This first-stage parser
+	// deliberately does not alter runtime behaviour; mode 0 remains the exact
+	// master-branch text-console path until the renderer lands separately.
+	"VIDEO_MODE"
 };
 
 // Which CPU core boot.cpp should install. Set from CPU_CORE in the config file;
@@ -194,6 +198,15 @@ extern int cfgBusAccessSentinel;
 extern int cfgDisplayScrub;
 extern int cfgDisplayScrubMask;
 extern int cfgDisplayScrubPeriodS;
+
+// What the Pi's HDMI output will show. Stage 1 only parses and validates this
+// value; no runtime path consumes it yet.
+extern int cfgVideoMode;
+
+#define SCPU_CFG_VIDEO_CONSOLE  0
+#define SCPU_CFG_VIDEO_VICII    1
+#define SCPU_CFG_VIDEO_VDC      2
+#define SCPU_CFG_VIDEO_DEFAULT  SCPU_CFG_VIDEO_CONSOLE
 
 #define SCPU_CFG_MIRROR_DISPLAY_DEFAULT 1024
 
