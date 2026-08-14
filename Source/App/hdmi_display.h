@@ -41,13 +41,18 @@ private:
 	{
 		HDMI_RENDER_BAND_ROWS = 1,
 		HDMI_FRAMEBUFFER_SPAN_BYTES = 64,
+		HDMI_SHARED_SPAN_BYTES = 64,
+		HDMI_IEC_SPAN_BYTES = 16,
+		HDMI_IEC_SPAN_PAUSE_US = 5,
 		HDMI_SERIAL_BUSY_ACCESSES = 32,
 		HDMI_SERIAL_ABORT_ACCESSES = 4
 	};
 	static void core1Entry( void *context );
 	void run();
 	void renderFrame( u64 frameStart, u64 frameTicks );
-	bool presentRows( const u8 *source, u32 firstRow, u32 rowCount );
+	void presentRows( const u8 *source, u32 firstRow, u32 rowCount );
+	void copyShared( u8 *destination, const u8 *source, u32 count );
+	void observeSerialActivity();
 	bool serialActive() const;
 	void fillFrameBuffer( u8 colour );
 
@@ -68,8 +73,8 @@ private:
 	const volatile u64 *m_SerialTransfers;
 	u64                m_LastSerialTransfers;
 	u64                m_FrameStartSerialTransfers;
-	u64                m_SerialBusySkips;
-	u64                m_SerialAborts;
+	bool               m_SerialThrottled;
+	u64                m_SerialThrottleFrames;
 };
 
 #endif

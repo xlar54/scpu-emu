@@ -56,13 +56,23 @@ static inline void hdmiWaitUntil( u64 target )
 		asm volatile( "wfe" );
 }
 
+// Stay off the shared memory system while an IEC slow-lane span drains. The
+// counter is a core register, and YIELD does not touch memory or involve core 0.
+static inline void hdmiPauseUS( u32 microseconds )
+{
+	const u64 end = hdmiCounter()
+	              + (u64)microseconds * hdmiCounterFrequency() / 1000000;
+	while ( (s64)( hdmiCounter() - end ) < 0 )
+		asm volatile( "yield" );
+}
+
 CHDMIDisplay::CHDMIDisplay( const CC64Memory &memory )
 	: m_Memory( memory ), m_FrameBuffer( 0 ), m_FramePixels( 0 ),
 	  m_FBPitchBytes( 0 ),
 	  m_Started( 0 ), m_FirstFrame( 0 ), m_MaxBandTicks( 0 ),
 	  m_MissedBandDeadlines( 0 ), m_SerialTransfers( 0 ),
 	  m_LastSerialTransfers( 0 ), m_FrameStartSerialTransfers( 0 ),
-	  m_SerialBusySkips( 0 ), m_SerialAborts( 0 )
+	  m_SerialThrottled( false ), m_SerialThrottleFrames( 0 )
 {
 	memset( m_Colours, 14, sizeof m_Colours );
 	memset( m_VICRAM, 0, sizeof m_VICRAM );
@@ -199,26 +209,27 @@ void CHDMIDisplay::run()
 void CHDMIDisplay::renderFrame( u64 frameStart, u64 frameTicks )
 {
 	// A real IEC transfer produces hundreds of CIA2 accesses per millisecond.
-	// Hold the last complete HDMI picture during such a frame. This is a
-	// one-way observation: core 0 never waits for core 1.
+	// K355 held the last complete picture during those frames. Preserve its
+	// protection without freezing the display: an active frame enters a
+	// producer-side slow lane with smaller spans and quiet gaps between them.
+	m_SerialThrottled = false;
 	if ( m_SerialTransfers )
 	{
 		const u64 now = *m_SerialTransfers;
 		const u64 delta = now - m_LastSerialTransfers;
 		m_LastSerialTransfers = now;
+		m_FrameStartSerialTransfers = now;
 		if ( delta > HDMI_SERIAL_BUSY_ACCESSES )
 		{
-			m_SerialBusySkips++;
-			hdmiWaitUntil( frameStart + frameTicks );
-			return;
+			m_SerialThrottled = true;
+			m_SerialThrottleFrames++;
 		}
-		m_FrameStartSerialTransfers = now;
 	}
 
 	// Colour RAM is cached in the v2 bank-1 SRAM shadow, not bank-0 $D800.
 	// Acquire its cache lines once sequentially, like the other display state.
 	const u8 *liveColours = m_Memory.colourRAMShadow();
-	if ( liveColours ) memcpy( m_Colours, liveColours, sizeof m_Colours );
+	if ( liveColours ) copyShared( m_Colours, liveColours, sizeof m_Colours );
 	else               memset( m_Colours, 14, sizeof m_Colours );
 
 	VICRenderState state;
@@ -237,28 +248,28 @@ void CHDMIDisplay::renderFrame( u64 frameStart, u64 frameTicks )
 	const u32 liveScreen = liveBank
 	                     + ( (u32)( state.vic[ 0x18 ] >> 4 ) << 10 );
 	const u32 localScreen = liveScreen - liveBank;
-	memcpy( m_VICRAM + localScreen, liveRAM + liveScreen, 1024 );
+	copyShared( m_VICRAM + localScreen, liveRAM + liveScreen, 1024 );
 
 	const bool bitmapMode = ( state.vic[ 0x11 ] & 0x20 ) != 0;
 	const u32 localBitmap = ( state.vic[ 0x18 ] & 0x08 ) ? 0x2000 : 0;
 	if ( bitmapMode )
-		memcpy( m_VICRAM + localBitmap,
-		        liveRAM + liveBank + localBitmap, 8192 );
+		copyShared( m_VICRAM + localBitmap,
+		            liveRAM + liveBank + localBitmap, 8192 );
 
 	const u32 localCharset = (u32)( state.vic[ 0x18 ] & 0x0E ) << 10;
 	const u32 bankNumber = liveBank >> 14;
 	const bool charROM = !bitmapMode && ( bankNumber & 1 ) == 0
 	                  && localCharset >= 0x1000 && localCharset < 0x2000;
 	if ( !bitmapMode && !charROM )
-		memcpy( m_VICRAM + localCharset,
-		        liveRAM + liveBank + localCharset, 2048 );
+		copyShared( m_VICRAM + localCharset,
+		            liveRAM + liveBank + localCharset, 2048 );
 
 	const u8 enabledSprites = state.vic[ 0x15 ];
 	for ( u32 sprite = 0; sprite < 8; sprite++ )
 	{
 		if ( !( enabledSprites & ( 1u << sprite ) ) ) continue;
 		const u32 shape = (u32)m_VICRAM[ localScreen + 0x3F8 + sprite ] << 6;
-		memcpy( m_VICRAM + shape, liveRAM + liveBank + shape, 64 );
+		copyShared( m_VICRAM + shape, liveRAM + liveBank + shape, 64 );
 	}
 
 	state.ram = m_VICRAM;
@@ -274,25 +285,16 @@ void CHDMIDisplay::renderFrame( u64 frameStart, u64 frameTicks )
 	for ( u32 first = 0; first < VIC_RENDER_HEIGHT;
 	      first += HDMI_RENDER_BAND_ROWS )
 	{
-		// If a serial handshake started while the frame was being snapshotted or
-		// while the previous row was rendered, abandon the frame immediately.
-		if ( serialActive() )
-		{
-			m_SerialAborts++;
-			hdmiWaitUntil( frameStart + frameTicks );
-			return;
-		}
+		// A transfer may begin after the frame-start sample. Move into the slow
+		// lane at the next row boundary and stay there for the rest of the frame.
+		observeSerialActivity();
 
 		const u32 rows = first + HDMI_RENDER_BAND_ROWS <= VIC_RENDER_HEIGHT
 		               ? HDMI_RENDER_BAND_ROWS : VIC_RENDER_HEIGHT - first;
 		const u64 bandStart = hdmiCounter();
 		m_Renderer.renderRows( state, m_BandPixels, VIC_RENDER_WIDTH, first, rows );
-		if ( !presentRows( m_BandPixels, first, rows ) )
-		{
-			m_SerialAborts++;
-			hdmiWaitUntil( frameStart + frameTicks );
-			return;
-		}
+		observeSerialActivity();
+		presentRows( m_BandPixels, first, rows );
 		const u64 bandEnd = hdmiCounter();
 		const u64 elapsed = bandEnd - bandStart;
 		u64 previousMax = __atomic_load_n( &m_MaxBandTicks, __ATOMIC_RELAXED );
@@ -319,7 +321,34 @@ bool CHDMIDisplay::serialActive() const
 	       > HDMI_SERIAL_ABORT_ACCESSES;
 }
 
-bool CHDMIDisplay::presentRows( const u8 *source, u32 firstRow, u32 rowCount )
+void CHDMIDisplay::observeSerialActivity()
+{
+	if ( !m_SerialThrottled && serialActive() )
+	{
+		m_SerialThrottled = true;
+		m_SerialThrottleFrames++;
+	}
+}
+
+void CHDMIDisplay::copyShared( u8 *destination, const u8 *source, u32 count )
+{
+	// Snapshot traffic is part of the same core-1 memory pressure as the final
+	// framebuffer stores. K355 avoided it by skipping busy frames entirely, so
+	// a live slow lane must bound these reads too or it loses that protection.
+	for ( u32 offset = 0; offset < count; )
+	{
+		observeSerialActivity();
+		const u32 span = m_SerialThrottled
+		               ? HDMI_IEC_SPAN_BYTES : HDMI_SHARED_SPAN_BYTES;
+		const u32 bytes = offset + span <= count ? span : count - offset;
+		memcpy( destination + offset, source + offset, bytes );
+		asm volatile( "dmb ish" ::: "memory" );
+		offset += bytes;
+		if ( m_SerialThrottled ) hdmiPauseUS( HDMI_IEC_SPAN_PAUSE_US );
+	}
+}
+
+void CHDMIDisplay::presentRows( const u8 *source, u32 firstRow, u32 rowCount )
 {
 	// A single 384-byte framebuffer memcpy collapsed the physical read eye on
 	// core 0. The previous hardware-validated renderer never issued more than
@@ -331,16 +360,17 @@ bool CHDMIDisplay::presentRows( const u8 *source, u32 firstRow, u32 rowCount )
 	{
 		u8 *dst = m_FramePixels + ( firstRow + row ) * m_FBPitchBytes;
 		const u8 *src = source + row * VIC_RENDER_WIDTH;
-		for ( u32 x = 0; x < VIC_RENDER_WIDTH;
-		      x += HDMI_FRAMEBUFFER_SPAN_BYTES )
+		for ( u32 x = 0; x < VIC_RENDER_WIDTH; )
 		{
-			if ( serialActive() ) return false;
-			const u32 count = x + HDMI_FRAMEBUFFER_SPAN_BYTES <= VIC_RENDER_WIDTH
-			                ? HDMI_FRAMEBUFFER_SPAN_BYTES
-			                : VIC_RENDER_WIDTH - x;
+			observeSerialActivity();
+			const u32 span = m_SerialThrottled
+			               ? HDMI_IEC_SPAN_BYTES : HDMI_FRAMEBUFFER_SPAN_BYTES;
+			const u32 count = x + span <= VIC_RENDER_WIDTH
+			                ? span : VIC_RENDER_WIDTH - x;
 			memcpy( dst + x, src + x, count );
 			asm volatile( "dmb ishst" ::: "memory" );
+			x += count;
+			if ( m_SerialThrottled ) hdmiPauseUS( HDMI_IEC_SPAN_PAUSE_US );
 		}
 	}
-	return true;
 }

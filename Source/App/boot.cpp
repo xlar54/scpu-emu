@@ -723,11 +723,11 @@ static bool scpuCheckButton( void *ctx )
 			CScopedLoggingIRQs saveIRQs;
 			if ( !scpuSaveRuntimeBusDiag( runtime ) )
 				s_Logger->Write( "SCPU", LogError,
-					               "K355 could not save post-handoff runtime to %s",
+					               "K356 could not save post-handoff runtime to %s",
 				               SCPU_BUS_DIAG_FILE );
 			else
 				s_Logger->Write( "SCPU", LogNotice,
-					               "K355 saved post-handoff runtime to %s",
+					               "K356 saved post-handoff runtime to %s",
 				               SCPU_BUS_DIAG_FILE );
 		}
 		s_RebootRequested = true;
@@ -760,11 +760,11 @@ static bool scpuCheckButton( void *ctx )
 			CScopedLoggingIRQs saveIRQs;
 			if ( !scpuSaveRuntimeBusDiag( s_ResetDiagnostic.runtime ) )
 				s_Logger->Write( "SCPU", LogError,
-					               "K355 could not save post-handoff runtime to %s",
+					               "K356 could not save post-handoff runtime to %s",
 				               SCPU_BUS_DIAG_FILE );
 			else
 				s_Logger->Write( "SCPU", LogNotice,
-					               "K355 saved post-handoff runtime to %s",
+					               "K356 saved post-handoff runtime to %s",
 				               SCPU_BUS_DIAG_FILE );
 		}
 
@@ -1244,7 +1244,7 @@ static void scpuAppendRuntimeBusDiag( char *dst, u32 capacity, u32 &length,
 		scpuLineChar( dst, capacity, length, '\n' );
 	}
 	scpuLineText( dst, capacity, length,
-	              "post-handoff runtime: build=355 handoff=" );
+	              "post-handoff runtime: build=356 handoff=" );
 	scpuLineDecimal( dst, capacity, length, r.valid ? 1 : 0 );
 	if ( r.valid )
 	{
@@ -2246,7 +2246,7 @@ void scpuBootRun( CLogger *logger )
 		if ( s_HDMIDisplay->start() )
 		{
 			// The first passive frame naturally replaces the blue ready screen.
-			// K355 makes one bounded wait before emulation begins: prove that
+			// K356 makes one bounded wait before emulation begins: prove that
 			// core 1 is actively rendering
 			// and repeat the read-eye scan under that exact electrical/thermal
 			// load. The quiet acquisition curve is retained alongside it.
