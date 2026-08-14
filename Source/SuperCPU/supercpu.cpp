@@ -29,10 +29,14 @@ CSuperCPU::CSuperCPU()
 
 void CSuperCPU::disablePhysicalMirror()
 {
-	// Detach first so no later emulated RAM write can refill the queue. This is
-	// called by core 0 at a frame boundary; core 1 only reads the shadow.
-	m_Memory.setMirrorSink( 0 );
+	// Core 1 presents directly from shadow RAM, so no later write may enter the
+	// physical delivery queue. Keep the buffer attached as a timing-only policy
+	// sink: the real SuperCPU still has a one-deep posted C64-RAM write slot even
+	// when this implementation deliberately sends no corresponding VIC byte.
 	m_WriteBuffer.discard();
+	m_WriteBuffer.setDeliveryEnabled( false );
+	m_Memory.setMirrorSink( &m_WriteBuffer );
+	m_Memory.enablePostedWriteTiming( true );
 	m_MirrorHalted = true;
 }
 
@@ -44,6 +48,8 @@ bool CSuperCPU::init( IC64Bus *bus, SCPUCoreType core, u32 simmMB )
 		return false;
 
 	m_Memory.attachBus( m_Bus );
+	m_Memory.enablePostedWriteTiming( false );
+	m_WriteBuffer.setDeliveryEnabled( true );
 	m_Memory.setMirrorSink( &m_WriteBuffer );
 	m_Memory.setIOInterceptor( &m_Registers );
 

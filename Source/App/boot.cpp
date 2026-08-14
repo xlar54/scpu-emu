@@ -39,6 +39,7 @@
 
 #include "../Common/config.h"
 #include "../Common/helpers.h"
+#include "../Common/runtime_diagnostic.h"
 #include "../Bus/RAD/gpio_defs.h"
 #include "../Bus/RAD/lowlevel_arm64.h"
 #include "../Bus/RAD/bus_timing.h"
@@ -87,7 +88,10 @@ static bool radBusButtonPressed();
 static bool radBusHardwareResetPressed();
 static void radBusSampleInterrupts( bool &irq, bool &nmi );
 static bool radBusTrafficHalted();
-static bool scpuSaveRuntimeBusDiag();
+static SCPURuntimeResult scpuCurrentRuntimeResult( CSuperCPU *scpu );
+static void scpuBeginRuntimeDiagnostic( CSuperCPU *scpu );
+static bool scpuRuntimeDiagnosticActive();
+static bool scpuSaveRuntimeBusDiag( const SCPURuntimeResult &runtime );
 static void radBusHaltAndProbe( u32 &eligiblePhases, u32 &addrChanges,
 	                           u32 &distinctAddrs, u32 &sequentialAddrs,
 	                           u32 &writePhases, u8 &firstAddr, u8 &lastAddr );
@@ -138,6 +142,22 @@ static bool scpuLineHexU32( char *dst, u32 capacity, u32 &length, u32 v )
 static bool scpuLineDecimal( char *dst, u32 capacity, u32 &length, u32 v )
 {
 	char reversed[ 10 ];
+	u32 digits = 0;
+	do
+	{
+		reversed[ digits++ ] = (char)( '0' + v % 10 );
+		v /= 10;
+	} while ( v && digits < sizeof reversed );
+
+	while ( digits )
+		if ( !scpuLineChar( dst, capacity, length, reversed[ --digits ] ) )
+			return false;
+	return true;
+}
+
+static bool scpuLineDecimal64( char *dst, u32 capacity, u32 &length, u64 v )
+{
+	char reversed[ 20 ];
 	u32 digits = 0;
 	do
 	{
@@ -239,6 +259,7 @@ struct SCPUResetDiagnostic
 	u64 scrubMismatchText;
 	u64 scrubMismatchBitmap;
 	u64 scrubRepaired;
+	SCPURuntimeResult runtime;
 };
 
 static SCPUResetDiagnostic s_ResetDiagnostic = {};
@@ -255,6 +276,7 @@ static void scpuSnapshotResetDiagnostic( CSuperCPU *scpu )
 	d.preResetSampleValid = s_PreResetSampleValid;
 	d.preResetDD00 = s_PreResetDD00;
 	d.preResetDD02 = s_PreResetDD02;
+	d.runtime = scpuCurrentRuntimeResult( scpu );
 
 	if ( !d.haveCPU )
 	{
@@ -690,6 +712,24 @@ static bool scpuCheckButton( void *ctx )
 
 	if ( radBusButtonPressed() )
 	{
+		// The RAD's Pi-reboot button is the convenient way to return the card,
+		// but it is not the Commodore /RESET line handled below. Persist the
+		// same post-handoff record on both exits so the diagnostic cannot be
+		// silently lost merely because the other physical button was used.
+		if ( !s_RebootRequested )
+		{
+			const SCPURuntimeResult runtime =
+				scpuCurrentRuntimeResult( scpu );
+			CScopedLoggingIRQs saveIRQs;
+			if ( !scpuSaveRuntimeBusDiag( runtime ) )
+				s_Logger->Write( "SCPU", LogError,
+					               "K355 could not save post-handoff runtime to %s",
+				               SCPU_BUS_DIAG_FILE );
+			else
+				s_Logger->Write( "SCPU", LogNotice,
+					               "K355 saved post-handoff runtime to %s",
+				               SCPU_BUS_DIAG_FILE );
+		}
 		s_RebootRequested = true;
 		return true;					// stop the run loop; caller reboots
 	}
@@ -712,7 +752,24 @@ static bool scpuCheckButton( void *ctx )
 			else                                  released++;
 		}
 
+		// Persist the counters from the workload that just ended while the
+		// emulated CPU is stopped and before reset clears its accounting. This
+		// is deliberately after physical /RESET is released so FAT/SD logging
+		// cannot extend the time the VIC and CIAs are held in reset.
+		{
+			CScopedLoggingIRQs saveIRQs;
+			if ( !scpuSaveRuntimeBusDiag( s_ResetDiagnostic.runtime ) )
+				s_Logger->Write( "SCPU", LogError,
+					               "K355 could not save post-handoff runtime to %s",
+				               SCPU_BUS_DIAG_FILE );
+			else
+				s_Logger->Write( "SCPU", LogNotice,
+					               "K355 saved post-handoff runtime to %s",
+				               SCPU_BUS_DIAG_FILE );
+		}
+
 		if ( scpu ) scpu->reset();
+		if ( scpuRuntimeDiagnosticActive() ) scpuBeginRuntimeDiagnostic( scpu );
 		s_HardwareResetGeneration++;
 		s_C128DiagnosticFrames = 0;
 		s_C128PCTracePos = 0;
@@ -760,7 +817,7 @@ static bool scpuCheckButton( void *ctx )
 			// formatter before its later topology report. Persist the live runtime
 			// counters at the moment traffic stops, after the requested workload,
 			// rather than asking the user to transcribe transient HDMI output.
-			if ( !scpuSaveRuntimeBusDiag() )
+			if ( !scpuSaveRuntimeBusDiag( scpuCurrentRuntimeResult( scpu ) ) )
 			{
 				s_Logger->Write( "SCPU", LogError,
 				               "K204 could not save live counters to %s; retrying",
@@ -961,10 +1018,19 @@ static CActLED   actLED;
 static CSuperCPU superCPU;
 static bool s_HDMIPictureActive = false;
 static bool s_HDMIExclusive = false;
+static SCPURuntimeSample s_RuntimeBaseline = {};
 static u32 s_PiThrottledStartup = 0;
 static u32 s_PiThrottledPostSelfTest = 0;
+static u32 s_PiThrottledCore1 = 0;
+static u32 s_PiARMClockStartup = 0;
+static u32 s_PiARMClockPostSelfTest = 0;
+static u32 s_PiARMClockCore1 = 0;
 static bool s_PiThrottledStartupValid = false;
 static bool s_PiThrottledPostSelfTestValid = false;
+static bool s_PiThrottledCore1Valid = false;
+static bool s_PiARMClockStartupValid = false;
+static bool s_PiARMClockPostSelfTestValid = false;
+static bool s_PiARMClockCore1Valid = false;
 
 static const u32 SCPU_PI_UNDERVOLTAGE_NOW = 1u << 0;
 static const u32 SCPU_PI_UNDERVOLTAGE_OCCURRED = 1u << 16;
@@ -987,6 +1053,53 @@ static void scpuPromoteHDMIExclusive( CSuperCPU *scpu )
 	scpu->memory().enableBusKeepalive( true );
 	scpu->disablePhysicalMirror();
 	s_HDMIExclusive = true;
+	scpuBeginRuntimeDiagnostic( scpu );
+}
+
+static SCPURuntimeSample scpuCaptureRuntimeSample( CSuperCPU *scpu,
+	                                               bool handoff )
+{
+	SCPURuntimeSample s = {};
+	s.handoff = handoff && scpu && scpu->hostBus();
+	if ( !s.handoff ) return s;
+
+	s.hostCycles = scpu->hostBus()->hostCycles();
+	s.emuCycles = scpu->memory().m_EmuCycles;
+	s.ramWrites = scpu->memory().m_RamWrites;
+	s.acceptedWrites = scpu->writeBuffer().m_WritesAccepted;
+	s.skippedWrites = scpu->writeBuffer().m_WritesSkipped;
+	s.postedWaitCycles = scpu->memory().m_MirrorStretchCycles;
+	s.slowCycles = scpu->memory().m_SlowPacedCycles;
+	s.iecThrottledCycles = scpu->memory().m_IECThrottledCycles;
+	s.transfers = radBus.transfers();
+	s.serialTransfers = radBus.serialTransfers();
+	s.idlePrimes = radBus.readPrimes();
+	if ( s_HDMIDisplay )
+	{
+		s.maxBandUS = s_HDMIDisplay->maxBandUS();
+		s.missedBandDeadlines = s_HDMIDisplay->missedBandDeadlines();
+	}
+	return s;
+}
+
+static void scpuBeginRuntimeDiagnostic( CSuperCPU *scpu )
+{
+	if ( s_HDMIDisplay ) s_HDMIDisplay->resetRuntimeDiagnostics();
+	s_RuntimeBaseline = scpuCaptureRuntimeSample( scpu, true );
+}
+
+static SCPURuntimeResult scpuCurrentRuntimeResult( CSuperCPU *scpu )
+{
+	const SCPURuntimeSample current =
+		scpuCaptureRuntimeSample( scpu, s_HDMIExclusive );
+	const u32 rate = ( scpu && scpu->hostBus() )
+	               ? scpu->hostBus()->hostCyclesPerSec() : 0;
+	return scpuRuntimeDelta( s_RuntimeBaseline, current, rate );
+}
+
+static bool scpuRuntimeDiagnosticActive()
+{
+	return s_HDMIExclusive;
 }
 
 static bool scpuReadPiThrottled( u32 &state )
@@ -1000,6 +1113,22 @@ static bool scpuReadPiThrottled( u32 &state )
 		return false;
 	}
 	state = tag.nValue;
+	return true;
+}
+
+static bool scpuReadPiARMClock( u32 &rateHz )
+{
+	CBcmPropertyTags tags;
+	TPropertyTagClockRate tag;
+	tag.nClockId = CLOCK_ID_ARM;
+	tag.nRate = 0;
+	if ( !tags.GetTag( PROPTAG_GET_CLOCK_RATE_MEASURED,
+	                   &tag, sizeof tag, 4 ) || tag.nRate == 0 )
+	{
+		rateHz = 0;
+		return false;
+	}
+	rateHz = tag.nRate;
 	return true;
 }
 
@@ -1035,6 +1164,19 @@ static void scpuLogPiThrottled( CLogger *logger, const char *when,
 	               (unsigned)( ( state >> 19 ) & 1 ) );
 }
 
+static void scpuLogPiARMClock( CLogger *logger, const char *when,
+	                           bool valid, u32 rateHz )
+{
+	if ( !valid )
+	{
+		logger->Write( "SCPU", LogWarning,
+		               "Pi ARM clock %s: measured-rate query failed", when );
+		return;
+	}
+	logger->Write( "SCPU", LogNotice, "Pi ARM clock %s: %u Hz",
+	               when, (unsigned)rateHz );
+}
+
 static void scpuAppendPiThrottledDiag( char *dst, u32 capacity, u32 &length )
 {
 	if ( length && dst[ length - 1 ] != '\n' )
@@ -1060,6 +1202,30 @@ static void scpuAppendPiThrottledDiag( char *dst, u32 capacity, u32 &length )
 		scpuLineText( dst, capacity, length, "QUERY-FAILED" );
 	scpuLineText( dst, capacity, length,
 	              " bits 0-3=live 16-19=sticky\r\n" );
+	scpuLineText( dst, capacity, length, "pi measured ARM Hz: startup=" );
+	if ( s_PiARMClockStartupValid )
+		scpuLineDecimal( dst, capacity, length, s_PiARMClockStartup );
+	else
+		scpuLineText( dst, capacity, length, "QUERY-FAILED" );
+	scpuLineText( dst, capacity, length, " post-selftest=" );
+	if ( s_PiARMClockPostSelfTestValid )
+		scpuLineDecimal( dst, capacity, length, s_PiARMClockPostSelfTest );
+	else
+		scpuLineText( dst, capacity, length, "QUERY-FAILED" );
+	scpuLineText( dst, capacity, length, " core1=" );
+	if ( s_PiARMClockCore1Valid )
+		scpuLineDecimal( dst, capacity, length, s_PiARMClockCore1 );
+	else
+		scpuLineText( dst, capacity, length, "NOT-SAMPLED" );
+	scpuLineText( dst, capacity, length, "\r\npi throttled core1=" );
+	if ( s_PiThrottledCore1Valid )
+	{
+		scpuLineText( dst, capacity, length, "$" );
+		scpuLineHexU32( dst, capacity, length, s_PiThrottledCore1 );
+	}
+	else
+		scpuLineText( dst, capacity, length, "NOT-SAMPLED" );
+	scpuLineText( dst, capacity, length, "\r\n" );
 }
 
 static void scpuHDMIShowFailure()
@@ -1069,11 +1235,80 @@ static void scpuHDMIShowFailure()
 	s_HDMIDisplay->showFailure();
 }
 
-static bool scpuSaveRuntimeBusDiag()
+static void scpuAppendRuntimeBusDiag( char *dst, u32 capacity, u32 &length,
+	                                  const SCPURuntimeResult &r )
 {
-	static char haltBusDiag[ 16384 ];
-	const u32 size =
+	if ( length && dst[ length - 1 ] != '\n' )
+	{
+		scpuLineChar( dst, capacity, length, '\r' );
+		scpuLineChar( dst, capacity, length, '\n' );
+	}
+	scpuLineText( dst, capacity, length,
+	              "post-handoff runtime: build=355 handoff=" );
+	scpuLineDecimal( dst, capacity, length, r.valid ? 1 : 0 );
+	if ( r.valid )
+	{
+		scpuLineText( dst, capacity, length, " host-us=" );
+		scpuLineDecimal64( dst, capacity, length, r.hostUS );
+		scpuLineText( dst, capacity, length, " emu=" );
+		scpuLineDecimal64( dst, capacity, length, r.emuCycles );
+		scpuLineText( dst, capacity, length, " achieved-khz=" );
+		scpuLineDecimal64( dst, capacity, length, r.achievedKHz );
+		scpuLineText( dst, capacity, length, " ram-writes=" );
+		scpuLineDecimal64( dst, capacity, length, r.ramWrites );
+		scpuLineText( dst, capacity, length, " accepted=" );
+		scpuLineDecimal64( dst, capacity, length, r.acceptedWrites );
+		scpuLineText( dst, capacity, length, " skipped=" );
+		scpuLineDecimal64( dst, capacity, length, r.skippedWrites );
+		scpuLineText( dst, capacity, length, " posted-wait=" );
+		scpuLineDecimal64( dst, capacity, length, r.postedWaitCycles );
+		scpuLineText( dst, capacity, length, " slow=" );
+		scpuLineDecimal64( dst, capacity, length, r.slowCycles );
+		scpuLineText( dst, capacity, length, " iec-slow=" );
+		scpuLineDecimal64( dst, capacity, length, r.iecThrottledCycles );
+		scpuLineText( dst, capacity, length, " transfers=" );
+		scpuLineDecimal64( dst, capacity, length, r.transfers );
+		scpuLineText( dst, capacity, length, " iec=" );
+		scpuLineDecimal64( dst, capacity, length, r.serialTransfers );
+		scpuLineText( dst, capacity, length, " idle-primes=" );
+		scpuLineDecimal64( dst, capacity, length, r.idlePrimes );
+		scpuLineText( dst, capacity, length, " hdmi-max-band-us=" );
+		scpuLineDecimal( dst, capacity, length, r.maxBandUS );
+		scpuLineText( dst, capacity, length, " hdmi-missed=" );
+		scpuLineDecimal( dst, capacity, length, r.missedBandDeadlines );
+	}
+	scpuLineText( dst, capacity, length, "\r\n" );
+}
+
+static void scpuAppendRuntimePiDiag( char *dst, u32 capacity, u32 &length )
+{
+	u32 throttled = 0, clockHz = 0;
+	const bool throttledValid = scpuReadPiThrottled( throttled );
+	const bool clockValid = scpuReadPiARMClock( clockHz );
+	scpuLineText( dst, capacity, length, "post-handoff pi throttled=" );
+	if ( throttledValid )
+	{
+		scpuLineText( dst, capacity, length, "$" );
+		scpuLineHexU32( dst, capacity, length, throttled );
+	}
+	else
+		scpuLineText( dst, capacity, length, "QUERY-FAILED" );
+	scpuLineText( dst, capacity, length, " measured-arm-hz=" );
+	if ( clockValid ) scpuLineDecimal( dst, capacity, length, clockHz );
+	else              scpuLineText( dst, capacity, length, "QUERY-FAILED" );
+	scpuLineText( dst, capacity, length,
+	              " bits 0-3=live 16-19=sticky\r\n" );
+}
+
+static bool scpuSaveRuntimeBusDiag( const SCPURuntimeResult &runtime )
+{
+	static char haltBusDiag[ 32768 ];
+	u32 size =
 		radBus.formatSelfTestResults( haltBusDiag, sizeof haltBusDiag );
+	if ( !size ) return false;
+	scpuAppendRuntimeBusDiag( haltBusDiag, sizeof haltBusDiag, size, runtime );
+	scpuAppendPiThrottledDiag( haltBusDiag, sizeof haltBusDiag, size );
+	scpuAppendRuntimePiDiag( haltBusDiag, sizeof haltBusDiag, size );
 	return size && writeFile( s_Logger, SCPU_DRIVE, SCPU_BUS_DIAG_FILE,
 	                          (u8 *)haltBusDiag, size );
 }
@@ -1360,8 +1595,11 @@ void scpuBootRun( CLogger *logger )
 	logger->Write( "SCPU", LogNotice, "if you are reading this on HDMI, the Pi"
 	               " firmware and our kernel both loaded correctly" );
 	s_PiThrottledStartupValid = scpuReadPiThrottled( s_PiThrottledStartup );
+	s_PiARMClockStartupValid = scpuReadPiARMClock( s_PiARMClockStartup );
 	scpuLogPiThrottled( logger, "at startup", s_PiThrottledStartupValid,
 	                    s_PiThrottledStartup );
+	scpuLogPiARMClock( logger, "at startup", s_PiARMClockStartupValid,
+	                   s_PiARMClockStartup );
 
 	// One ACT-LED blink per milestone, so there is a signal even with no
 	// monitor attached. The Pi's own error codes are all >= 3 flashes, so a
@@ -1479,6 +1717,7 @@ void scpuBootRun( CLogger *logger )
 			CHDMIDisplay *display = new CHDMIDisplay( superCPU.memory() );
 			if ( display && display->initialize( logger ) )
 			{
+				display->watchBusActivity( radBus.serialCounter() );
 				s_HDMIDisplay = display;
 				if ( scpuPiUndervoltageSeen( s_PiThrottledStartupValid,
 				                             s_PiThrottledStartup ) )
@@ -1604,11 +1843,16 @@ void scpuBootRun( CLogger *logger )
 		radBus.c128KnownFirstTransferOnly();
 	s_PiThrottledPostSelfTestValid =
 		scpuReadPiThrottled( s_PiThrottledPostSelfTest );
+	s_PiARMClockPostSelfTestValid =
+		scpuReadPiARMClock( s_PiARMClockPostSelfTest );
 	{
 		CScopedLoggingIRQs powerLogIRQs;
 		scpuLogPiThrottled( logger, "after bus self-test",
 		                    s_PiThrottledPostSelfTestValid,
 		                    s_PiThrottledPostSelfTest );
+		scpuLogPiARMClock( logger, "after bus self-test",
+		                   s_PiARMClockPostSelfTestValid,
+		                   s_PiARMClockPostSelfTest );
 	}
 	if ( s_HDMIDisplay
 	     && scpuPiUndervoltageSeen( s_PiThrottledPostSelfTestValid,
@@ -2001,9 +2245,38 @@ void scpuBootRun( CLogger *logger )
 	{
 		if ( s_HDMIDisplay->start() )
 		{
-			// Do not wait on core 1. The first passive frame naturally replaces
-			// the blue ready screen while core 0 begins emulation immediately.
+			// The first passive frame naturally replaces the blue ready screen.
+			// K355 makes one bounded wait before emulation begins: prove that
+			// core 1 is actively rendering
+			// and repeat the read-eye scan under that exact electrical/thermal
+			// load. The quiet acquisition curve is retained alongside it.
 			s_HDMIPictureActive = true;
+			const u64 core1Deadline = radBus.hostCycles()
+			                        + SCPU_ARM_CLOCK_HZ / 4u;
+			while ( !s_HDMIDisplay->firstFrameReady()
+			        && radBus.hostCycles() < core1Deadline )
+				asm volatile( "yield" );
+			if ( s_HDMIDisplay->firstFrameReady() )
+			{
+				radBus.calibrateReadTimingUnderLoad();
+				static char loadedEyeDiag[ 65536 ];
+				u32 loadedEyeDiagSize = 0;
+				{
+					CScopedLoggingIRQs loadedEyeIRQs;
+					s_PiThrottledCore1Valid =
+						scpuReadPiThrottled( s_PiThrottledCore1 );
+					s_PiARMClockCore1Valid =
+						scpuReadPiARMClock( s_PiARMClockCore1 );
+					loadedEyeDiagSize = radBus.formatSelfTestResults(
+						loadedEyeDiag, sizeof loadedEyeDiag );
+					scpuAppendPiThrottledDiag( loadedEyeDiag,
+					                            sizeof loadedEyeDiag,
+					                            loadedEyeDiagSize );
+					if ( loadedEyeDiagSize )
+						writeFile( logger, SCPU_DRIVE, SCPU_BUS_DIAG_FILE,
+						           (u8 *)loadedEyeDiag, loadedEyeDiagSize );
+				}
+			}
 		}
 		else
 		{

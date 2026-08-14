@@ -79,6 +79,10 @@ public:
 	bool selfTest();
 	u8 selfTestFailure() const { return m_SelfTestFailure; }
 	bool c128KnownFirstTransferOnly() const;
+	// Repeat the ordinary-read eye scan after core 1 has completed an HDMI
+	// frame. The original quiet result is retained separately, while a valid
+	// loaded result becomes the production sample point for the ensuing run.
+	void calibrateReadTimingUnderLoad();
 	void logSelfTestResults( CLogger *logger ) const;
 	u32 formatSelfTestResults( char *dst, u32 capacity ) const;
 	// C64-only diagnostic: seed a broad physical-RAM sentinel and compare
@@ -188,6 +192,10 @@ public:
 	u64 readPrimes() const { return m_ReadPrimes; }
 	u64 transfers() const { return m_Transfers; }
 	u64 serialTransfers() const { return m_SerialTransfers; }
+	// Core 1 may observe the already-maintained CIA2 transfer total to stay
+	// out of live IEC handshakes. This adds no poll or synchronisation to the
+	// core-0 physical-access hot path; only the HDMI producer reads it.
+	const volatile u64 *serialCounter() const { return &m_SerialTransfers; }
 
 	bool acquired() const { return m_Acquired; }
 	void setTrafficHalted( bool halted );
@@ -291,6 +299,11 @@ private:
 	static const u32 READ_TIMING_REPETITIONS = 12;
 	u16        m_ReadTimingErrors[ READ_TIMING_SCORE_COUNT ];
 	u16        m_ReadTimingBestError, m_ReadTimingBestErrorSample;
+	bool       m_LoadedReadTimingRan;
+	u16        m_QuietReadTimingConfigured, m_QuietReadTimingStart,
+	           m_QuietReadTimingEnd, m_QuietReadTimingSelected,
+	           m_QuietReadTimingBestError, m_QuietReadTimingBestErrorSample;
+	u16        m_QuietReadTimingErrors[ READ_TIMING_SCORE_COUNT ];
 	// Observation-only split of the mixed RAM/VIC calibration. Production
 	// selection continues to use m_ReadTimingErrors until this identifies why
 	// $D020 contributes one failure per repetition on physical C64s.

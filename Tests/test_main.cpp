@@ -7,7 +7,9 @@ int g_TestsRun = 0;
 int g_TestsFailed = 0;
 const char *g_CurrentTest = "";
 
-#define MAX_TESTS 256
+// Keep ample headroom. Silently dropping every registration after 256 made a
+// growing suite report success while whichever tests linked last never ran.
+#define MAX_TESTS 512
 static const char *s_Names[ MAX_TESTS ];
 static TestFn      s_Fns[ MAX_TESTS ];
 static int         s_Count = 0;

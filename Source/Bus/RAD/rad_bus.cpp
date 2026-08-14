@@ -45,7 +45,11 @@ CRADBus::CRADBus()
 	  m_SelfTestFailure( 0 ),
 	  m_ReadTimingConfigured( 0 ), m_ReadTimingStart( 0 ), m_ReadTimingEnd( 0 ),
 	  m_ReadTimingSelected( 0 ), m_ReadTimingBestError( 0 ),
-	  m_ReadTimingBestErrorSample( 0 ), m_ReadTimingRAMBestError( 0 ),
+	  m_ReadTimingBestErrorSample( 0 ), m_LoadedReadTimingRan( false ),
+	  m_QuietReadTimingConfigured( 0 ), m_QuietReadTimingStart( 0 ),
+	  m_QuietReadTimingEnd( 0 ), m_QuietReadTimingSelected( 0 ),
+	  m_QuietReadTimingBestError( 0 ), m_QuietReadTimingBestErrorSample( 0 ),
+	  m_ReadTimingRAMBestError( 0 ),
 	  m_ReadTimingRAMBestSample( 0 ), m_ReadTimingRAMOnlyBestError( 0 ),
 	  m_ReadTimingRAMOnlyBestSample( 0 ),
 	  m_SnapshotKernalFirst( 0 ), m_SnapshotKernalReread( 0 ),
@@ -85,6 +89,7 @@ CRADBus::CRADBus()
 	for ( u32 i = 0; i < READ_TIMING_SCORE_COUNT; i++ )
 	{
 		m_ReadTimingErrors[ i ] = 0;
+		m_QuietReadTimingErrors[ i ] = 0;
 		m_ReadTimingRAMErrors[ i ] = 0;
 		m_ReadTimingRAMOnlyErrors[ i ] = 0;
 		m_ReadTimingMixedVICErrors[ i ] = 0;
@@ -1600,6 +1605,31 @@ void CRADBus::calibrateReadTiming()
 	// useful when acquisition later fails for an unrelated reason.
 	RAD_SPOKE( 0xD020, 0x0E );
 	m_Writes++;
+}
+
+void CRADBus::calibrateReadTimingUnderLoad()
+{
+	// Preserve the acquisition-time curve before calibrateReadTiming() reuses
+	// its working arrays. That first pass ran while core 1 was still parked;
+	// this pass runs only after the HDMI renderer has completed a whole frame.
+	m_QuietReadTimingConfigured = m_ReadTimingConfigured;
+	m_QuietReadTimingStart = m_ReadTimingStart;
+	m_QuietReadTimingEnd = m_ReadTimingEnd;
+	m_QuietReadTimingSelected = m_ReadTimingSelected;
+	m_QuietReadTimingBestError = m_ReadTimingBestError;
+	m_QuietReadTimingBestErrorSample = m_ReadTimingBestErrorSample;
+	for ( u32 i = 0; i < READ_TIMING_SCORE_COUNT; i++ )
+		m_QuietReadTimingErrors[ i ] = m_ReadTimingErrors[ i ];
+
+	calibrateReadTiming();
+	m_LoadedReadTimingRan = true;
+	RADLOG( "    read timing core1 A/B: quiet=%u..%u/%u loaded=%u..%u/%u",
+	        (unsigned)m_QuietReadTimingStart,
+	        (unsigned)m_QuietReadTimingEnd,
+	        (unsigned)m_QuietReadTimingSelected,
+	        (unsigned)m_ReadTimingStart,
+	        (unsigned)m_ReadTimingEnd,
+	        (unsigned)m_ReadTimingSelected );
 }
 
 bool CRADBus::verifyC64CIA2DDRA( u8 expected )
@@ -6477,6 +6507,45 @@ u32 CRADBus::formatSelfTestResults( char *dst, u32 capacity ) const
 	busDiagChar( dst, capacity, n, '/' );
 	busDiagDecimal( dst, capacity, n, (u32)m_ReadPrimes );
 	busDiagEndLine( dst, capacity, n );
+	if ( m_LoadedReadTimingRan )
+	{
+		busDiagText( dst, capacity, n,
+		             "read-eye core1 A/B quiet configured/selected/start/end/best/errors: " );
+		busDiagDecimal( dst, capacity, n, m_QuietReadTimingConfigured );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_QuietReadTimingSelected );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_QuietReadTimingStart );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_QuietReadTimingEnd );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_QuietReadTimingBestErrorSample );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_QuietReadTimingBestError );
+		busDiagText( dst, capacity, n,
+		             " loaded configured/selected/start/end/best/errors: " );
+		busDiagDecimal( dst, capacity, n, m_ReadTimingConfigured );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_ReadTimingSelected );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_ReadTimingStart );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_ReadTimingEnd );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_ReadTimingBestErrorSample );
+		busDiagChar( dst, capacity, n, '/' );
+		busDiagDecimal( dst, capacity, n, m_ReadTimingBestError );
+		busDiagEndLine( dst, capacity, n );
+		busDiagText( dst, capacity, n, "read-eye quiet sample/errors:" );
+		for ( u32 i = 0; i < READ_TIMING_SCORE_COUNT; i++ )
+		{
+			busDiagChar( dst, capacity, n, ' ' );
+			busDiagDecimal( dst, capacity, n, 300u + i * 5u );
+			busDiagChar( dst, capacity, n, '/' );
+			busDiagDecimal( dst, capacity, n, m_QuietReadTimingErrors[ i ] );
+		}
+		busDiagEndLine( dst, capacity, n );
+	}
 	busDiagText( dst, capacity, n,
 	             "read-eye configured/selected/stable-start/stable-end/best-sample/best-errors: " );
 	busDiagDecimal( dst, capacity, n, m_ReadTimingConfigured );

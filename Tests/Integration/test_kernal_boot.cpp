@@ -13,6 +13,67 @@
 #include "../../Source/SuperCPU/registers.h"
 #include "../../Source/SuperCPU/supercpu.h"
 #include "../../Source/Bus/Host/host_bus.h"
+#include "../../Source/Common/runtime_diagnostic.h"
+
+TEST( integration_runtime_diagnostic_reports_post_handoff_deltas )
+{
+	SCPURuntimeSample start = {};
+	start.handoff = true;
+	start.hostCycles = 100;
+	start.emuCycles = 200;
+	start.ramWrites = 300;
+	start.acceptedWrites = 350;
+	start.skippedWrites = 375;
+	start.postedWaitCycles = 380;
+	start.slowCycles = 390;
+	start.iecThrottledCycles = 395;
+	start.transfers = 400;
+	start.serialTransfers = 500;
+	start.idlePrimes = 600;
+
+	SCPURuntimeSample end = start;
+	end.hostCycles += 1400000;
+	end.emuCycles += 20000;
+	end.ramWrites += 700;
+	end.acceptedWrites += 710;
+	end.skippedWrites += 720;
+	end.postedWaitCycles += 730;
+	end.slowCycles += 740;
+	end.iecThrottledCycles += 750;
+	end.transfers += 800;
+	end.serialTransfers += 90;
+	end.idlePrimes += 10;
+	end.maxBandUS = 77;
+	end.missedBandDeadlines = 3;
+
+	const SCPURuntimeResult r = scpuRuntimeDelta( start, end, 1400000000 );
+	CHECK( r.valid );
+	CHECK_EQ( r.hostUS, 1000 );
+	CHECK_EQ( r.emuCycles, 20000 );
+	CHECK_EQ( r.achievedKHz, 20000 );
+	CHECK_EQ( r.ramWrites, 700 );
+	CHECK_EQ( r.acceptedWrites, 710 );
+	CHECK_EQ( r.skippedWrites, 720 );
+	CHECK_EQ( r.postedWaitCycles, 730 );
+	CHECK_EQ( r.slowCycles, 740 );
+	CHECK_EQ( r.iecThrottledCycles, 750 );
+	CHECK_EQ( r.transfers, 800 );
+	CHECK_EQ( r.serialTransfers, 90 );
+	CHECK_EQ( r.idlePrimes, 10 );
+	CHECK_EQ( r.maxBandUS, 77 );
+	CHECK_EQ( r.missedBandDeadlines, 3 );
+}
+
+TEST( integration_runtime_diagnostic_requires_handoff_and_elapsed_time )
+{
+	SCPURuntimeSample start = {};
+	SCPURuntimeSample end = {};
+	CHECK( !scpuRuntimeDelta( start, end, 1400000000 ).valid );
+	start.handoff = end.handoff = true;
+	CHECK( !scpuRuntimeDelta( start, end, 1400000000 ).valid );
+	end.hostCycles = 1;
+	CHECK( !scpuRuntimeDelta( start, end, 0 ).valid );
+}
 
 struct SystemFixture
 {
@@ -593,7 +654,7 @@ TEST( integration_configured_jiffy_switch_survives_supercpu_init_and_reset )
 	CHECK_EQ( v & SCPU_SWITCH_JIFFYDOS, 0x00 );
 }
 
-TEST( integration_hdmi_exclusive_mode_detaches_and_discards_physical_mirror )
+TEST( integration_hdmi_exclusive_mode_discards_delivery_but_keeps_posted_timing )
 {
 	CHostBus bus;
 	CSuperCPU scpu;
@@ -617,15 +678,56 @@ TEST( integration_hdmi_exclusive_mode_detaches_and_discards_physical_mirror )
 	// any physical bus traffic. VIC/CIA access itself is deliberately untouched.
 	scpu.disablePhysicalMirror();
 	CHECK( scpu.mirrorHalted() );
+	CHECK( !scpu.writeBuffer().deliveryEnabled() );
 	CHECK_EQ( scpu.writeBuffer().pending(), 0u );
+	const u64 physicalWrites = bus.m_Writes;
+	scpu.memory().setPacing( 0, 20000000 );
+	u64 cycleStart = scpu.memory().m_EmuCycles;
 	scpu.memory().write8( 0x0401, 0x42 );
+	CHECK( scpu.memory().fineTicksRequired() );
+	scpu.memory().tickFast( 4 );
+	CHECK_EQ( scpu.memory().m_EmuCycles - cycleStart, 4u );
 	CHECK_EQ( scpu.writeBuffer().pending(), 0u );
+	CHECK_EQ( bus.m_Writes, physicalWrites );
+
+	// The first write posts for free; the next accepted write waits for that
+	// slot's next 1MHz retirement boundary even though no physical mirror byte
+	// is transmitted.
+	cycleStart = scpu.memory().m_EmuCycles;
+	scpu.memory().write8( 0x0402, 0x43 );
+	scpu.memory().tickFast( 4 );
+	CHECK_EQ( scpu.memory().m_EmuCycles - cycleStart, 16u );
+	CHECK_EQ( scpu.writeBuffer().pending(), 0u );
+	CHECK_EQ( bus.m_Writes, physicalWrites );
 
 	// An emulated reset must not silently re-enable the native display path.
 	scpu.reset();
 	CHECK( scpu.mirrorHalted() );
 	scpu.memory().write8( 0x0402, 0x43 );
 	CHECK_EQ( scpu.writeBuffer().pending(), 0u );
+}
+
+TEST( integration_hdmi_posted_timing_respects_full_optimization )
+{
+	CHostBus bus;
+	CSuperCPU scpu;
+	u8 basic[ C64_BASIC_SIZE ] = {};
+	u8 kernal[ C64_KERNAL_SIZE ] = {};
+	kernal[ 0x1FFC ] = 0x00;
+	kernal[ 0x1FFD ] = 0xE0;
+	scpu.setBasicROM( basic );
+	scpu.setKernalROM( kernal );
+	CHECK( scpu.init( &bus, SCPU_CORE_6502, 0 ) );
+	scpu.writeBuffer().setOptMode( SCPU_OPT_FULL );
+	scpu.disablePhysicalMirror();
+	const u64 physicalWrites = bus.m_Writes;
+	scpu.memory().setPacing( 0, 20000000 );
+	scpu.memory().write8( 0x0400, 0x41 );
+	CHECK( !scpu.memory().fineTicksRequired() );
+	scpu.memory().tickFast( 4 );
+	CHECK_EQ( scpu.memory().m_MirrorStretchCycles, 0u );
+	CHECK_EQ( scpu.writeBuffer().pending(), 0u );
+	CHECK_EQ( bus.m_Writes, physicalWrites );
 }
 
 TEST( integration_hdmi_bus_keepalive_uses_host_time_and_is_opt_in )

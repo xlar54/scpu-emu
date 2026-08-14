@@ -408,6 +408,7 @@ void CC64Memory::reset()
 	m_CIA2ICRPending = 0;
 	m_CIA2ArmPending = 0;
 	m_BusEventCount = 0;
+	m_PostedWritePending = false;
 	m_MirrorBufferFreeAt = 0;
 	m_PendingFastHalfCycles = 0;
 	m_FastHalfCarry = 0;

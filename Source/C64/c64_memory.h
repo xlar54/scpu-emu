@@ -105,6 +105,15 @@ public:
 
 	void attachBus( IC64Bus *bus ) { m_C64 = bus; }
 	void setMirrorSink( IMirrorSink *sink ) { m_Mirror = sink; }
+	void enablePostedWriteTiming( bool on )
+	{
+		m_PostedWriteTimingEnable = on;
+		if ( !on )
+		{
+			m_PostedWritePending = false;
+			m_MirrorBufferFreeAt = 0;
+		}
+	}
 	void setIOInterceptor( IIOInterceptor *io )
 	{
 		m_IO = io;
@@ -304,6 +313,7 @@ public:
 	// as soon as an event appears, so only one instruction's events accumulate.
 	bool m_IOStretchEnable = true;			// config IO_STRETCH
 	bool m_MirrorStretchEnable = false;		// config MIRROR_STRETCH
+	bool m_PostedWriteTimingEnable = false;	// VIDEO_MODE 1, no physical mirror
 	enum BusTimingEvent : u8
 	{
 		BUS_EVENT_IO = 1,
@@ -313,6 +323,7 @@ public:
 	static const u32 BUS_EVENT_CAPACITY = 32;
 	u8   m_BusEvents[ BUS_EVENT_CAPACITY ];
 	u8   m_BusEventCount = 0;
+	bool m_PostedWritePending = false;
 	u64  m_MirrorBufferFreeAt = 0;
 	u64  m_IOStretchCycles = 0;				// statistics
 	u64  m_MirrorStretchCycles = 0;
@@ -334,12 +345,15 @@ public:
 	}
 	inline void noteMirrorWrite()
 	{
-		// On RAD the queued byte is delivered later over the physical bus, so
-		// MIRROR_STRETCH defaults off. In that mode it must be completely free:
-		// merely queuing an event makes fineTicksRequired() break the CPU batch
-		// after every RAM write even though tickFast() then discards the event.
-		if ( m_MirrorStretchEnable )
+		// Mode 0 pays the physical transfer in wall time, so MIRROR_STRETCH
+		// remains an opt-in compatibility switch there. HDMI-exclusive mode has
+		// no physical transfer at all and must account for the real card's one
+		// posted slot explicitly, independent of that switch.
+		if ( m_MirrorStretchEnable || m_PostedWriteTimingEnable )
+		{
 			noteTimingEvent( BUS_EVENT_MIRROR_WRITE );
+			if ( m_PostedWriteTimingEnable ) m_PostedWritePending = true;
+		}
 	}
 	inline void noteFastHalfCycles( u32 halfCycles )
 	{
@@ -489,14 +503,15 @@ public:
 			const u64 perC64 = effectiveCIAFactor();
 			u64 ioExtra = 0;
 			u64 mirrorExtra = 0;
-			if ( m_IOStretchEnable && perC64 > 1 )
+			if ( perC64 > 1 )
 			{
 				for ( u32 i = 0; i < m_BusEventCount; i++ )
 				{
 					const BusTimingEvent event = (BusTimingEvent)m_BusEvents[ i ];
 					if ( event == BUS_EVENT_MIRROR_WRITE )
 					{
-						if ( !m_MirrorStretchEnable )
+						if ( !m_MirrorStretchEnable
+						     && !m_PostedWriteTimingEnable )
 						{
 							m_MirrorBufferFreeAt = 0;
 							continue;
@@ -517,6 +532,14 @@ public:
 					}
 
 					// Any real I/O access first drains the posted write buffer.
+					// With I/O stretch disabled the physical access itself already
+					// consumed the wall-clock interval, so simply mark the slot free;
+					// do not bill the guest for that interval a second time.
+					if ( !m_IOStretchEnable )
+					{
+						m_MirrorBufferFreeAt = 0;
+						continue;
+					}
 					if ( m_EmuCycles < m_MirrorBufferFreeAt )
 					{
 						const u64 wait = m_MirrorBufferFreeAt - m_EmuCycles;
@@ -540,6 +563,7 @@ public:
 				}
 			}
 			m_BusEventCount = 0;
+			m_PostedWritePending = false;
 			const u64 extra = ioExtra + mirrorExtra;
 			if ( extra )
 			{
@@ -694,7 +718,8 @@ public:
 	// automatic throttle timer is not armed).
 	bool fineTicksRequired() const
 	{
-		return m_IECHoldCycles != 0 || m_IECActivityCycles != 0
+		return m_PostedWritePending
+		    || m_IECHoldCycles != 0 || m_IECActivityCycles != 0
 		    || m_IECPollHoldCycles != 0
 		    || m_CIA2NMIDeadline != 0 || m_CIA2ArmPending != 0
 		    || ( m_SelectedEmulatedHz != 0
@@ -880,6 +905,10 @@ public:
 	// bus object and therefore cannot turn HDMI rendering into physical traffic.
 	const u8 *ramShadow() const     { return m_RAM; }
 	const u8 *charROMShadow() const { return m_CharROM; }
+	const u8 *colourRAMShadow() const
+	{
+		return m_ROMShadow ? m_ROMShadow + 0xD800 : 0;
+	}
 	u8 vicRegister( u8 reg ) const  { return m_VICRegShadow[ reg & 0x3F ]; }
 	u8 colourRAM( u16 offset ) const
 	{

@@ -86,6 +86,13 @@ public:
 	void setOptMode( SCPUOptMode mode );
 	SCPUOptMode optMode() const { return m_Mode; }
 
+	// HDMI-exclusive mode still needs the real SuperCPU's optimisation policy
+	// to decide which writes consume its one posted slot, but must never queue
+	// a byte for the physical VIC. In timing-only mode onRamWrite() returns the
+	// policy decision without adding anything to the delivery queue.
+	void setDeliveryEnabled( bool enabled ) { m_DeliveryEnabled = enabled; }
+	bool deliveryEnabled() const { return m_DeliveryEnabled; }
+
 	// When true, zero page and stack ($0000-$01FF) are never mirrored. The
 	// SuperCPU exposes this as the "Z flag" alongside the optimization mode:
 	// almost nothing points the VIC at page 0 or 1, and CPU traffic there is
@@ -265,6 +272,7 @@ private:
 
 	SCPUOptMode m_Mode;
 	bool        m_ExcludeZPStack;
+	bool        m_DeliveryEnabled;
 
 	// Region the current mode mirrors, as an inclusive address range.
 	u16 m_RangeLo, m_RangeHi;

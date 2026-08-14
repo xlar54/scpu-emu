@@ -30,6 +30,7 @@ CWriteBuffer::CWriteBuffer()
 	  m_IOWindowSuppressed( 0 ),
 	  m_Bus( 0 ), m_RAM( 0 ),
 	  m_Mode( SCPU_OPT_DEFAULT ), m_ExcludeZPStack( true ),
+	  m_DeliveryEnabled( true ),
 	  m_RangeLo( 0x0000 ), m_RangeHi( 0xFFFF ),
 	  m_Head( 0 ), m_Count( 0 )
 {
@@ -153,6 +154,22 @@ bool CWriteBuffer::shouldMirror( u16 addr ) const
 
 bool CWriteBuffer::onRamWrite( u16 addr, u8 value )
 {
+	// VIDEO_MODE 1 owns presentation from Pi shadow RAM. Keep only the real
+	// card's optimisation decision for posted-write timing; do not relocate,
+	// eliminate, dirty or enqueue a byte that can never be delivered. A real
+	// SuperCPU cannot eliminate same-value writes here, so every policy-accepted
+	// write consumes the slot.
+	if ( !m_DeliveryEnabled )
+	{
+		if ( shouldMirror( addr ) )
+		{
+			m_WritesAccepted++;
+			return true;
+		}
+		m_WritesSkipped++;
+		return false;
+	}
+
 	// Under-I/O shape relocation, when armed. A write into a relocated
 	// $D000-$DFFF block is forwarded to the block's deliverable copy; a
 	// program write into the copy's own underlying address is suppressed,
