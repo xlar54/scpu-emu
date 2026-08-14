@@ -114,6 +114,7 @@ void CSCPUKernel::Run( void )
 	radMountFileSystem();
 
 	scpuBootLoadConfig( logger );
+	scpuBootSetFrameBuffer( m_Screen.GetFrameBuffer(), &m_Screen );
 	scpuBootRun( logger );
 
 	// scpuBootRun() only returns on a failure it has already logged.

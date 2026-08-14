@@ -701,6 +701,21 @@ public:
 	// raster polling: the slow protocol assigns meaning to pauses, so the CPU
 	// must not be stalled mid-transaction whatever the pacing mode.
 	bool iecBusActive() const { return m_IECActivityCycles != 0; }
+
+	// VIDEO_MODE 1's renderer is a one-way observer of serial-port activity.
+	// Core 0 publishes an epoch BEFORE each $DD00/$DD02 access; core 1 may then
+	// abandon cached rendering or uncached framebuffer writes, but can never
+	// make the timed IEC path wait. Disabled by default so VIDEO_MODE 0 does no
+	// atomic work and follows its established bus path unchanged.
+	void setHDMISerialObservation( bool enabled )
+	{
+		__atomic_store_n( &m_HDMISerialObservation, enabled ? 1u : 0u,
+		                  __ATOMIC_RELEASE );
+	}
+	u32 hdmiSerialAccessCount() const
+	{
+		return __atomic_load_n( &m_HDMISerialAccesses, __ATOMIC_ACQUIRE );
+	}
 	typedef void (*TimingHook)( void *ctx );
 	void setTimingHook( TimingHook hook, void *ctx ) { m_TimingHook = hook; m_TimingHookCtx = ctx; }
 	u64  m_IECThrottleEvents;
@@ -841,6 +856,8 @@ private:
 	// m_IECHoldCycles because iecBusActive() -- the MIRROR gate -- must never
 	// see it: polls suppressing mirroring is the blackout latch-up.
 	u32  m_IECPollHoldCycles = 0;
+	volatile u32 m_HDMISerialObservation = 0;
+	volatile u32 m_HDMISerialAccesses = 0;
 public:
 	// Largest single tickFast() chunk seen. The 65816 run() loop batches bus
 	// ticks for speed but must drop to per-instruction ticks while the serial
@@ -849,6 +866,12 @@ public:
 	// so a test can PROVE the granularity contract instead of trusting it.
 	u32  m_MaxTickChunk = 0;
 private:
+	inline void noteHDMISerialAccess()
+	{
+		if ( __atomic_load_n( &m_HDMISerialObservation, __ATOMIC_RELAXED ) )
+			__atomic_add_fetch( &m_HDMISerialAccesses, 1u, __ATOMIC_RELEASE );
+	}
+
 	// CIA2 port A has three different pieces of state. A port read contains
 	// live PA6/PA7 input pins, so it must never replace the output-latch
 	// baseline used to recognise PA3-PA5 IEC transitions. DDRA determines
@@ -870,6 +893,17 @@ public:
 	// The sprite-pointer tracker already follows both $D018 and CIA2's VIC-bank
 	// select, so deriving the matrix here keeps the mirror scheduler on exactly
 	// the same live state without another copy to go stale.
+	// Read-only shadow access for passive display consumers. These expose no
+	// bus object and therefore cannot turn HDMI rendering into physical traffic.
+	const u8 *ramShadow() const     { return m_RAM; }
+	const u8 *charROMShadow() const { return m_CharROM; }
+	u8 vicRegister( u8 reg ) const  { return m_VICRegShadow[ reg & 0x3F ]; }
+	u8 colourRAM( u16 offset ) const
+	{
+		return m_ROMShadow
+		     ? m_ROMShadow[ 0xD800 + ( offset & 0x03FF ) ] & 0x0F : 14;
+	}
+
 	u32 activeScreenBase() const
 	{
 		return m_SpritePtrBase == 0xFFFFFFFF

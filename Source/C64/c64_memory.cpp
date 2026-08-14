@@ -627,6 +627,10 @@ u8 CC64Memory::read8( scpu_addr_t addr )
 					noteBusAccess( a, false );
 				return v;
 			}
+			// Reading PRA is how the serial receive path polls CLK/DATA on
+			// bits 6-7. DDRA reads are not traffic and must not stop a renderer.
+			if ( a == 0xDD00 )
+				noteHDMISerialAccess();
 
 			// Deliberately no flush here. Flushing before every I/O access
 			// meant a booting KERNAL -- which touches I/O constantly -- drove
@@ -807,6 +811,18 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 			                             | ( 1u << 24 ) | ( 1u << 25 );
 			return;
 		}
+		// $DD00 also selects the VIC bank in bits 0-1. Publishing every write
+		// made bank-flipping games look like permanent disk traffic, so arm HDMI
+		// only when an IEC output bit changes. Likewise, only changes to the IEC
+		// direction bits of DDRA matter. Unknown initial latch state counts once.
+		const bool hdmiSerialWrite =
+			( a == 0xDD00
+			  && ( !m_HaveCIA2PortALatch
+			       || ( ( m_CIA2PortALatch ^ value ) & 0x38 ) != 0 ) )
+		 || ( a == 0xDD02
+			  && ( !m_HaveCIA2DDRA
+			       || ( ( m_CIA2DDRA ^ value ) & 0x38 ) != 0 ) );
+		if ( hdmiSerialWrite ) noteHDMISerialAccess();
 
 		// Work out whether this can affect a physical IEC output. Unknown CIA
 		// state is deliberately treated as a change: a harmless initial 1MHz

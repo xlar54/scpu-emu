@@ -68,6 +68,12 @@ public:
 	void Run( unsigned core ) override;
 };
 
+// Core 1 is otherwise idle. A passive Pi-side task can claim it once. The task
+// must never touch the Commodore bus; core 0 owns emulation and core 3 owns the
+// C128 refresh service.
+typedef void (*RADCoreTask)( void *context );
+void radSetCore1Task( RADCoreTask task, void *context );
+
 // Called only while RAD owns the host under /DMA. Start returns after core 3
 // has acknowledged the request. Stop returns only after it has reasserted
 // /DMA and stopped touching the pin.

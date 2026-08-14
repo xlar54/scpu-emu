@@ -31,7 +31,9 @@
    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 #include "boot.h"
+#include "hdmi_display.h"
 #include <circle/actled.h>
+#include <circle/bcmpropertytags.h>
 #include <circle/startup.h>
 #include <circle/synchronize.h>
 
@@ -115,6 +117,22 @@ static bool scpuLineHexByte( char *dst, u32 capacity, u32 &length, u8 v )
 	static const char *h = "0123456789ABCDEF";
 	return scpuLineChar( dst, capacity, length, h[ v >> 4 ] )
 	    && scpuLineChar( dst, capacity, length, h[ v & 15 ] );
+}
+
+static bool scpuLineText( char *dst, u32 capacity, u32 &length, const char *s )
+{
+	while ( s && *s )
+		if ( !scpuLineChar( dst, capacity, length, *s++ ) ) return false;
+	return true;
+}
+
+static bool scpuLineHexU32( char *dst, u32 capacity, u32 &length, u32 v )
+{
+	static const char *h = "0123456789ABCDEF";
+	for ( s32 shift = 28; shift >= 0; shift -= 4 )
+		if ( !scpuLineChar( dst, capacity, length,
+		                     h[ ( v >> shift ) & 15 ] ) ) return false;
+	return true;
 }
 
 static bool scpuLineDecimal( char *dst, u32 capacity, u32 &length, u32 v )
@@ -601,9 +619,12 @@ static void scpuHoldC128FreezeDiagnostic( CSuperCPU *scpu )
 	}
 }
 
+static void scpuPromoteHDMIExclusive( CSuperCPU *scpu );
+
 static bool scpuCheckButton( void *ctx )
 {
 	CSuperCPU *scpu = (CSuperCPU *)ctx;
+	scpuPromoteHDMIExclusive( scpu );
 	const bool hardwareResetPressed = radBusHardwareResetPressed();
 
 	// Do not wait for a formal stall during initial native-C128 bring-up. A bad
@@ -932,6 +953,125 @@ static bool scpuRunFrameAndCheckButtons( CSuperCPU &scpu )
 static CRADBus   radBus;
 static CActLED   actLED;
 static CSuperCPU superCPU;
+static CBcmFrameBuffer *s_BootFrameBuffer = 0;
+static CDevice *s_BootScreenTarget = 0;
+static CHDMIDisplay *s_HDMIDisplay = 0;
+static bool s_HDMIPictureActive = false;
+static bool s_HDMIExclusive = false;
+static bool s_HDMILoggerDetached = false;
+static u32 s_PiThrottledStartup = 0;
+static u32 s_PiThrottledPostSelfTest = 0;
+static bool s_PiThrottledStartupValid = false;
+static bool s_PiThrottledPostSelfTestValid = false;
+
+static const u32 SCPU_PI_UNDERVOLTAGE_NOW = 1u << 0;
+static const u32 SCPU_PI_UNDERVOLTAGE_OCCURRED = 1u << 16;
+
+static void scpuPromoteHDMIExclusive( CSuperCPU *scpu )
+{
+	// Do not give up the known physical presentation path merely because the
+	// HDMI task was scheduled. Wait for proof that core 1 completed a frame;
+	// the next core-0 frame hook then performs the mirror handoff without ever
+	// waiting on core 1. This path exists only for VIDEO_MODE 1.
+	if ( !scpu || s_HDMIExclusive || !s_HDMIPictureActive
+	     || !s_HDMIDisplay || !s_HDMIDisplay->firstFrameReady() )
+		return;
+
+	scpu->disablePhysicalMirror();
+	s_HDMIExclusive = true;
+}
+
+static bool scpuReadPiThrottled( u32 &state )
+{
+	CBcmPropertyTags tags;
+	TPropertyTagSimple tag;
+	tag.nValue = 0;
+	if ( !tags.GetTag( PROPTAG_GET_THROTTLED, &tag, sizeof tag, 4 ) )
+	{
+		state = 0;
+		return false;
+	}
+	state = tag.nValue;
+	return true;
+}
+
+static bool scpuPiUndervoltageSeen( bool valid, u32 state )
+{
+	return valid && ( state & ( SCPU_PI_UNDERVOLTAGE_NOW
+	                           | SCPU_PI_UNDERVOLTAGE_OCCURRED ) ) != 0;
+}
+
+static void scpuLogPiThrottled( CLogger *logger, const char *when,
+	                            bool valid, u32 state )
+{
+	if ( !valid )
+	{
+		logger->Write( "SCPU", LogWarning,
+		               "Pi power %s: GET_THROTTLED query failed", when );
+		return;
+	}
+
+	const bool warning = ( state & 0x000F000Fu ) != 0;
+	logger->Write( "SCPU", warning ? LogWarning : LogNotice,
+	               "Pi power %s: throttled=$%08X "
+	               "live[uv/cap/throttle/temp]=%u/%u/%u/%u "
+	               "sticky=%u/%u/%u/%u",
+	               when, (unsigned)state,
+	               (unsigned)( ( state >> 0 ) & 1 ),
+	               (unsigned)( ( state >> 1 ) & 1 ),
+	               (unsigned)( ( state >> 2 ) & 1 ),
+	               (unsigned)( ( state >> 3 ) & 1 ),
+	               (unsigned)( ( state >> 16 ) & 1 ),
+	               (unsigned)( ( state >> 17 ) & 1 ),
+	               (unsigned)( ( state >> 18 ) & 1 ),
+	               (unsigned)( ( state >> 19 ) & 1 ) );
+}
+
+static void scpuAppendPiThrottledDiag( char *dst, u32 capacity, u32 &length )
+{
+	if ( length && dst[ length - 1 ] != '\n' )
+	{
+		scpuLineChar( dst, capacity, length, '\r' );
+		scpuLineChar( dst, capacity, length, '\n' );
+	}
+	scpuLineText( dst, capacity, length, "pi throttled: startup=" );
+	if ( s_PiThrottledStartupValid )
+	{
+		scpuLineText( dst, capacity, length, "$" );
+		scpuLineHexU32( dst, capacity, length, s_PiThrottledStartup );
+	}
+	else
+		scpuLineText( dst, capacity, length, "QUERY-FAILED" );
+	scpuLineText( dst, capacity, length, " post-selftest=" );
+	if ( s_PiThrottledPostSelfTestValid )
+	{
+		scpuLineText( dst, capacity, length, "$" );
+		scpuLineHexU32( dst, capacity, length, s_PiThrottledPostSelfTest );
+	}
+	else
+		scpuLineText( dst, capacity, length, "QUERY-FAILED" );
+	scpuLineText( dst, capacity, length,
+	              " bits 0-3=live 16-19=sticky\r\n" );
+}
+
+void scpuBootSetFrameBuffer( CBcmFrameBuffer *frameBuffer,
+	                         CDevice *screenTarget )
+{
+	s_BootFrameBuffer = frameBuffer;
+	s_BootScreenTarget = screenTarget;
+}
+
+static void scpuHDMIShowFailure( CLogger *logger )
+{
+	if ( !s_HDMIDisplay ) return;
+	// Reattach first, as agreed: the following logger writes must have a live
+	// target. Painting red second leaves the failure text visible over it.
+	if ( s_HDMILoggerDetached && s_BootScreenTarget )
+		logger->SetNewTarget( s_BootScreenTarget );
+	s_HDMILoggerDetached = false;
+	s_HDMIPictureActive = false;
+	s_HDMIDisplay->showFailure();
+}
 
 static bool scpuSaveRuntimeBusDiag()
 {
@@ -1223,6 +1363,9 @@ void scpuBootRun( CLogger *logger )
 	logger->Write( "SCPU", LogNotice, "SCPU-EMU starting" );
 	logger->Write( "SCPU", LogNotice, "if you are reading this on HDMI, the Pi"
 	               " firmware and our kernel both loaded correctly" );
+	s_PiThrottledStartupValid = scpuReadPiThrottled( s_PiThrottledStartup );
+	scpuLogPiThrottled( logger, "at startup", s_PiThrottledStartupValid,
+	                    s_PiThrottledStartup );
 
 	// One ACT-LED blink per milestone, so there is a signal even with no
 	// monitor attached. The Pi's own error codes are all >= 3 flashes, so a
@@ -1326,6 +1469,28 @@ void scpuBootRun( CLogger *logger )
 	logger->Write( "SCPU", LogNotice, "mirror: under-I/O sprite relocation %s",
 	               cfgMirrorD000Relocate ? "on" : "off" );
 
+	// Construct and validate while Circle's framebuffer and logger are still
+	// fully available, but do not start core 1 until all physical bus
+	// calibration and self-test work is complete.
+	if ( cfgVideoMode == SCPU_CFG_VIDEO_VICII )
+	{
+		CHDMIDisplay *display = new CHDMIDisplay( superCPU.memory() );
+		if ( display && display->initialize( s_BootFrameBuffer, logger ) )
+		{
+			s_HDMIDisplay = display;
+			logger->Write( "SCPU", LogNotice,
+			               "video: VIC-II shadow renderer armed for HDMI" );
+		}
+		else
+			logger->Write( "SCPU", LogError,
+			               "video: HDMI renderer unavailable; retaining console" );
+	}
+	else if ( cfgVideoMode == SCPU_CFG_VIDEO_VDC )
+		logger->Write( "SCPU", LogWarning,
+		               "video: VDC HDMI output is not implemented yet" );
+	else
+		logger->Write( "SCPU", LogNotice, "video: firmware text console" );
+
 	// Say once whether the per-second line will follow, so a quiet log reads
 	// as configured rather than wedged. Stall detection is armed either way.
 	logger->Write( "SCPU", LogNotice, "heartbeat: %s (stall detector always armed)",
@@ -1360,18 +1525,37 @@ void scpuBootRun( CLogger *logger )
 	// live. Logging is bought back the other way instead -- CScopedLoggingIRQs
 	// unmasks around individual log writes, which happen between bus
 	// operations, never inside one.
+	// VIDEO_MODE 1 uses a status screen instead of startup text. Blue means the
+	// RAD is initialised and is now waiting for the Commodore to be powered on.
+	// Diagnostic-only images retain the console because their text is the test
+	// result. VIDEO_MODE 0 never enters this block.
+	if ( s_HDMIDisplay && cfgBusAccessSentinel == 0 )
+	{
+		if ( scpuPiUndervoltageSeen( s_PiThrottledStartupValid,
+		                             s_PiThrottledStartup ) )
+			s_HDMIDisplay->showFailure();
+		else
+			s_HDMIDisplay->showReady();
+		logger->SetNewTarget( 0 );
+		s_HDMILoggerDetached = true;
+	}
+
 	DisableIRQs();
 
 	if ( !superCPU.init( &radBus, core, SCPU_SIMM_16MB ) )
 	{
 		// init() releases /DMA on every failure path, so the C64 is running its
 		// own CPU again and is usable -- it simply has no accelerator.
+		{
+		CScopedLoggingIRQs failIRQs;
+		scpuHDMIShowFailure( logger );
 		logger->Write( "SCPU", LogError,
 		               "startup failed: no machine detected, no safe DMA handover "
 		               "point found, or no usable KERNAL. The C64 has been released "
 		               "and continues to run normally." );
 		logger->Write( "SCPU", LogNotice,
 		               "press the RAD button to reboot and retry." );
+		}
 		scpuWaitForButtonThenReboot();
 	}
 
@@ -1424,6 +1608,18 @@ void scpuBootRun( CLogger *logger )
 	const bool busSelfTestPassed = radBus.selfTest();
 	const bool c128KnownFirstTransferOnly =
 		radBus.c128KnownFirstTransferOnly();
+	s_PiThrottledPostSelfTestValid =
+		scpuReadPiThrottled( s_PiThrottledPostSelfTest );
+	{
+		CScopedLoggingIRQs powerLogIRQs;
+		scpuLogPiThrottled( logger, "after bus self-test",
+		                    s_PiThrottledPostSelfTestValid,
+		                    s_PiThrottledPostSelfTest );
+	}
+	if ( s_HDMIDisplay
+	     && scpuPiUndervoltageSeen( s_PiThrottledPostSelfTestValid,
+		                              s_PiThrottledPostSelfTest ) )
+		s_HDMIDisplay->showFailure();
 	// Kernel154 established the physical retention bound: perfect through 2 ms,
 	// first stable decay at 4 ms. Production epochs are conservatively sized
 	// from that result, so do not repeat the minute-long ladder on every boot.
@@ -1432,7 +1628,8 @@ void scpuBootRun( CLogger *logger )
 		// fails. The SD write happens between bus operations with /DMA held and
 		// IRQs temporarily enabled; it cannot alter the C128-side measurement.
 		static char busDiag[ 65536 ];
-		const u32 busDiagSize = radBus.formatSelfTestResults( busDiag, sizeof busDiag );
+		u32 busDiagSize = radBus.formatSelfTestResults( busDiag, sizeof busDiag );
+		scpuAppendPiThrottledDiag( busDiag, sizeof busDiag, busDiagSize );
 		CScopedLoggingIRQs diagFileIRQs;
 		if ( busDiagSize && writeFile( logger, SCPU_DRIVE, SCPU_BUS_DIAG_FILE,
 		                               (u8 *)busDiag, busDiagSize ) )
@@ -1454,6 +1651,7 @@ void scpuBootRun( CLogger *logger )
 		// unusable. Hand the C64 back instead: it returns to its own CPU and
 		// the log above stays on screen to be read.
 		CScopedLoggingIRQs failIRQs;
+		scpuHDMIShowFailure( logger );
 		radBus.logSelfTestResults( logger );
 		if ( cfgBusHaltAfterS > 0 )
 		{
@@ -1803,7 +2001,29 @@ void scpuBootRun( CLogger *logger )
 		for ( ;; ) asm volatile( "wfe" );
 	}
 
+	// Measurements are finished. Core 1 may now read Pi shadow and write the
+	// existing framebuffer without sharing any physical-bus path with core 0.
+	if ( s_HDMIDisplay )
+	{
+		superCPU.memory().setHDMISerialObservation( true );
+		if ( s_HDMIDisplay->start() )
+		{
+			// Do not wait on core 1. The first passive frame naturally replaces
+			// the blue ready screen while core 0 begins emulation immediately.
+			s_HDMIPictureActive = true;
+		}
+		else
+		{
+			superCPU.memory().setHDMISerialObservation( false );
+			CScopedLoggingIRQs failIRQs;
+			scpuHDMIShowFailure( logger );
+			logger->Write( "SCPU", LogError,
+			               "HDMI renderer did not start; retaining the console" );
+		}
+	}
+
 	actLED.Blink( 4 );		// milestone: handing over to the CPU core
+	if ( !s_HDMIPictureActive )
 	{
 	CScopedLoggingIRQs handoverIRQs;
 	logger->Write( "SCPU", LogNotice, "starting the CPU core" );
@@ -1826,13 +2046,14 @@ void scpuBootRun( CLogger *logger )
 		}
 	}
 
-	if ( !startupInterrupted && scpuWaitForDiagnosticWindow( superCPU ) )
+	if ( !s_HDMIPictureActive && !startupInterrupted
+	     && scpuWaitForDiagnosticWindow( superCPU ) )
 		scpuDumpEmulatedScreen( logger, superCPU );
 
 	// Calibration runs before the successful boot and its original log lines
 	// have scrolled away by now. Repeat the retained results last so hardware
 	// testing does not require photographing a transient early boot screen.
-	if ( !startupInterrupted )
+	if ( !s_HDMIPictureActive && !startupInterrupted )
 	{
 		CScopedLoggingIRQs resultIRQs;
 		radBus.logSelfTestResults( logger );

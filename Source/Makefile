@@ -20,6 +20,8 @@ CIRCLEHOME = ../..
 OBJS = \
 	App/main.o \
 	App/boot.o \
+	App/hdmi_display.o \
+	Video/vic_renderer.o \
 	CPU/M6502/m6502.o \
 	CPU/M6502/m6502_opcodes.o \
 	CPU/W65C816/w65c816.o \
@@ -85,4 +87,4 @@ SuperCPU/supercpu.o:          CPPFLAGS += -O3
 EXTRACLEAN = App/*.o App/*.d CPU/M6502/*.o CPU/M6502/*.d \
              CPU/W65C816/*.o CPU/W65C816/*.d C64/*.o C64/*.d \
              SuperCPU/*.o SuperCPU/*.d Bus/RAD/*.o Bus/RAD/*.d \
-             Common/*.o Common/*.d
+             Common/*.o Common/*.d Video/*.o Video/*.d

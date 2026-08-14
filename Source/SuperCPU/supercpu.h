@@ -134,6 +134,14 @@ public:
 	void setMirrorHalted( bool halted ) { m_MirrorHalted = halted; }
 	bool mirrorHalted() const           { return m_MirrorHalted; }
 
+	// VIDEO_MODE 1 owns presentation after its first completed HDMI frame.
+	// Make that handoff one-way: stop accepting new VIC-visible RAM writes,
+	// forget anything already queued, and prevent both ordinary drains and the
+	// background resync sweep from touching physical DRAM. Immediate VIC/CIA
+	// register accesses remain live because they are part of machine semantics,
+	// not display mirroring. VIDEO_MODE 0 never calls this method.
+	void disablePhysicalMirror();
+
 	// Under-I/O sprite-shape relocation (MIRROR_D000_RELOCATE); see
 	// CC64Memory's relocation section. On by default; the switch exists so a
 	// game that goes wrong with it can prove it with one config line.

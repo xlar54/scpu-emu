@@ -27,6 +27,15 @@ CSuperCPU::CSuperCPU()
 {
 }
 
+void CSuperCPU::disablePhysicalMirror()
+{
+	// Detach first so no later emulated RAM write can refill the queue. This is
+	// called by core 0 at a frame boundary; core 1 only reads the shadow.
+	m_Memory.setMirrorSink( 0 );
+	m_WriteBuffer.discard();
+	m_MirrorHalted = true;
+}
+
 bool CSuperCPU::init( IC64Bus *bus, SCPUCoreType core, u32 simmMB )
 {
 	m_Bus = bus;

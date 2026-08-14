@@ -584,6 +584,85 @@ TEST( integration_configured_jiffy_switch_survives_supercpu_init_and_reset )
 	CHECK_EQ( v & SCPU_SWITCH_JIFFYDOS, 0x00 );
 }
 
+TEST( integration_hdmi_exclusive_mode_detaches_and_discards_physical_mirror )
+{
+	CHostBus bus;
+	CSuperCPU scpu;
+	u8 basic[ C64_BASIC_SIZE ];
+	u8 kernal[ C64_KERNAL_SIZE ];
+	std::memset( basic, 0xEA, sizeof basic );
+	std::memset( kernal, 0xEA, sizeof kernal );
+	kernal[ 0x1FFC ] = 0x00;
+	kernal[ 0x1FFD ] = 0xE0;
+	scpu.setBasicROM( basic );
+	scpu.setKernalROM( kernal );
+	CHECK( scpu.init( &bus, SCPU_CORE_6502, 0 ) );
+	scpu.writeBuffer().setOptMode( SCPU_OPT_NONE );
+
+	// Before HDMI takes ownership, RAM writes still enter the physical mirror.
+	scpu.memory().write8( 0x0400, 0x41 );
+	CHECK_EQ( scpu.writeBuffer().pending(), 1u );
+	CHECK( !scpu.mirrorHalted() );
+
+	// The handoff drops stale work and prevents later RAM writes from creating
+	// any physical bus traffic. VIC/CIA access itself is deliberately untouched.
+	scpu.disablePhysicalMirror();
+	CHECK( scpu.mirrorHalted() );
+	CHECK_EQ( scpu.writeBuffer().pending(), 0u );
+	scpu.memory().write8( 0x0401, 0x42 );
+	CHECK_EQ( scpu.writeBuffer().pending(), 0u );
+
+	// An emulated reset must not silently re-enable the native display path.
+	scpu.reset();
+	CHECK( scpu.mirrorHalted() );
+	scpu.memory().write8( 0x0402, 0x43 );
+	CHECK_EQ( scpu.writeBuffer().pending(), 0u );
+}
+
+TEST( integration_hdmi_serial_observer_counts_only_iec_port_accesses_when_enabled )
+{
+	CHostBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+
+	mem.read8( 0xDD00 );
+	mem.write8( 0xDD02, 0x3F );
+	CHECK_EQ( mem.hdmiSerialAccessCount(), 0u );
+
+	mem.setHDMISerialObservation( true );
+	mem.read8( 0xDC00 );
+	mem.write8( 0xD020, 6 );
+	CHECK_EQ( mem.hdmiSerialAccessCount(), 0u );
+	// DDRA reads and VIC-bank-only writes are not serial activity.
+	mem.read8( 0xDD02 );
+	CHECK_EQ( mem.hdmiSerialAccessCount(), 0u );
+	mem.read8( 0xDD00 );
+	CHECK_EQ( mem.hdmiSerialAccessCount(), 1u );
+	// The first PRA write has no authoritative old latch and counts once.
+	mem.write8( 0xDD00, 0x03 );
+	CHECK_EQ( mem.hdmiSerialAccessCount(), 2u );
+	mem.write8( 0xDD00, 0x00 );	// bits 0-1 only: VIC bank
+	CHECK_EQ( mem.hdmiSerialAccessCount(), 2u );
+	mem.write8( 0xDD00, 0x08 );	// IEC bit 3 changes
+	CHECK_EQ( mem.hdmiSerialAccessCount(), 3u );
+	mem.write8( 0xDD00, 0x08 );	// same value
+	CHECK_EQ( mem.hdmiSerialAccessCount(), 3u );
+
+	// DDRA was established as $3F before observation. Same-value and changes
+	// outside bits 3-5 do not count; an IEC direction change does.
+	mem.write8( 0xDD02, 0x3F );
+	CHECK_EQ( mem.hdmiSerialAccessCount(), 3u );
+	mem.write8( 0xDD02, 0x3B );	// bit 2 only
+	CHECK_EQ( mem.hdmiSerialAccessCount(), 3u );
+	mem.write8( 0xDD02, 0x33 );	// bit 3 direction changes
+	CHECK_EQ( mem.hdmiSerialAccessCount(), 4u );
+
+	mem.setHDMISerialObservation( false );
+	mem.write8( 0xDD00, 0x00 );
+	CHECK_EQ( mem.hdmiSerialAccessCount(), 4u );
+}
+
 TEST( integration_enhanced_optimisation_bits_select_the_vice_mirror_ranges )
 {
 	SystemFixture f;

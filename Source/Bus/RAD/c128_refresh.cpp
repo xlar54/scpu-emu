@@ -67,6 +67,16 @@ volatile u32 g_C128EpochEnabled = 0;
 volatile u32 g_C128EpochState = 0;
 volatile u32 g_C128TrafficBusy = 0;
 
+static volatile uintptr s_Core1Task = 0;
+static volatile uintptr s_Core1Context = 0;
+
+void radSetCore1Task( RADCoreTask task, void *context )
+{
+	__atomic_store_n( &s_Core1Context, (uintptr)context, __ATOMIC_RELAXED );
+	__atomic_store_n( &s_Core1Task, (uintptr)task, __ATOMIC_RELEASE );
+	asm volatile( "sev" );
+}
+
 static const u32 C128_REFRESH_CORE = 3;
 // Kernel194 proved that even a four-half-cycle traffic island can lose sparse
 // rows on the adapter-equipped C128. Per-line admission therefore cannot make
@@ -448,8 +458,34 @@ CC128RefreshService::CC128RefreshService( CMemorySystem *memory )
 
 void CC128RefreshService::Run( unsigned core )
 {
-	// Cores 1 and 2 are intentionally unused. Keep them asleep rather than
-	// returning through Circle's secondary-core logger during timed operation.
+	// Core 1 waits for a registered task and then belongs to it. Nothing
+	// registers one unless a feature asks for it, so by default this is the
+	// same permanent sleep it has always been.
+	if ( core == 1 )
+	{
+		DisableIRQs();
+		for ( ;; )
+		{
+			// Relaxed, not acquire: this loop is live during bus calibration and
+			// self-test, and no ordering barrier is needed until a task exists.
+			// Once published, the acquire load pairs with radSetCore1Task()'s
+			// release store before the context is consumed.
+			if ( __atomic_load_n( &s_Core1Task, __ATOMIC_RELAXED ) )
+			{
+				RADCoreTask task = (RADCoreTask)__atomic_load_n(
+					&s_Core1Task, __ATOMIC_ACQUIRE );
+				task( (void *)__atomic_load_n( &s_Core1Context,
+				                                  __ATOMIC_RELAXED ) );
+				// A task owns the core permanently. If it returns, stay out of
+				// Circle's secondary-core exit path.
+				for ( ;; ) asm volatile( "wfe" );
+			}
+			asm volatile( "wfe" );
+		}
+	}
+
+	// Core 2 is intentionally unused. Keep it asleep rather than returning
+	// through Circle's secondary-core logger during timed operation.
 	if ( core != C128_REFRESH_CORE )
 	{
 		DisableIRQs();
