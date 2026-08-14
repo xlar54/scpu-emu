@@ -69,6 +69,9 @@ static inline void hdmiPauseUS( u32 microseconds )
 CHDMIDisplay::CHDMIDisplay( const CC64Memory &memory )
 	: m_Memory( memory ), m_FrameBuffer( 0 ), m_FramePixels( 0 ),
 	  m_FBPitchBytes( 0 ),
+	  m_RasterTiming{ 65, 263, VIC_RENDER_HEIGHT, 5,
+	                  VIC_RENDER_DISPLAY_Y, VIC_RENDER_DISPLAY_H },
+	  m_FrameHz( 60 ),
 	  m_Started( 0 ), m_FirstFrame( 0 ), m_MaxBandTicks( 0 ),
 	  m_MissedBandDeadlines( 0 ), m_SerialTransfers( 0 ),
 	  m_LastSerialTransfers( 0 ), m_FrameStartSerialTransfers( 0 ),
@@ -76,6 +79,8 @@ CHDMIDisplay::CHDMIDisplay( const CC64Memory &memory )
 {
 	memset( m_Colours, 14, sizeof m_Colours );
 	memset( m_VICRAM, 0, sizeof m_VICRAM );
+	memset( m_LiveVIC, 0, sizeof m_LiveVIC );
+	memset( &m_RasterPlan, 0, sizeof m_RasterPlan );
 	memset( m_BandPixels, 0, sizeof m_BandPixels );
 }
 
@@ -87,6 +92,21 @@ void CHDMIDisplay::watchBusActivity( const volatile u64 *transfers )
 	m_SerialTransfers = transfers;
 	m_LastSerialTransfers = transfers ? *transfers : 0;
 	m_FrameStartSerialTransfers = m_LastSerialTransfers;
+}
+
+void CHDMIDisplay::setVideoTiming( u32 cyclesPerLine, u32 rasterLines,
+	                               u32 displayFirstLine )
+{
+	if ( cyclesPerLine < 48 || cyclesPerLine > 80
+	     || rasterLines < 240 || rasterLines > 320 ) return;
+	m_RasterTiming.cyclesPerLine = cyclesPerLine;
+	m_RasterTiming.rasterLines = rasterLines;
+	m_RasterTiming.frameRows = VIC_RENDER_HEIGHT;
+	m_RasterTiming.topRaster = (s32)displayFirstLine
+	                         - (s32)VIC_RENDER_DISPLAY_Y;
+	m_RasterTiming.displayFirstRow = VIC_RENDER_DISPLAY_Y;
+	m_RasterTiming.displayRows = VIC_RENDER_DISPLAY_H;
+	m_FrameHz = rasterLines > 300 ? 50 : 60;
 }
 
 bool CHDMIDisplay::initialize( CLogger *logger )
@@ -197,11 +217,12 @@ void CHDMIDisplay::core1Entry( void *context )
 
 void CHDMIDisplay::run()
 {
-	const u64 frameTicks = hdmiCounterFrequency() / 60;
 	hdmiEnableCounterEvents();
 	for ( ;; )
 	{
 		const u64 frameStart = hdmiCounter();
+		const u64 frameTicks = hdmiCounterFrequency()
+		                     / ( m_FrameHz ? m_FrameHz : 60 );
 		renderFrame( frameStart, frameTicks );
 	}
 }
@@ -226,90 +247,107 @@ void CHDMIDisplay::renderFrame( u64 frameStart, u64 frameTicks )
 		}
 	}
 
-	// Colour RAM is cached in the v2 bank-1 SRAM shadow, not bank-0 $D800.
-	// Acquire its cache lines once sequentially, like the other display state.
+	// Latch one consistent scalar endpoint. A raster write advances the ring
+	// head after its shadow byte is stored, so equal head/generation samples on
+	// both sides of this tiny copy prove the live state belongs to that head.
+	u32 generation = 0;
+	u32 head = 0;
+	u8 liveBank = 0;
+	for ( u32 attempt = 0; attempt < 4; attempt++ )
+	{
+		const u32 generationBefore = m_Memory.vicLogGeneration();
+		const u32 headBefore = m_Memory.vicLogHead();
+		for ( u32 i = 0; i < sizeof m_LiveVIC; i++ )
+			m_LiveVIC[ i ] = m_Memory.vicRegister( (u8)i );
+		liveBank = (u8)( m_Memory.activeVICBankBase() >> 14 );
+		const u32 headAfter = m_Memory.vicLogHead();
+		const u32 generationAfter = m_Memory.vicLogGeneration();
+		head = headAfter;
+		generation = generationAfter;
+		if ( headBefore == headAfter
+		     && generationBefore == generationAfter ) break;
+	}
+
+	const u8 *liveRAM = m_Memory.ramShadow();
+	const VICRasterFrameResult rasterResult = m_RasterReplay.build(
+		m_Memory.vicLog(), head, (u32)m_Memory.emuNow(),
+		m_Memory.rasterAnchor(), generation, m_RasterTiming,
+		m_LiveVIC, liveBank, liveRAM, m_RasterPlan );
+	if ( rasterResult == VIC_RASTER_HOLD )
+	{
+		hdmiWaitUntil( frameStart + frameTicks );
+		return;
+	}
+
+	// Colour and source RAM are one coherent per-frame image, not timestamped
+	// streams. Mid-frame RAM rewrites are intentionally unsupported; register,
+	// bank and VIC colour-register effects retain raster precision.
 	const u8 *liveColours = m_Memory.colourRAMShadow();
 	if ( liveColours ) copyShared( m_Colours, liveColours, sizeof m_Colours );
 	else               memset( m_Colours, 14, sizeof m_Colours );
+	for ( u32 page = 0; page < 256; page++ )
+		if ( m_RasterPlan.pageMask[ page >> 3 ] & ( 1u << ( page & 7 ) ) )
+			copyShared( m_VICRAM + page * 256, liveRAM + page * 256, 256 );
 
-	VICRenderState state;
-	memset( &state, 0, sizeof state );
-	const u8 *liveRAM = m_Memory.ramShadow();
-	state.charROM = m_Memory.charROMShadow();
-	state.colourRAM = m_Colours;
-	for ( u32 i = 0; i < sizeof state.vic; i++ )
-		state.vic[ i ] = m_Memory.vicRegister( (u8)i );
-
-	// Rendering directly from m_RAM makes the live screen cache lines bounce
-	// between core 0 (writer) and core 1 (reader). Snapshot each active VIC
-	// dependency once in a sequential transfer, then render only from private
-	// core-1 storage. Local address zero represents the selected 16KB VIC bank.
-	const u32 liveBank = m_Memory.activeVICBankBase();
-	const u32 liveScreen = liveBank
-	                     + ( (u32)( state.vic[ 0x18 ] >> 4 ) << 10 );
-	const u32 localScreen = liveScreen - liveBank;
-	copyShared( m_VICRAM + localScreen, liveRAM + liveScreen, 1024 );
-
-	const bool bitmapMode = ( state.vic[ 0x11 ] & 0x20 ) != 0;
-	const u32 localBitmap = ( state.vic[ 0x18 ] & 0x08 ) ? 0x2000 : 0;
-	if ( bitmapMode )
-		copyShared( m_VICRAM + localBitmap,
-		            liveRAM + liveBank + localBitmap, 8192 );
-
-	const u32 localCharset = (u32)( state.vic[ 0x18 ] & 0x0E ) << 10;
-	const u32 bankNumber = liveBank >> 14;
-	const bool charROM = !bitmapMode && ( bankNumber & 1 ) == 0
-	                  && localCharset >= 0x1000 && localCharset < 0x2000;
-	if ( !bitmapMode && !charROM )
-		copyShared( m_VICRAM + localCharset,
-		            liveRAM + liveBank + localCharset, 2048 );
-
-	const u8 enabledSprites = state.vic[ 0x15 ];
-	for ( u32 sprite = 0; sprite < 8; sprite++ )
+	// Reset may race the bounded snapshot. Never present a frame assembled from
+	// two producer epochs; invalidation makes the next pass re-prime live state.
+	if ( m_Memory.vicLogGeneration() != generation )
 	{
-		if ( !( enabledSprites & ( 1u << sprite ) ) ) continue;
-		const u32 shape = (u32)m_VICRAM[ localScreen + 0x3F8 + sprite ] << 6;
-		copyShared( m_VICRAM + shape, liveRAM + liveBank + shape, 64 );
+		m_RasterReplay.invalidate();
+		hdmiWaitUntil( frameStart + frameTicks );
+		return;
 	}
 
-	state.ram = m_VICRAM;
-	state.bankBase = 0;
-	state.screenBase = localScreen;
-	state.charsetBase = charROM ? 0xFFFFFFFF : localCharset;
-	state.bitmapBase = localBitmap;
-
-	// Work one line at a time and distribute the writes uniformly through the
-	// frame. Besides lowering the instantaneous memory-system pressure, the
-	// 384-byte reusable buffer stays in L1 instead of dirtying a 104KB shared
-	// full-frame scratch image on every pass.
-	for ( u32 first = 0; first < VIC_RENDER_HEIGHT;
-	      first += HDMI_RENDER_BAND_ROWS )
+	for ( u32 b = 0; b < m_RasterPlan.bandCount; b++ )
 	{
-		// A transfer may begin after the frame-start sample. Move into the slow
-		// lane at the next row boundary and stay there for the rest of the frame.
-		observeSerialActivity();
+		const VICRasterReplayBand &band = m_RasterPlan.bands[ b ];
+		VICRenderState state;
+		memset( &state, 0, sizeof state );
+		state.ram = m_VICRAM;
+		state.charROM = m_Memory.charROMShadow();
+		state.colourRAM = m_Colours;
+		state.bankBase = (u32)( band.bank & 3 ) << 14;
+		state.screenBase = state.bankBase
+		                 + ( (u32)( band.vic[ 0x18 ] >> 4 ) << 10 );
+		state.bitmapBase = state.bankBase
+		                 + ( ( band.vic[ 0x18 ] & 0x08 ) ? 0x2000 : 0 );
+		const u32 charset = (u32)( band.vic[ 0x18 ] & 0x0E ) << 10;
+		const bool charROM = ( ( band.bank & 1 ) == 0 )
+		                  && charset >= 0x1000 && charset < 0x2000;
+		state.charsetBase = charROM ? 0xFFFFFFFF
+		                            : state.bankBase + charset;
+		state.yScrollVaries = m_RasterPlan.yScrollVaries;
+		memcpy( state.vic, band.vic, sizeof state.vic );
 
-		const u32 rows = first + HDMI_RENDER_BAND_ROWS <= VIC_RENDER_HEIGHT
-		               ? HDMI_RENDER_BAND_ROWS : VIC_RENDER_HEIGHT - first;
-		const u64 bandStart = hdmiCounter();
-		m_Renderer.renderRows( state, m_BandPixels, VIC_RENDER_WIDTH, first, rows );
-		observeSerialActivity();
-		presentRows( m_BandPixels, first, rows );
-		const u64 bandEnd = hdmiCounter();
-		const u64 elapsed = bandEnd - bandStart;
-		u64 previousMax = __atomic_load_n( &m_MaxBandTicks, __ATOMIC_RELAXED );
-		while ( elapsed > previousMax
-		        && !__atomic_compare_exchange_n( &m_MaxBandTicks, &previousMax,
-		                                         elapsed, false,
-		                                         __ATOMIC_RELAXED,
-		                                         __ATOMIC_RELAXED ) ) {}
+		const u32 end = (u32)band.firstRow + band.rowCount;
+		for ( u32 first = band.firstRow; first < end; first++ )
+		{
+			// A transfer may begin after the frame-start sample. Move into the slow
+			// lane at the next row boundary and stay there for the rest of the frame.
+			observeSerialActivity();
+			const u64 bandStart = hdmiCounter();
+			m_Renderer.renderRows( state, m_BandPixels, VIC_RENDER_WIDTH,
+			                       first, HDMI_RENDER_BAND_ROWS );
+			observeSerialActivity();
+			presentRows( m_BandPixels, first, HDMI_RENDER_BAND_ROWS );
+			const u64 bandEnd = hdmiCounter();
+			const u64 elapsed = bandEnd - bandStart;
+			u64 previousMax = __atomic_load_n( &m_MaxBandTicks,
+			                                       __ATOMIC_RELAXED );
+			while ( elapsed > previousMax
+			        && !__atomic_compare_exchange_n( &m_MaxBandTicks,
+			                                         &previousMax, elapsed, false,
+			                                         __ATOMIC_RELAXED,
+			                                         __ATOMIC_RELAXED ) ) {}
 
-		const u64 target = frameStart
-		                 + frameTicks * ( first + rows ) / VIC_RENDER_HEIGHT;
-		if ( (s64)( bandEnd - target ) >= 0 )
-			__atomic_add_fetch( &m_MissedBandDeadlines, 1, __ATOMIC_RELAXED );
-		else
-			hdmiWaitUntil( target );
+			const u64 target = frameStart
+			                 + frameTicks * ( first + 1 ) / VIC_RENDER_HEIGHT;
+			if ( (s64)( bandEnd - target ) >= 0 )
+				__atomic_add_fetch( &m_MissedBandDeadlines, 1,
+				                    __ATOMIC_RELAXED );
+			else
+				hdmiWaitUntil( target );
+		}
 	}
 	__atomic_store_n( &m_FirstFrame, 1, __ATOMIC_RELEASE );
 }

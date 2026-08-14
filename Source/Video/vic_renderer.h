@@ -37,6 +37,10 @@ struct VICRenderState
 	u32 screenBase;
 	u32 charsetBase;
 	u32 bitmapBase;
+	// FLI changes D011.YSCROLL inside the visible frame to force badlines; it
+	// does not move every independently-rendered band. Use neutral YSCROLL for
+	// the entire frame when the raster planner observes that pattern.
+	bool yScrollVaries;
 	// Last value written to each VIC-II register. Keeping the register file in
 	// the render snapshot makes graphics and sprite decoding self-contained and
 	// avoids dozens of independently-racing scalar reads on core 1.

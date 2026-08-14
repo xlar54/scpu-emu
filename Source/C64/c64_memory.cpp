@@ -103,6 +103,14 @@ void CC64Memory::notePollHold()
 void CC64Memory::cia2OnRateChange()
 {
 	const u64 f = effectiveCIAFactor();
+	// Bank the elapsed C64-clock segment with the OLD stored factor, then
+	// remember the effective factor selected by the state change which brought
+	// us here. Do this only for a real transition: timer-register writes also
+	// call this function, and rebasing an unchanged turbo segment would discard
+	// its sub-C64-cycle remainder every time.
+	if ( f != m_C64FactorInUse )
+		c64ClockRebase();
+
 	if ( f == m_CIA2FactorInUse )
 		return;
 	// Re-denominate the REMAINING count of every armed deadline. A deadline
@@ -387,6 +395,15 @@ void CC64Memory::reset()
 	m_CIALogPos = 0;
 	m_CIALastRead = 0xFFFFFFFF;
 	m_EmuCycles = 0;
+	m_C64ClockBase = 0;
+	m_EmuAtRateChange = 0;
+	m_C64FactorInUse = effectiveCIAFactor();
+	m_RasterCompare = 0;
+	m_LastCompareWrite = 0x80000000u;
+	m_LastPreciseAnchor = 0x80000000u;
+	m_LastPreciseLine = 0xFFFF;
+	__atomic_store_n( &m_RasterAnchor, 0ULL, __ATOMIC_RELAXED );
+	__atomic_store_n( &m_VICLogHead, 0u, __ATOMIC_RELEASE );
 	// The keepalive deadline is on the host clock. Carrying it across an
 	// emulated reset can leave it arbitrarily far in the future relative to a
 	// restarted session, allowing the physical bus to go cold permanently.
@@ -420,6 +437,10 @@ void CC64Memory::reset()
 		m_RAM[ i ] = 0;
 
 	updateBankMode();
+	// Publish reset only after every live shadow above is back in its reset
+	// state. Core 1 treats a generation change as an unconditional re-prime;
+	// the numeric log head alone is ambiguous after it returns to zero.
+	__atomic_add_fetch( &m_VICLogGeneration, 1u, __ATOMIC_RELEASE );
 }
 
 bool CC64Memory::initializeC64CIA2()
@@ -815,6 +836,8 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 		// state is deliberately treated as a change: a harmless initial 1MHz
 		// interval is preferable to delaying the first protocol edge.
 		bool cia2IECChanged = false;
+		const bool vicWrite = a >= 0xD000 && a < 0xD200;
+		const u8 vicReg = (u8)( a & 0x3F );
 		if ( a == 0xDD00 )
 		{
 			if ( m_HaveCIA2DDRA && m_HaveCIA2PortALatch )
@@ -847,10 +870,11 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 			m_HaveCIA2PortALatch = true;
 			updateSpritePtrBase();		// VIC bank lives in bits 0-1
 			updateHotShapeBlocks();
+			logVICBank();
 			if ( cia2IECChanged )
 				noteIECActivity();
 		}
-		else if ( a == 0xD018 )
+		else if ( vicWrite && vicReg == 0x18 )
 		{
 			m_LastD018 = value;
 			updateSpritePtrBase();
@@ -862,6 +886,7 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 			m_HaveCIA2DDRA = true;
 			updateSpritePtrBase();		// input pins float high; direction can move the VIC bank
 			updateHotShapeBlocks();
+			logVICBank();
 			if ( cia2IECChanged )
 				noteIECActivity();
 		}
@@ -873,12 +898,43 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 		}
 
 		m_IOWrites++;
-		if ( a < 0xD040 )
+		if ( vicWrite )
 		{
-			m_VICRegShadow[ a & 0x3F ] = value;
-			if ( a == 0xD015 )
+			// The beam is at the OLD compare when an IRQ handler acknowledges or
+			// re-aims it. Anchor only the first compare write in a handler; a
+			// follow-up high/low-half write is already programming the next split.
+			if ( m_VICLogEnabled )
+			{
+				const bool compareWrite = vicReg == 0x12
+				   || ( vicReg == 0x11
+				        && ( ( value ^ m_VICRegShadow[ 0x11 ] ) & 0x80 ) );
+				if ( compareWrite )
+				{
+					const u32 now = (u32)c64Now();
+					if ( (u32)( now - m_LastCompareWrite ) >= 256 )
+						noteRasterPrecise( m_RasterCompare );
+					m_LastCompareWrite = now;
+				}
+				else if ( vicReg == 0x19 && ( value & 0x01 )
+				          && (u32)( (u32)c64Now() - m_LastCompareWrite ) >= 256 )
+					noteRasterPrecise( m_RasterCompare );
+			}
+
+			m_VICRegShadow[ vicReg ] = value;
+			// Maintain both halves even while capture is disabled, so enabling
+			// VIDEO_MODE 1 never begins with a stale compare line.
+			if ( vicReg == 0x11 || vicReg == 0x12 )
+				m_RasterCompare = (u16)( m_VICRegShadow[ 0x12 ]
+				                | ( ( m_VICRegShadow[ 0x11 ] & 0x80 )
+				                    ? 0x100 : 0 ) );
+			appendVICLog( vicReg, value );
+			if ( vicReg == 0x15 )
 				updateHotShapeBlocks();
 		}
+		// Colour RAM is deliberately not timestamped. A normal 1000-cell fill
+		// would consume half the ring and make low-rate raster state lossy. HDMI
+		// snapshots the colour array once per completed frame instead; mid-frame
+		// colour-RAM rewrites are outside the replay fidelity contract.
 		m_IOLog[ m_IOLogPos++ & 63 ] = (u32)a | ( (u32)value << 16 ) | ( 1u << 24 );
 		if ( ( a & 0xFE00 ) == 0xDC00 )
 		{

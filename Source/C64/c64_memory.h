@@ -36,6 +36,7 @@
 
 #include "../Common/types.h"
 #include "../CPU/cpu_bus.h"
+#include "../Video/vic_raster.h"
 #include "c64_bus.h"
 #include "banking.h"
 
@@ -610,8 +611,7 @@ public:
 			                    ? ( m_IECPollHoldCycles - nCycles ) : 0;
 			if ( m_IECPollHoldCycles == 0 && m_IECHoldCycles == 0 )
 			{
-				if ( m_CIA2NMIDeadline )
-					cia2OnRateChange();
+				cia2OnRateChange();
 				if ( m_TimingHook )
 					m_TimingHook( m_TimingHookCtx );
 			}
@@ -626,14 +626,15 @@ public:
 			m_SlowPacedCycles += nCycles;
 		if ( iecActive )
 		{
+			const bool hadIECHold = m_IECHoldCycles != 0;
 			m_IECHoldCycles = ( m_IECHoldCycles > nCycles )
 			                ? ( m_IECHoldCycles - nCycles ) : 0;
-			if ( m_IECHoldCycles == 0 )
+			if ( hadIECHold && m_IECHoldCycles == 0
+			     && m_IECPollHoldCycles == 0 )
 			{
 				// Hold expiry is an effective-speed transition; armed CIA2
 				// deadlines re-denominate (cold: once per expiry).
-				if ( m_CIA2NMIDeadline )
-					cia2OnRateChange();
+				cia2OnRateChange();
 				if ( m_TimingHook )
 					m_TimingHook( m_TimingHookCtx );
 			}
@@ -788,6 +789,21 @@ public:
 	// remaining independent of how fast the ARM happens to execute the core.
 	inline u64 ciaNow() { return m_EmuCycles; }
 	inline u64 ciaSpan( u64 n ) const { return n * m_CIA2FactorInUse; }
+
+	// Free-running C64 BUS clock (~1MHz), independent of the accelerator's
+	// selected CPU rate. Raster timestamps must use this denomination: dividing
+	// raw turbo CPU cycles by 63 makes every split position speed-dependent.
+	//
+	// Each completed rate segment is banked using the factor that was actually
+	// in force for that segment. Rate-change notifications arrive after the
+	// hold/selection state has changed, so consulting effectiveCIAFactor() for
+	// the elapsed segment would reinterpret old turbo time at the new rate.
+	inline u64 c64Now() const
+	{
+		const u64 factor = m_C64FactorInUse ? m_C64FactorInUse : 1;
+		return m_C64ClockBase
+		     + ( m_EmuCycles - m_EmuAtRateChange ) / factor;
+	}
 	u64  m_SynthNMIsDelivered = 0;		// statistics
 	u64  m_CIA2Rescales = 0;			// deadline re-denominations at speed changes
 	// Forensic trace of the LAST timer-NMI lifecycle, for the stall dump:
@@ -836,6 +852,12 @@ public:
 	// left in turbo units fires 20x late in C64 time, exactly late enough to
 	// land inside the native-mode window it was engineered to miss.
 	void cia2OnRateChange();
+	inline void c64ClockRebase()
+	{
+		m_C64ClockBase = c64Now();
+		m_EmuAtRateChange = m_EmuCycles;
+		m_C64FactorInUse = effectiveCIAFactor();
+	}
 	inline u64 effectiveCIAFactor() const
 	{
 		return ( m_IECHoldCycles || m_IECPollHoldCycles ) ? 1ULL
@@ -863,6 +885,40 @@ private:
 	u32 m_SelectedEmulatedHz;
 	bool m_BusKeepalive = false;
 	u64 m_NextKeepalive = 0;
+	u64 m_C64ClockBase = 0;
+	u64 m_EmuAtRateChange = 0;
+	u64 m_C64FactorInUse = 1;
+	VICRegWrite m_VICLog[ SCPU_VIC_LOG_SIZE ];
+	volatile u32 m_VICLogHead = 0;
+	volatile u32 m_VICLogGeneration = 0;
+	bool m_VICLogEnabled = false;
+	volatile u64 m_RasterAnchor = 0;
+	u32 m_LastPreciseAnchor = 0x80000000u;
+	u16 m_RasterCompare = 0;
+	u32 m_LastCompareWrite = 0x80000000u;
+	u16 m_LastPreciseLine = 0xFFFF;
+
+	inline void appendVICLog( u16 reg, u8 value )
+	{
+		if ( !m_VICLogEnabled ) return;
+		const u32 now = (u32)c64Now();
+		VICRegWrite &event = m_VICLog[ m_VICLogHead
+		                              & ( SCPU_VIC_LOG_SIZE - 1 ) ];
+		event.cycle = now;
+		event.reg = (u16)( reg & VIC_LOG_REG_MASK );
+		event.value = value;
+		event.lineLow = 0;
+		if ( m_LastPreciseLine != 0xFFFF
+		     && (u32)( now - m_LastPreciseAnchor ) < 48 )
+		{
+			event.reg |= VIC_LOG_LINE_VALID;
+			if ( m_LastPreciseLine & 0x100 )
+				event.reg |= VIC_LOG_LINE_HIGH;
+			event.lineLow = (u8)m_LastPreciseLine;
+		}
+		__atomic_store_n( &m_VICLogHead, m_VICLogHead + 1,
+		                  __ATOMIC_RELEASE );
+	}
 
 	bool m_IECThrottleEnabled;
 	u32  m_IECHoldCycles;		// emulated cycles left at forced 1MHz
@@ -921,6 +977,65 @@ public:
 		const u8 bank = m_HaveCIA2PortALatch
 		              ? (u8)( ~m_CIA2PortALatch & outputs & 3 ) : 0;
 		return (u32)bank << 14;
+	}
+
+	// Timestamp capture is explicitly enabled only by VIDEO_MODE 1. With it
+	// off, the hot VIC/colour write path performs no clock read or ring store.
+	void enableVICLog( bool enabled )
+	{
+		if ( enabled && !m_VICLogEnabled )
+		{
+			__atomic_store_n( &m_VICLogHead, 0u, __ATOMIC_RELEASE );
+			m_LastPreciseAnchor = 0x80000000u;
+			m_LastCompareWrite = 0x80000000u;
+			m_LastPreciseLine = 0xFFFF;
+			__atomic_store_n( &m_RasterAnchor, 0ULL, __ATOMIC_RELAXED );
+			// A new producer epoch cannot be confused with a wrapped/reset head.
+			__atomic_add_fetch( &m_VICLogGeneration, 1u, __ATOMIC_RELEASE );
+		}
+		m_VICLogEnabled = enabled;
+	}
+	bool vicLogEnabled() const { return m_VICLogEnabled; }
+	const VICRegWrite *vicLog() const { return m_VICLog; }
+	u32 vicLogHead() const
+	{
+		return __atomic_load_n( &m_VICLogHead, __ATOMIC_ACQUIRE );
+	}
+	u32 vicLogGeneration() const
+	{
+		return __atomic_load_n( &m_VICLogGeneration, __ATOMIC_ACQUIRE );
+	}
+	u64 rasterAnchor() const
+	{
+		return __atomic_load_n( &m_RasterAnchor, __ATOMIC_RELAXED );
+	}
+	u64 emuNow() const { return c64Now(); }
+
+	inline void noteRasterPrecise( u16 line )
+	{
+		const u32 now = (u32)c64Now();
+		m_LastPreciseAnchor = now;
+		m_LastPreciseLine = (u16)( line & 0x1FF );
+		__atomic_store_n( &m_RasterAnchor,
+		                  ( 1ULL << 63 ) | ( (u64)now << 16 )
+		                                | (u64)( line & 0x1FF ),
+		                  __ATOMIC_RELAXED );
+	}
+	inline void noteRasterCoarse( u16 line )
+	{
+		if ( !m_VICLogEnabled || line == 0xFFFF ) return;
+		const u32 now = (u32)c64Now();
+		if ( (u32)( now - m_LastPreciseAnchor ) < 25000 )
+			return;
+		__atomic_store_n( &m_RasterAnchor,
+		                  ( 1ULL << 63 ) | ( (u64)now << 16 )
+		                                | (u64)( line & 0x1FF ),
+		                  __ATOMIC_RELAXED );
+	}
+
+	inline void logVICBank()
+	{
+		appendVICLog( 0x40, (u8)( activeVICBankBase() >> 14 ) );
 	}
 	u32 activeVICScreenBase() const
 	{

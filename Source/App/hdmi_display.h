@@ -10,6 +10,7 @@
 #include <circle/bcmframebuffer.h>
 #include <circle/logger.h>
 #include "../Common/types.h"
+#include "../Video/vic_raster.h"
 #include "../Video/vic_renderer.h"
 
 class CC64Memory;
@@ -28,12 +29,18 @@ public:
 	// Observe core 0's existing CIA2 transfer total. Core 1 is the only reader;
 	// core 0 never waits for or polls the renderer.
 	void watchBusActivity( const volatile u64 *transfers );
+	void setVideoTiming( u32 cyclesPerLine, u32 rasterLines,
+	                     u32 displayFirstLine );
 
 	// Register the renderer on otherwise-idle core 1. Returns immediately.
 	bool start();
 	bool firstFrameReady() const;
 	u32 maxBandUS() const;
 	u32 missedBandDeadlines() const;
+	u32 rasterResyncs() const { return m_RasterReplay.resyncs(); }
+	u32 rasterLostResyncs() const { return m_RasterReplay.lostEventResyncs(); }
+	u32 rasterResetResyncs() const { return m_RasterReplay.resetResyncs(); }
+	u32 rasterFallbacks() const { return m_RasterReplay.snapshotFallbacks(); }
 	void resetRuntimeDiagnostics();
 
 private:
@@ -61,11 +68,17 @@ private:
 	u8               *m_FramePixels;
 	u32               m_FBPitchBytes;
 	u8                m_Colours[ 1024 ];
-	// Core-1-private representation of the active VIC bank. renderFrame()
-	// populates only the active screen, charset/bitmap and sprite shapes.
-	u8                m_VICRAM[ 0x4000 ];
+	// Core-1-private 64K VIC source image. Only pages selected by the completed
+	// frame's bands are refreshed; absolute addresses keep bank-split replay
+	// simple and make every rendered band read the same coherent page image.
+	u8                m_VICRAM[ 0x10000 ];
+	u8                m_LiveVIC[ 0x40 ];
 	u8                m_BandPixels[ VIC_RENDER_WIDTH * HDMI_RENDER_BAND_ROWS ];
 	CVICRenderer       m_Renderer;
+	CVICRasterReplay   m_RasterReplay;
+	VICRasterReplayPlan m_RasterPlan;
+	VICRasterTiming    m_RasterTiming;
+	u32                m_FrameHz;
 	volatile u32       m_Started;
 	volatile u32       m_FirstFrame;
 	volatile u64       m_MaxBandTicks;

@@ -546,9 +546,13 @@ static void scpuEmitResetDiagnostic()
 	               (unsigned long long)d.scrubRepaired );
 	if ( s_HDMIDisplay )
 		s_Logger->Write( "SCPU", LogNotice,
-		               "  hdmi renderer: max-band=%uus missed-deadlines=%u",
+		               "  hdmi renderer: max-band=%uus missed=%u raster-resync=%u lost/reset/fallback=%u/%u/%u",
 		               (unsigned)s_HDMIDisplay->maxBandUS(),
-		               (unsigned)s_HDMIDisplay->missedBandDeadlines() );
+		               (unsigned)s_HDMIDisplay->missedBandDeadlines(),
+		               (unsigned)s_HDMIDisplay->rasterResyncs(),
+		               (unsigned)s_HDMIDisplay->rasterLostResyncs(),
+		               (unsigned)s_HDMIDisplay->rasterResetResyncs(),
+		               (unsigned)s_HDMIDisplay->rasterFallbacks() );
 
 	// Both should read zero. Either one non-zero means a bus wait hit its
 	// ceiling instead of seeing the signal it wanted -- which before those
@@ -723,11 +727,11 @@ static bool scpuCheckButton( void *ctx )
 			CScopedLoggingIRQs saveIRQs;
 			if ( !scpuSaveRuntimeBusDiag( runtime ) )
 				s_Logger->Write( "SCPU", LogError,
-					               "K356 could not save post-handoff runtime to %s",
+						               "K358 could not save post-handoff runtime to %s",
 				               SCPU_BUS_DIAG_FILE );
 			else
 				s_Logger->Write( "SCPU", LogNotice,
-					               "K356 saved post-handoff runtime to %s",
+						               "K358 saved post-handoff runtime to %s",
 				               SCPU_BUS_DIAG_FILE );
 		}
 		s_RebootRequested = true;
@@ -760,11 +764,11 @@ static bool scpuCheckButton( void *ctx )
 			CScopedLoggingIRQs saveIRQs;
 			if ( !scpuSaveRuntimeBusDiag( s_ResetDiagnostic.runtime ) )
 				s_Logger->Write( "SCPU", LogError,
-					               "K356 could not save post-handoff runtime to %s",
+						               "K358 could not save post-handoff runtime to %s",
 				               SCPU_BUS_DIAG_FILE );
 			else
 				s_Logger->Write( "SCPU", LogNotice,
-					               "K356 saved post-handoff runtime to %s",
+						               "K358 saved post-handoff runtime to %s",
 				               SCPU_BUS_DIAG_FILE );
 		}
 
@@ -1244,7 +1248,7 @@ static void scpuAppendRuntimeBusDiag( char *dst, u32 capacity, u32 &length,
 		scpuLineChar( dst, capacity, length, '\n' );
 	}
 	scpuLineText( dst, capacity, length,
-	              "post-handoff runtime: build=356 handoff=" );
+	              "post-handoff runtime: build=358 handoff=" );
 	scpuLineDecimal( dst, capacity, length, r.valid ? 1 : 0 );
 	if ( r.valid )
 	{
@@ -1826,6 +1830,10 @@ void scpuBootRun( CLogger *logger )
 	}
 
 	const C64Signals &sig = radBus.signals();
+	if ( s_HDMIDisplay )
+		s_HDMIDisplay->setVideoTiming( c64CyclesPerLine( sig.video ),
+		                               c64RasterLines( sig.video ),
+		                               c64DisplayFirstLine( sig.video ) );
 	logger->Write( "SCPU", LogNotice, "SuperRAM: %u MB%s",
 	               (unsigned)superCPU.fastRAM().sizeMB(),
 	               superCPU.fastRAM().present()
@@ -2243,6 +2251,7 @@ void scpuBootRun( CLogger *logger )
 	// indexed framebuffer without sharing any physical-bus path with core 0.
 	if ( s_HDMIDisplay )
 	{
+		superCPU.memory().enableVICLog( true );
 		if ( s_HDMIDisplay->start() )
 		{
 			// The first passive frame naturally replaces the blue ready screen.
@@ -2280,6 +2289,7 @@ void scpuBootRun( CLogger *logger )
 		}
 		else
 		{
+			superCPU.memory().enableVICLog( false );
 			CScopedLoggingIRQs failIRQs;
 			scpuHDMIShowFailure();
 			logger->Write( "SCPU", LogError,

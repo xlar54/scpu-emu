@@ -21,6 +21,7 @@ OBJS = \
 	App/main.o \
 	App/boot.o \
 	App/hdmi_display.o \
+	Video/vic_raster.o \
 	Video/vic_renderer.o \
 	CPU/M6502/m6502.o \
 	CPU/M6502/m6502_opcodes.o \

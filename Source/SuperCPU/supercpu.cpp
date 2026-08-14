@@ -814,6 +814,15 @@ u64 CSuperCPU::runFrame()
 	// for anything that measures time by counting cycles -- the KERNAL's IEC
 	// routines bit-bang the serial lines to microsecond tolerances.
 
+	// One coarse clock/raster pairing per frame gives non-IRQ programs a
+	// reference without perturbing VIDEO_MODE 0. Precise anchors taken inside
+	// raster handlers outrank this sample for roughly a frame.
+	if ( m_Memory.vicLogEnabled() && !m_Memory.iecBusActive() )
+	{
+		const u16 line = m_Bus->rasterLine();
+		if ( line != 0xFFFF ) m_Memory.noteRasterCoarse( line );
+	}
+
 	return executed;
 }
 

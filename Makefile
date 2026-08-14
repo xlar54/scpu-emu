@@ -37,6 +37,7 @@ HOST_SRCS = \
 	Source/SuperCPU/fast_ram.cpp \
 	Source/SuperCPU/memory_map.cpp \
 	Source/Bus/Host/host_bus.cpp \
+	Source/Video/vic_raster.cpp \
 	Source/Video/vic_renderer.cpp
 
 TEST_SRCS = \
@@ -45,6 +46,7 @@ TEST_SRCS = \
 	Tests/CPU/test_w65c816.cpp \
 	Tests/CPU/test_w65c816_diff.cpp \
 	Tests/C64/test_banking.cpp \
+	Tests/Video/test_vic_raster.cpp \
 	Tests/Video/test_vic_renderer.cpp \
 	Tests/SuperCPU/test_write_buffer.cpp \
 	Tests/Integration/test_kernal_boot.cpp \

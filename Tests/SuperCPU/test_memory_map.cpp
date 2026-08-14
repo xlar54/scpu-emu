@@ -987,6 +987,182 @@ TEST( nmi_retime_poll_hold_decays_quickly_without_polls )
 	CHECK( !mem.iecThrottleActive() );	// gone within ~a millisecond
 }
 
+TEST( c64_clock_preserves_elapsed_time_across_explicit_speed_changes )
+{
+	CHostBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+
+	mem.setPacing( 0, 20000000 );
+	mem.tickFast( 2000 );
+	CHECK_EQ( mem.c64Now(), 100u );
+
+	mem.setPacing( 0, 1000000 );
+	CHECK_EQ( mem.c64Now(), 100u );
+	mem.tickFast( 100 );
+	CHECK_EQ( mem.c64Now(), 200u );
+
+	mem.setPacing( 0, 20000000 );
+	CHECK_EQ( mem.c64Now(), 200u );
+	mem.tickFast( 200 );
+	CHECK_EQ( mem.c64Now(), 210u );
+}
+
+TEST( c64_clock_does_not_drop_fractional_time_without_a_rate_change )
+{
+	CC64Memory mem;
+	mem.reset();
+	mem.setPacing( 0, 20000000 );
+
+	mem.tickFast( 10 );
+	CHECK_EQ( mem.c64Now(), 0u );
+	mem.cia2OnRateChange();
+	mem.tickFast( 10 );
+	CHECK_EQ( mem.c64Now(), 1u );
+}
+
+TEST( c64_clock_preserves_elapsed_time_across_iec_poll_hold )
+{
+	CHostBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	mem.setPacing( 0, 20000000 );
+	bus.m_Memory[ 0xDD00 ] = 0xFF;
+
+	mem.tickFast( 2000 );
+	CHECK_EQ( mem.c64Now(), 100u );
+	mem.read8( 0xDD00 );
+	CHECK( mem.iecThrottleActive() );
+	CHECK_EQ( mem.c64Now(), 100u );
+
+	mem.tickFast( 100 );
+	CHECK_EQ( mem.c64Now(), 200u );
+	mem.tickFast( 900 );
+	CHECK( !mem.iecThrottleActive() );
+	CHECK_EQ( mem.c64Now(), 1100u );
+
+	mem.tickFast( 200 );
+	CHECK_EQ( mem.c64Now(), 1110u );
+}
+
+TEST( vic_log_is_mode1_gated_and_captures_mirrors_and_bank )
+{
+	CHostBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	mem.setPacing( 0, 20000000 );
+
+	mem.write8( 0xD020, 2 );
+	CHECK_EQ( mem.vicLogHead(), 0u );
+	CHECK_EQ( mem.vicRegister( 0x20 ), 2 );
+
+	mem.enableVICLog( true );
+	mem.write8( 0xD060, 6 );		// mirror of $D020
+	mem.write8( 0xD800, 0xFA );
+	mem.write8( 0xDD02, 0x03 );
+	mem.write8( 0xDD00, 0xFE );		// inverted bank select -> bank 1
+
+	CHECK_EQ( mem.vicRegister( 0x20 ), 6 );
+	CHECK_EQ( bus.m_Memory[ 0xD060 ], 6 );
+	// Colour RAM is copied once per completed frame. Logging every colour-cell
+	// write would let an ordinary 1000-cell clear overwrite the 2048-event
+	// raster register ring before core 1 could consume it.
+	CHECK_EQ( mem.vicLogHead(), 3u );
+	const VICRegWrite *events = mem.vicLog();
+	CHECK_EQ( vicLogRegister( events[ 0 ] ), 0x20 );
+	CHECK_EQ( events[ 0 ].value, 6 );
+	CHECK_EQ( vicLogRegister( events[ 1 ] ), 0x40 );
+	CHECK_EQ( events[ 1 ].value, 0 );
+	CHECK_EQ( vicLogRegister( events[ 2 ] ), 0x40 );
+	CHECK_EQ( events[ 2 ].value, 1 );
+
+	mem.enableVICLog( false );
+	mem.write8( 0xD021, 3 );
+	CHECK_EQ( mem.vicLogHead(), 3u );
+}
+
+TEST( vic_log_generation_changes_when_capture_or_machine_resets )
+{
+	CHostBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	const u32 afterReset = mem.vicLogGeneration();
+
+	mem.enableVICLog( true );
+	const u32 afterEnable = mem.vicLogGeneration();
+	CHECK( afterEnable != afterReset );
+	mem.write8( 0xD020, 2 );
+	CHECK_EQ( mem.vicLogHead(), 1u );
+
+	mem.reset();
+	CHECK( mem.vicLogGeneration() != afterEnable );
+	CHECK_EQ( mem.vicLogHead(), 0u );
+}
+
+TEST( vic_log_precise_irq_anchor_keeps_the_full_compare_line )
+{
+	CHostBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	mem.setPacing( 0, 20000000 );
+
+	// Establish a nine-bit compare before capture starts. The compare shadow
+	// must already be authoritative when VIDEO_MODE 1 is enabled.
+	mem.write8( 0xD011, 0x9B );
+	mem.write8( 0xD012, 0x34 );
+	mem.enableVICLog( true );
+
+	mem.write8( 0xD019, 0x01 );		// IRQ acknowledge at line $134
+	mem.tickFast( 20 );
+	mem.write8( 0xD020, 2 );
+	CHECK_EQ( mem.vicLogHead(), 2u );
+	const VICRegWrite *events = mem.vicLog();
+	CHECK( vicLogHasRasterLine( events[ 0 ] ) );
+	CHECK( vicLogHasRasterLine( events[ 1 ] ) );
+	CHECK_EQ( vicLogRasterLine( events[ 0 ] ), 0x134 );
+	CHECK_EQ( vicLogRasterLine( events[ 1 ] ), 0x134 );
+
+	const u64 precise = mem.rasterAnchor();
+	CHECK( ( precise >> 63 ) != 0 );
+	CHECK_EQ( precise & 0x1FF, 0x134u );
+	mem.noteRasterCoarse( 7 );
+	CHECK_EQ( mem.rasterAnchor(), precise );
+}
+
+TEST( vic_log_anchors_only_the_first_compare_write_in_a_handler )
+{
+	CHostBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	mem.setPacing( 0, 20000000 );
+	mem.write8( 0xD011, 0x9B );
+	mem.write8( 0xD012, 0x34 );		// current compare $134
+	mem.enableVICLog( true );
+
+	// Low and high halves of the next compare are written together. Both
+	// writes belong to the handler for $134, not to the newly assembled $050.
+	mem.write8( 0xD012, 0x50 );
+	mem.tickFast( 20 );
+	mem.write8( 0xD011, 0x1B );
+	const VICRegWrite *events = mem.vicLog();
+	CHECK_EQ( mem.vicLogHead(), 2u );
+	CHECK_EQ( vicLogRasterLine( events[ 0 ] ), 0x134 );
+	CHECK_EQ( vicLogRasterLine( events[ 1 ] ), 0x134 );
+
+	// A later handler is outside the 256-C64-cycle guard and anchors to the
+	// compare assembled above.
+	mem.tickFast( 20 * 300 );
+	mem.write8( 0xD012, 0x60 );
+	CHECK_EQ( mem.vicLogHead(), 3u );
+	CHECK_EQ( vicLogRasterLine( events[ 2 ] ), 0x050 );
+}
+
 TEST( nmi_retime_deadline_survives_an_explicit_speed_change_mid_count )
 {
 	// Winter Games' arm sequence ends with a $D07B write: timer armed in

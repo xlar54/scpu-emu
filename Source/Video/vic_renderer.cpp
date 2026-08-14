@@ -190,7 +190,8 @@ static inline bool outputToSource( const VICRenderState &state,
 	// $1B is the KERNAL's neutral 25-row value; changing YSCROLL moves the
 	// matrix relative to that position while RSEL controls the border aperture.
 	const int originY = VIC_RENDER_DISPLAY_Y
-	                  + (int)( state.vic[ 0x11 ] & 7 ) - 3;
+	                  + ( state.yScrollVaries
+	                      ? 0 : (int)( state.vic[ 0x11 ] & 7 ) - 3 );
 	const int sx = (int)x - originX;
 	const int sy = (int)y - originY;
 	if ( sx < 0 || sx >= VIC_RENDER_DISPLAY_W
@@ -322,7 +323,8 @@ VICRenderMode CVICRenderer::renderRows( const VICRenderState &state,
 		memset( opaqueCells, 0, sizeof opaqueCells );
 		const int originX = VIC_RENDER_DISPLAY_X + ( state.vic[ 0x16 ] & 7 );
 		const int originY = VIC_RENDER_DISPLAY_Y
-		                  + (int)( state.vic[ 0x11 ] & 7 ) - 3;
+		                  + ( state.yScrollVaries
+		                      ? 0 : (int)( state.vic[ 0x11 ] & 7 ) - 3 );
 		const int sourceY = (int)y - originY;
 		if ( context.mode != VIC_RENDER_UNSUPPORTED
 		     && sourceY >= 0 && sourceY < VIC_RENDER_DISPLAY_H )
