@@ -93,6 +93,18 @@ public:
 	void setDeliveryEnabled( bool enabled ) { m_DeliveryEnabled = enabled; }
 	bool deliveryEnabled() const { return m_DeliveryEnabled; }
 
+	// A prepared physical C64 can expose DRAM at $D000-$DFFF while /GAME is
+	// released and select the real I/O chips only for an explicit bus access.
+	// Until the bus proves that arrangement, retain the old fail-safe exclusion:
+	// sending these bytes to a conventional $01=$37 host would hit live chips.
+	void setRAMUnderIOAccessible( bool accessible )
+	{
+		if ( m_RAMUnderIOAccessible == accessible ) return;
+		m_RAMUnderIOAccessible = accessible;
+		m_NoProgressValid = false;
+	}
+	bool ramUnderIOAccessible() const { return m_RAMUnderIOAccessible; }
+
 	// When true, zero page and stack ($0000-$01FF) are never mirrored. The
 	// SuperCPU exposes this as the "Z flag" alongside the optimization mode:
 	// almost nothing points the VIC at page 0 or 1, and CPU traffic there is
@@ -184,8 +196,9 @@ public:
 	u32 flushRangeUpTo( u32 base, u32 len, u32 maxBytes );
 	bool hasPendingInRange( u32 base, u32 len ) const;
 
-	// Under-I/O shape relocation wiring; the tables are owned by CC64Memory
-	// (see its relocation section for the why). ptrReloc maps an under-I/O
+	// Fallback under-I/O shape relocation wiring, used only when the physical
+	// RAM window could not be prepared. The tables are owned by CC64Memory.
+	// ptrReloc maps an under-I/O
 	// block (V-$40, 64 entries) to its relocated block; inUse maps a
 	// relocated block (48 entries) back to its source V, $FF meaning free;
 	// count is the live allocation total and the fast-out for every check
@@ -259,9 +272,8 @@ public:
 	u64 m_PolicyZeroProgressScans;	// complete policy scans that sent nothing
 	u64 m_PolicyNoProgressCacheHits;	// repeated scans avoided by the cache
 
-	// Writes aimed at $D000-$DFFF that were refused. Non-zero means the
-	// emulated banking had the I/O window mapped as RAM while the real machine
-	// had it mapped as I/O -- see the note in shouldMirror().
+	// Writes aimed at $D000-$DFFF that were refused before native access was
+	// verified. This should remain zero during a prepared C64 run.
 	mutable u64 m_IOWindowSuppressed;
 
 	void resetStats();
@@ -281,6 +293,7 @@ private:
 	SCPUOptMode m_Mode;
 	bool        m_ExcludeZPStack;
 	bool        m_DeliveryEnabled;
+	bool        m_RAMUnderIOAccessible;
 
 	// Region the current mode mirrors, as an inclusive address range.
 	u16 m_RangeLo, m_RangeHi;

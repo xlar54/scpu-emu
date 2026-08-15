@@ -30,6 +30,10 @@
 #include "bus_timing.h"
 
 static u64 armCycleCounter;
+// Armed only after the post-snapshot $01=$34 takeover verifies. Ordinary
+// $D000-$DFFF accesses then pulse /GAME for one CPU half-cycle; force-RAM
+// operations and mirror bursts leave it released.
+static bool radSelectIOWithGame = false;
 
 #include "rad_lowlevel.h"
 #include "rad_bus.h"
@@ -40,7 +44,7 @@ static u64 armCycleCounter;
 CRADBus::CRADBus()
 	: m_Reads( 0 ), m_Writes( 0 ), m_BurstWrites( 0 ),
 	  m_LastTransferCycles( 0 ), m_Transfers( 0 ), m_SerialTransfers( 0 ),
-	  m_ReadPrimes( 0 ), m_Acquired( false ),
+	  m_ReadPrimes( 0 ), m_Acquired( false ), m_RAMUnderIOReady( false ),
 	  m_TrafficHalted( false ),
 	  m_SelfTestFailure( 0 ),
 	  m_ReadTimingConfigured( 0 ), m_ReadTimingStart( 0 ), m_ReadTimingEnd( 0 ),
@@ -578,24 +582,26 @@ static bool busDiagEndLine( char *dst, u32 capacity, u32 &length )
 // the normal read primitive itself the same direct p1/p2/p3 sequence.
 static bool sidReadAtFallingEdge = false;
 
-__attribute__((noinline)) u8 radDirectRead( u16 addr )
+__attribute__((noinline)) u8 radDirectRead( u16 addr, bool forceRAM )
 {
 	register u32 g2;
 	u8 v = 0;
+	const bool selectIO = radSelectIOWithGame && !forceRAM
+	                   && addr >= 0xD000 && addr <= 0xDFFF;
 	// K202's hardware-validated blocking path. A transaction claims the open
 	// C128 traffic epoch before it aligns to the physical bus; C64-class hosts
 	// return immediately because the refresh interlock is disabled.
 	c128TrafficBegin();
 	BUS_RESYNC
 	busReadByte_p1( g2, addr );
-	busReadByte_p2( g2 );
+	busReadByte_p2( g2, selectIO );
 	const u32 sampleAt = ( ( addr & 0xFC00 ) == 0xD400 )
 	                   ? (u32)busTiming.WAIT_CYCLE_READ_SID
 	                   : (u32)busTiming.WAIT_CYCLE_READ;
 	if ( ( addr & 0xFC00 ) == 0xD400 && sidReadAtFallingEdge )
-		busReadByte_p3FallingEdge( g2, v, false );
+		busReadByte_p3FallingEdge( g2, v, false, selectIO );
 	else
-		busReadByte_p3( g2, v, false, sampleAt );
+		busReadByte_p3( g2, v, false, sampleAt, selectIO );
 	c128TrafficEnd();
 	return v;
 }
@@ -605,13 +611,16 @@ static inline u8 busDiagRawRead( u16 addr )
 	return radDirectRead( addr );
 }
 
-__attribute__((noinline)) void radDirectWrite( u16 addr, u8 value )
+__attribute__((noinline)) void radDirectWrite( u16 addr, u8 value,
+	                                           bool forceRAM )
 {
 	register u32 g2;
+	const bool selectIO = radSelectIOWithGame && !forceRAM
+	                   && addr >= 0xD000 && addr <= 0xDFFF;
 	c128TrafficBegin();
 	BUS_RESYNC
-	busWriteByte_p1( g2, addr, value );
-	busWriteByte_p2( g2, false );
+	busWriteByte_p1( g2, addr, value, selectIO );
+	busWriteByte_p2( g2, false, selectIO );
 	c128TrafficEnd();
 }
 
@@ -1157,6 +1166,12 @@ static u8 busDiagTurnFlags()
 
 bool CRADBus::acquire()
 {
+	// A new acquisition always begins in the conventional host-KERNAL map.
+	// The special all-RAM port state is installed only after ROM snapshotting
+	// and the complete baseline bus self-test have succeeded.
+	radSelectIOWithGame = false;
+	m_RAMUnderIOReady = false;
+
 	// Order matters, and it used to be wrong. We reset the machine first and
 	// only then waited for a valid clock -- so on a cold power-on, where the
 	// Pi and the C64 come up together, the reset landed while the C64 was still
@@ -2135,6 +2150,71 @@ u8 CRADBus::sidReadPOTFiltered( u16 addr )
 	return m_SIDPotFiltered[ pot ];
 }
 
+bool CRADBus::prepareRAMUnderIOAccess()
+{
+	if ( !m_Acquired || m_TrafficHalted
+	     || m_Signals.machine != MACHINE_C64 )
+		return false;
+
+	// The acquisition path deliberately leaves the physical host in its normal
+	// $01=$37/$35 map until BASIC and KERNAL have been snapshotted and the bus
+	// self-test has exercised those ROM windows. Now reset through the same
+	// bounded Ultimax injector once more, but leave the stopped 6510 at $34:
+	// CHAREN/HIRAM/LORAM=100. With /GAME released the PLA exposes all RAM;
+	// asserting /GAME selects Ultimax, whose $D000-$DFFF window is real I/O.
+	radSelectIOWithGame = false;
+	m_RAMUnderIOReady = false;
+	radPrepareUltimaxTakeover( 0x34 );
+	if ( !radHijackCPUWithUltimax() )
+	{
+		// radHijackCPUWithUltimax() already released /DMA and reset the machine
+		// normally on failure. Reflect that ownership change so a later release()
+		// cannot drive a bus we no longer own.
+		m_Acquired = false;
+		return false;
+	}
+
+	// Success returns with /GAME asserted and /DMA held. Release /GAME to select
+	// physical RAM, then prove both halves of the mapping before enabling any
+	// queued under-I/O write. The stub blanked D011/D020/D021 through Ultimax,
+	// so the chip reads must differ from the deliberately chosen RAM sentinels.
+	SET_GPIO( bGAME_OUT );
+	busWriteTurnaroundNeeded = 1;
+	static const u16 probeAddr[ 3 ] = { 0xD011, 0xD020, 0xD021 };
+	static const u8  probeData[ 3 ] = { 0x5A, 0xA5, 0x3C };
+	bool ramOK = true;
+	for ( u32 i = 0; i < 3; i++ )
+	{
+		radDirectWrite( probeAddr[ i ], probeData[ i ], true );
+		if ( radDirectRead( probeAddr[ i ], true ) != probeData[ i ] )
+			ramOK = false;
+	}
+
+	// Arm the selector only after the all-RAM side has verified. Each following
+	// read asserts /GAME inside the timed primitive and releases it exactly at
+	// the CPU-to-VIC falling edge.
+	radSelectIOWithGame = true;
+	bool ioOK = false;
+	for ( u32 i = 0; i < 3; i++ )
+		if ( radDirectRead( probeAddr[ i ] ) != probeData[ i ] ) ioOK = true;
+
+	if ( !ramOK || !ioOK )
+	{
+		radSelectIOWithGame = false;
+		SET_GPIO( bGAME_OUT );
+		// Do not let the physical CPU execute even one instruction with $01=$34.
+		// Reset it while /DMA is held, then release it into the normal reset path.
+		radResetMachine();
+		radReleaseCPU();
+		m_Acquired = false;
+		return false;
+	}
+
+	m_RAMUnderIOReady = true;
+	m_LastTransferCycles = hostCycles();
+	return true;
+}
+
 void CRADBus::release()
 {
 	if ( !m_Acquired )
@@ -2144,6 +2224,15 @@ void CRADBus::release()
 	// operation. Stop it and wait for /DMA-low acknowledgement before handing
 	// the physical CPU back to the machine.
 	c128RefreshStop();
+	const bool restoreHost = m_RAMUnderIOReady;
+	m_RAMUnderIOReady = false;
+	radSelectIOWithGame = false;
+	// $34 is intentionally useful only while the accelerator owns the bus. If
+	// the Pi is rebooting or startup aborts, give the physical CPU a clean reset
+	// so its KERNAL restores the conventional $2F/$37 processor-port state.
+	// Assert/reset it while /DMA is still held; otherwise it can execute briefly
+	// from all-RAM $E000 before RESET reaches the pin.
+	if ( restoreHost ) radResetMachine();
 	radReleaseCPU();
 	m_Acquired = false;
 }
@@ -8149,6 +8238,43 @@ u8 CRADBus::read( u16 addr )
 	}
 	m_Reads++;
 	return v;
+}
+
+u8 CRADBus::readRAM( u16 addr )
+{
+	if ( m_TrafficHalted ) return 0xFF;
+
+	// Keep the same cold-transfer protection and accounting as a normal read,
+	// but bypass the per-access /GAME selector. This is used only to verify the
+	// physical DRAM image (notably a bitmap crossing $D000) and must never touch
+	// the side-effectful I/O chip at the same address.
+	primeAfterIdle();
+	const u8 v = radDirectRead( addr, true );
+	m_LastTransferCycles = hostCycles();
+	m_Transfers++;
+	m_Reads++;
+	return v;
+}
+
+void CRADBus::writeRAM( u16 addr, u8 value )
+{
+	if ( m_TrafficHalted ) return;
+
+	// Same-polarity cold-write protection as write(), but deliberately leave
+	// /GAME released so the prepared $01=$34 host stores into physical DRAM.
+	const u64 nowW  = hostCycles();
+	const u64 rateW = hostCyclesPerSec();
+	const u64 idleW = rateW ? ( rateW * 150 / 1000000 ) : 0;
+	if ( idleW && ( nowW - m_LastTransferCycles ) >= idleW )
+	{
+		radDirectWrite( 0x02FE, 0xA6, true );
+		m_Transfers++;
+		m_ReadPrimes++;
+	}
+	radDirectWrite( addr, value, true );
+	m_LastTransferCycles = hostCycles();
+	m_Transfers++;
+	m_Writes++;
 }
 
 void CRADBus::write( u16 addr, u8 value )

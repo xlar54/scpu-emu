@@ -50,6 +50,8 @@ public:
 
 	u8   read( u16 addr ) override;
 	void write( u16 addr, u8 value ) override;
+	u8   readRAM( u16 addr ) override;
+	void writeRAM( u16 addr, u8 value ) override;
 	bool verifyC64CIA2DDRA( u8 expected ) override;
 	void writeBurst( const C64BusWrite *writes, u32 count ) override;
 	void readBlock( u16 addr, u8 *dst, u32 length ) override;
@@ -63,6 +65,13 @@ public:
 	u32  hostCyclesPerSec() override { return SCPU_ARM_CLOCK_HZ; }
 
 	const char *name() const override { return "RAD expansion unit"; }
+
+	// After ROM snapshot and the ordinary bus self-test, run the physical 6510
+	// briefly under the Ultimax injector and leave $01=$34. With /GAME released
+	// this exposes all RAM; a timed /GAME assertion then selects real I/O for a
+	// single guest cycle. Initially supported only on C64-class hosts.
+	bool prepareRAMUnderIOAccess();
+	bool ramUnderIOReady() const { return m_RAMUnderIOReady; }
 
 	// Flash the border a few times, as visible proof that we hold the bus and
 	// can drive it. Costs a fraction of a second and happens before the CPU
@@ -291,6 +300,7 @@ private:
 
 	C64Signals m_Signals;
 	bool       m_Acquired;
+	bool       m_RAMUnderIOReady;
 	bool       m_TrafficHalted;
 	u8         m_SelfTestFailure; // bit 0: single R/W, bit 1: burst, bit 2: first-transfer series
 	u16        m_ReadTimingConfigured, m_ReadTimingStart, m_ReadTimingEnd,

@@ -150,6 +150,14 @@ public:
 	// CC64Memory's relocation section. On by default; the switch exists so a
 	// game that goes wrong with it can prove it with one config line.
 	void setUnderIORelocate( bool e ) { m_Memory.m_RelocEnable = e; }
+	void setRAMUnderIOAccessible( bool accessible )
+	{
+		m_WriteBuffer.setRAMUnderIOAccessible( accessible );
+		m_Memory.setRAMUnderIOAccessible( accessible );
+		// Native delivery supersedes the old compatibility workaround. Leaving
+		// relocation armed would redirect the very writes now able to reach RAM.
+		if ( accessible ) m_Memory.m_RelocEnable = false;
+	}
 
 	// CIA2 timer NMI retiming (NMI_RETIME); see CC64Memory's retiming
 	// section. On by default, same escape-hatch reasoning.

@@ -64,6 +64,15 @@ public:
 	virtual u8   read( u16 addr ) = 0;
 	virtual void write( u16 addr, u8 value ) = 0;
 
+	// Read the physical DRAM cell regardless of whether $D000-$DFFF is exposed
+	// as I/O to an ordinary guest access. The distinction exists on real
+	// SuperCPU hardware: /GAME selects I/O for read()/write(), while mirror
+	// verification leaves the specially prepared 6510 port in all-RAM mode.
+	// Host backends have only one flat array, so their implementation is the
+	// same operation with the same accounting.
+	virtual u8 readRAM( u16 addr ) = 0;
+	virtual void writeRAM( u16 addr, u8 value ) = 0;
+
 	// Verify the C64-personality CIA2 direction-register seed after the caller
 	// has written it. The RAD backend samples several points inside the
 	// calibrated read eye and discards bus-turnaround reads before accepting

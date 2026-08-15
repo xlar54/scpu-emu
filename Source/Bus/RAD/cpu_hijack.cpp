@@ -97,7 +97,7 @@ static const u8 takeoverROMPrefix[] = {
 	0xA9, 0x2F, 0x85, 0x00        // LDA #$2F / STA $00
 };
 
-void radPrepareUltimaxTakeover()
+void radPrepareUltimaxTakeover( u8 physicalPort )
 {
 	// Materialise the exact 256-byte image generated from upstream RAD's
 	// C64Side/ultimax_memcfg.a.  Keeping a complete table also keeps the timed
@@ -105,6 +105,9 @@ void radPrepareUltimaxTakeover()
 	for ( u32 i = 0; i < sizeof( takeoverROM ); i++ ) takeoverROM[ i ] = 0xEA;
 	for ( u32 i = 0; i < sizeof( takeoverROMPrefix ); i++ )
 		takeoverROM[ i ] = takeoverROMPrefix[ i ];
+	// Immediate operand of LDA #$35 / STA $01 in takeoverROMPrefix. Keep the
+	// source image readable and patch only the value selected by the caller.
+	takeoverROM[ 13 ] = physicalPort;
 	takeoverROM[ 0xFC ] = 0x00;
 	takeoverROM[ 0xFD ] = 0xFF;
 	takeoverROM[ 0xFE ] = 0x00;
@@ -276,9 +279,10 @@ void radReleaseCPU()
 	WAIT_FOR_VIC_HALFCYCLE
 	RESTART_CYCLE_COUNTER
 
-	SET_GPIO( bLATCH_A_OE | bOE_Dx | bRW_OUT | bDMA_OUT );
+	SET_GPIO( bLATCH_A_OE | bOE_Dx | bRW_OUT | bDMA_OUT | bGAME_OUT );
 	INP_GPIO_RW();
 	SET_BANK2_OUTPUT
+	INP_GPIO( GAME_OUT );
 	INP_GPIO( DMA_OUT );
 }
 

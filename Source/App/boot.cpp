@@ -86,6 +86,8 @@ static u32 s_C128PCTracePos = 0;
 
 static bool radBusButtonPressed();
 static bool radBusHardwareResetPressed();
+static bool radBusRAMUnderIOReady();
+static bool radBusPrepareRAMUnderIOAccess();
 static void radBusSampleInterrupts( bool &irq, bool &nmi );
 static bool radBusTrafficHalted();
 static SCPURuntimeResult scpuCurrentRuntimeResult( CSuperCPU *scpu );
@@ -783,6 +785,19 @@ static bool scpuCheckButton( void *ctx )
 				               SCPU_BUS_DIAG_FILE );
 		}
 
+		// RESET restores the physical 6510's processor port. If this run installed
+		// the all-RAM under-I/O map, put it back before the emulated CPU resumes;
+		// otherwise its next legitimate VIC/CIA access would hit DRAM instead.
+		const bool restoreRAMUnderIO = radBusRAMUnderIOReady();
+		if ( restoreRAMUnderIO && !radBusPrepareRAMUnderIOAccess() )
+		{
+			CScopedLoggingIRQs resetMapIRQs;
+			s_Logger->Write( "SCPU", LogError,
+			               "could not restore the C64 RAM-under-I/O bus map after RESET" );
+			s_RebootRequested = true;
+			return true;
+		}
+
 		if ( scpu ) scpu->reset();
 		if ( scpuRuntimeDiagnosticActive() ) scpuBeginRuntimeDiagnostic( scpu );
 		s_HardwareResetGeneration++;
@@ -1420,6 +1435,11 @@ static u8 scpuROMBuffer[ SCPU_ROM_MAXSIZE ];
 
 static bool radBusButtonPressed() { return radBus.buttonPressed(); }
 static bool radBusHardwareResetPressed() { return radBus.hardwareResetPressed(); }
+static bool radBusRAMUnderIOReady() { return radBus.ramUnderIOReady(); }
+static bool radBusPrepareRAMUnderIOAccess()
+{
+	return radBus.prepareRAMUnderIOAccess();
+}
 static void radBusSampleInterrupts( bool &irq, bool &nmi ) { radBus.sampleInterrupts( irq, nmi ); }
 static bool radBusTrafficHalted() { return radBus.trafficHalted(); }
 static void radBusHaltAndProbe( u32 &eligiblePhases, u32 &addrChanges,
@@ -2346,6 +2366,32 @@ void scpuBootRun( CLogger *logger )
 		radBus.setTrafficHalted( true );
 		actLED.Blink( scanTrusted ? 5 : 8 );
 		for ( ;; ) asm volatile( "wfe" );
+	}
+
+	// A real SuperCPU keeps the stopped 6510 in an all-RAM processor-port map
+	// and selects Ultimax only for genuine I/O cycles. Install that arrangement
+	// only now: ROM snapshotting, calibration, the bus self-test and destructive
+	// diagnostics above all depend on the conventional host map. The RAD's C128
+	// refresh ownership is deliberately excluded until its equivalent has been
+	// validated independently.
+	if ( radBus.signals().machine == MACHINE_C64 )
+	{
+		if ( !radBus.prepareRAMUnderIOAccess() )
+		{
+			CScopedLoggingIRQs underIOFailIRQs;
+			scpuHDMIShowFailure();
+			logger->Write( "SCPU", LogError,
+			               "RAM-under-I/O preparation failed; the C64 was reset and released" );
+			logger->Write( "SCPU", LogNotice,
+			               "press the RAD button to reboot and retry." );
+			scpuWaitForButtonThenReboot();
+		}
+		superCPU.setRAMUnderIOAccessible( true );
+		{
+			CScopedLoggingIRQs underIOLogIRQs;
+			logger->Write( "SCPU", LogNotice,
+			               "physical RAM under I/O: enabled; /GAME selects chip accesses" );
+		}
 	}
 
 	// Measurements are finished. Core 1 may now read Pi shadow and write the

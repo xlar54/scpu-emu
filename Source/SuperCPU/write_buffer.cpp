@@ -32,7 +32,7 @@ CWriteBuffer::CWriteBuffer()
 	  m_IOWindowSuppressed( 0 ),
 	  m_Bus( 0 ), m_RAM( 0 ),
 	  m_Mode( SCPU_OPT_DEFAULT ), m_ExcludeZPStack( true ),
-	  m_DeliveryEnabled( true ),
+	  m_DeliveryEnabled( true ), m_RAMUnderIOAccessible( false ),
 	  m_RangeLo( 0x0000 ), m_RangeHi( 0xFFFF ),
 	  m_Head( 0 ), m_Count( 0 ), m_QueueGeneration( 0 ),
 	  m_NoProgressValid( false ), m_NoProgressDeferHot( false ),
@@ -141,9 +141,10 @@ bool CWriteBuffer::shouldMirror( u16 addr ) const
 	if ( m_Mode != SCPU_OPT_NONE && m_ExcludeZPStack && addr < 0x0200 )
 		return false;
 
-	// NEVER mirror $D000-$DFFF. On the real machine that window is chip
-	// registers -- VIC-II, SID, CIAs, colour RAM -- not DRAM the VIC fetches
-	// from, so there is nothing there to keep coherent.
+	// Never mirror $D000-$DFFF until the physical bus has explicitly proved the
+	// real-SuperCPU mapping used to reach RAM underneath I/O. On a conventional
+	// $01=$37 host this window is chip registers -- VIC-II, SID, CIAs and colour
+	// RAM -- and mirroring a shadow-RAM write would be actively destructive.
 	//
 	// Mirroring it is actively destructive. Our emulated $01 can decide the
 	// window is RAM (CHAREN clear, or LORAM and HIRAM both clear), in which
@@ -153,7 +154,7 @@ bool CWriteBuffer::shouldMirror( u16 addr ) const
 	// register. A stray write to $D011 clears DEN and corrupts the raster
 	// compare; one to $DD00 moves the VIC's 16K bank. Either produces a blanked
 	// or rolling picture -- which is precisely the fault this was hunting.
-	if ( addr >= 0xD000 && addr <= 0xDFFF )
+	if ( !m_RAMUnderIOAccessible && addr >= 0xD000 && addr <= 0xDFFF )
 	{
 		m_IOWindowSuppressed++;
 		return false;
@@ -567,7 +568,10 @@ u32 CWriteBuffer::resyncDisplayed( u32 screenBase, u32 graphicsBase,
 		candidates++;
 		if ( sample )
 		{
-			const u8 actual = m_Bus->read( a );
+			// The region may be physical DRAM underneath the I/O window. Sampling
+			// through an ordinary read would select the VIC/SID/CIA overlay and can
+			// even clear a CIA ICR. Ask the bus explicitly for RAM instead.
+			const u8 actual = m_Bus->readRAM( a );
 			m_DisplayScrubSampled[ mode ]++;
 			if ( actual != expected ) m_DisplayScrubMismatches[ mode ]++;
 		}

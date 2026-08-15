@@ -278,7 +278,14 @@ public:
 		// pointer selecting a shape block under the I/O window is remapped to
 		// the block's relocated copy, the only place the real VIC can actually
 		// be fed from. See relocPointerValue().
-		if ( m_C64 ) m_C64->write( a, relocPointerValue( v ) );
+		if ( m_C64 )
+		{
+			const u8 delivered = relocPointerValue( v );
+			if ( m_RAMUnderIOAccessible && a >= 0xD000 && a <= 0xDFFF )
+				m_C64->writeRAM( a, delivered );
+			else
+				m_C64->write( a, delivered );
+		}
 		updateHotShapeBlocks();
 
 		// Timestamp it. Sprite pointers are RAM, so otherwise they are carried
@@ -998,14 +1005,23 @@ private:
 	bool m_HaveCIA2PortALatch;
 
 	// Base of the ACTIVE screen's sprite-pointer row ($xxF8 masked to 8), or
-	// the sentinel when the screen sits under the I/O window and cannot be
-	// mirrored at all. Kept fresh by writes to $D018 and $DD00.
+	// the sentinel when the screen sits under the I/O window and the physical
+	// bus has not proved native RAM-under-I/O delivery. Kept fresh by writes to
+	// $D018 and $DD00.
 	u32  m_SpritePtrBase;
 	u32  m_PreviousSpritePtrBase;
 	u8   m_LastD018;
+	bool m_RAMUnderIOAccessible = false;
 public:
+	void setRAMUnderIOAccessible( bool accessible )
+	{
+		m_RAMUnderIOAccessible = accessible;
+		if ( accessible ) m_RelocEnable = false;
+		updateSpritePtrBase();
+		updateHotShapeBlocks();
+	}
 	// First byte of the active VIC screen matrix, or 0xFFFFFFFF when that
-	// matrix lies under the real machine's I/O window and cannot be mirrored.
+	// matrix lies under an I/O window the physical bus cannot yet reach as RAM.
 	// The sprite-pointer tracker already follows both $D018 and CIA2's VIC-bank
 	// select, so deriving the matrix here keeps the mirror scheduler on exactly
 	// the same live state without another copy to go stale.
@@ -1200,17 +1216,13 @@ public:
 	u64  m_PtrRowWrites = 0;
 
 	// --- under-I/O sprite-shape relocation --------------------------------
-	// In VIC bank 3 a sprite pointer of $40-$7F selects a shape block at
-	// $D000-$DFFF: RAM to the VIC, which always fetches DRAM there, but
-	// unreachable to our mirror, because the halted 6510 keeps the real
-	// machine's I/O banked in and a bus write lands on a chip register (see
-	// CWriteBuffer::shouldMirror). A real SuperCPU-side program can still put
-	// shapes there -- 3D Pool /SCPU double-buffers across banks 1 and 3 and
-	// keeps thirty rotation blocks at $D080-$D77F, which is exactly why its
-	// balls alternated between correct (bank-1 frame, deliverable) and garbage
-	// (bank-3 frame, never delivered) at frame rate.
+	// Fallback for a host where native RAM-under-I/O delivery was not prepared.
+	// In VIC bank 3 a sprite pointer of $40-$7F selects $D000-$DFFF DRAM, but a
+	// conventional halted host has I/O over that window and cannot accept the
+	// shape bytes safely. 3D Pool /SCPU exposed this by double-buffering between
+	// deliverable bank 1 and then-unreachable bank 3 shapes.
 	//
-	// The one lever we do control is the pointer VALUE we deliver. So: remap
+	// The fallback lever is the pointer VALUE we deliver. So: remap
 	// each under-I/O block, on first use, to a free block in $C000-$CBFF,
 	// mirror the shape bytes to the relocated copy, and deliver the remapped
 	// pointer. The real VIC then fetches identical bytes from an address it
@@ -1311,9 +1323,11 @@ private:
 		              ? (u8)( ~m_CIA2PortALatch & outputs & 3 ) : 0;
 		const u32 base = ( (u32)bank << 14 )
 		               + ( (u32)( m_LastD018 >> 4 ) << 10 ) + 0x3F8;
-		// Screen under the I/O window: the pointer row is unreachable over
-		// the bus (real $01 stays $37), so the fast path must never try.
-		const u32 next = ( ( base & 0xF000 ) == 0xD000 ) ? 0xFFFFFFFF : base;
+		// Before native delivery is armed, a pointer row under I/O is unreachable
+		// and its urgent write path must not touch the overlaid chip registers.
+		const u32 next = !m_RAMUnderIOAccessible
+		              && ( ( base & 0xF000 ) == 0xD000 )
+		               ? 0xFFFFFFFF : base;
 		if ( next != m_SpritePtrBase )
 			m_PreviousSpritePtrBase = m_SpritePtrBase;
 		m_SpritePtrBase = next;

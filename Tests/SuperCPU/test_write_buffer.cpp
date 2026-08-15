@@ -315,13 +315,11 @@ TEST( writebuf_none_then_default_restores_zp_exclusion )
 	CHECK(  f.wb.shouldMirror( 0x0400 ) );
 }
 
-TEST( writebuf_never_mirrors_the_io_window )
+TEST( writebuf_mirrors_io_window_only_after_physical_map_is_prepared )
 {
-	// $D000-$DFFF is VIC-II, SID, CIAs and colour RAM on the real machine, not
-	// DRAM. Our emulated $01 may map it as RAM (CHAREN clear, or LORAM and
-	// HIRAM both clear) and route writes here -- but the halted 6510 leaves the
-	// real machine's $01 at $37, so a mirrored byte would land on the actual
-	// register. A stray $D011 clears DEN; a stray $DD00 moves the VIC bank.
+	// The fail-safe default rejects the window: on an ordinary $01=$37 host a
+	// mirrored byte would land on an actual register. A stray $D011 clears DEN;
+	// a stray $DD00 moves the VIC bank.
 	WBFixture f;
 	f.wb.setOptMode( SCPU_OPT_NONE );		// the most permissive policy
 
@@ -343,6 +341,26 @@ TEST( writebuf_never_mirrors_the_io_window )
 	f.wb.flush();
 	CHECK_EQ( f.bus.m_Cycles, 0 );
 	CHECK( f.wb.m_IOWindowSuppressed >= 2 );
+
+	// Once the physical bus proves its $01=$34 + per-access /GAME mapping, the
+	// same addresses denote DRAM for mirror delivery. Genuine I/O never enters
+	// this sink: CC64Memory routes it directly through IC64Bus::write().
+	f.wb.setRAMUnderIOAccessible( true );
+	CHECK( f.wb.ramUnderIOAccessible() );
+	CHECK( f.wb.shouldMirror( 0xD000 ) );
+	CHECK( f.wb.shouldMirror( 0xD011 ) );
+	CHECK( f.wb.shouldMirror( 0xD400 ) );
+	CHECK( f.wb.shouldMirror( 0xD800 ) );
+	CHECK( f.wb.shouldMirror( 0xDD00 ) );
+	CHECK( f.wb.shouldMirror( 0xDFFF ) );
+
+	f.bus.resetStats();
+	f.poke( 0xD011, 0x5A );
+	f.poke( 0xDD00, 0xA5 );
+	f.wb.flush();
+	CHECK_EQ( f.bus.m_Memory[ 0xD011 ], 0x5A );
+	CHECK_EQ( f.bus.m_Memory[ 0xDD00 ], 0xA5 );
+	CHECK_EQ( f.bus.m_Cycles, 2 );
 }
 
 TEST( writebuf_partial_flush_cannot_starve_old_entries )

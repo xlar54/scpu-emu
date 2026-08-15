@@ -35,8 +35,11 @@
 // Keep the complete physical read in one known-good out-of-line code body.
 // The C128 positional diagnostics proved that expanding p1/p2/p3 into large
 // callers changes the result even though the source sequence is identical.
-u8 radDirectRead( u16 addr );
-void radDirectWrite( u16 addr, u8 value );
+// forceRAM bypasses the runtime /GAME I/O selector. The write buffer uses it
+// when it verifies or repairs physical DRAM underneath $D000-$DFFF; ordinary
+// guest-visible accesses leave it false and therefore reach the real chips.
+u8 radDirectRead( u16 addr, bool forceRAM = false );
+void radDirectWrite( u16 addr, u8 value, bool forceRAM = false );
 
 // Align to the start of a fresh C64 cycle: wait out the CPU half-cycle, then
 // the VIC half-cycle, then re-anchor the ARM cycle counter.

@@ -237,22 +237,14 @@ void busReadByte_p1( register u32 &g2, u16 addr )
 
 
 __attribute__( ( always_inline ) ) inline
-void busReadByte_p2( register u32 &g2 )
+void busReadByte_p2( register u32 &g2, bool selectIOWithGame = false )
 {
-	// NO /GAME here. RAD-Doom pulled it low on every read (its pullGAMEforIO
-	// condition was commented out, making it unconditional), because Doom only
-	// ever reads I/O registers and forcing Ultimax mode guarantees $D000-$DFFF
-	// decodes as I/O whatever the banking is.
-	//
-	// SCPU-EMU reads ROM and RAM as well, and Ultimax is fatal for those:
-	// $A000-$CFFF becomes open bus and $E000-$FFFF comes from cartridge ROMH
-	// instead of the KERNAL. It also toggles the machine in and out of Ultimax
-	// thousands of times a frame, which disturbs the VIC-II's own fetches.
-	//
-	// The stock RAD firmware -- which reads C64 RAM for REU transfers -- does
-	// not touch /GAME here either. We do not need the Ultimax guarantee: we
-	// reset the machine ourselves, so the halted 6510's port latch is left at
-	// $37 and I/O is banked in regardless.
+	// A real SuperCPU leaves the halted 6510's CHAREN/HIRAM/LORAM pins in an
+	// all-RAM group, then selects Ultimax only for a genuine $D000-$DFFF I/O
+	// cycle. Assert /GAME after BA arbitration and address setup, while PHI2 is
+	// still in the VIC half, so the PLA sees a stable selector before the CPU
+	// half begins. Ordinary RAM and mirror traffic never takes this branch.
+	if ( selectIOWithGame ) CLR_GPIO( bGAME_OUT );
 	WAIT_FOR_CPU_HALFCYCLE
 	RESTART_CYCLE_COUNTER
 }
@@ -272,12 +264,13 @@ static u8 busWriteTurnaroundNeeded = 0;
 static u8 busWriteTurnaroundPasses = 1;
 __attribute__( ( always_inline ) ) inline  
 void busReadByte_p3( register u32 &g2, register u8 &x, bool releaseDMA,
-                     u32 sampleAt )
+                     u32 sampleAt, bool selectIOWithGame = false )
 { 
 	WAIT_UP_TO_CYCLE( sampleAt );
 	g2 = read32( ARM_GPIO_GPLEV0 );
 	x = (u8)( ( g2 >> D0 ) & 255 );
 	WAIT_FOR_VIC_HALFCYCLE
+	if ( selectIOWithGame ) SET_GPIO( bGAME_OUT );
 	RESTART_CYCLE_COUNTER
 	DISABLE_ADDRESS_LATCH_AND_BUSTRANSCEIVER( releaseDMA );
 	busWriteTurnaroundNeeded = 1;
@@ -290,7 +283,8 @@ void busReadByte_p3( register u32 &g2, register u8 &x, bool releaseDMA,
 // an ARM-cycle offset and without discarding the last known-valid phase.
 __attribute__( ( always_inline ) ) inline
 void busReadByte_p3FallingEdge( register u32 &g2, register u8 &x,
-	                            bool releaseDMA )
+	                            bool releaseDMA,
+	                            bool selectIOWithGame = false )
 {
 	u32 lastHigh = g2;
 	do
@@ -299,6 +293,7 @@ void busReadByte_p3FallingEdge( register u32 &g2, register u8 &x,
 		g2 = read32( ARM_GPIO_GPLEV0 );
 	} while ( CPU_HALF_CYCLE );
 	x = (u8)( ( lastHigh >> D0 ) & 255 );
+	if ( selectIOWithGame ) SET_GPIO( bGAME_OUT );
 	RESTART_CYCLE_COUNTER
 	DISABLE_ADDRESS_LATCH_AND_BUSTRANSCEIVER( releaseDMA );
 	busWriteTurnaroundNeeded = 1;
@@ -419,7 +414,8 @@ void busWriteByteBurst_p2( register u32 &g2, bool releaseDMA )
 
 
 __attribute__( ( always_inline ) ) inline  
-void busWriteByte_p1( register u32 &g2, u16 addr, u8 data )
+void busWriteByte_p1( register u32 &g2, u16 addr, u8 data,
+	                  bool selectIOWithGame = false )
 {
 	if ( busWriteTurnaroundNeeded )
 	{
@@ -448,6 +444,10 @@ void busWriteByte_p1( register u32 &g2, u16 addr, u8 data )
 	CLR_GPIO( ( D_FLAG & ( ~DD ) ) );
 
 	HANDLE_BUS_AVAILABLE
+	// BA is now high and the target CPU half has not begun. Select Ultimax only
+	// for this genuine I/O cycle; leaving /GAME low while waiting for BA would
+	// unnecessarily alter the VIC's intervening fetches.
+	if ( selectIOWithGame ) CLR_GPIO( bGAME_OUT );
 	WAIT_UP_TO_CYCLE( busTiming.TIMING_ENABLE_RWOUT_ADDR_LATCH_WRITING - 40 );
 	OUT_GPIO( RW_OUT );
 	CLR_GPIO( bLATCH_A_OE | bDIR_Dx );
@@ -456,9 +456,11 @@ void busWriteByte_p1( register u32 &g2, u16 addr, u8 data )
 }
 
 __attribute__( ( always_inline ) ) inline  
-void busWriteByte_p2( register u32 &g2, bool releaseDMA )
+void busWriteByte_p2( register u32 &g2, bool releaseDMA,
+	                  bool selectIOWithGame = false )
 {
 	WAIT_FOR_VIC_HALFCYCLE
+	if ( selectIOWithGame ) SET_GPIO( bGAME_OUT );
 	RESTART_CYCLE_COUNTER
 	WAIT_UP_TO_CYCLE( busTiming.TIMING_DATA_HOLD );
 	DISABLE_ADDRESS_LATCH_AND_BUSTRANSCEIVER( releaseDMA )

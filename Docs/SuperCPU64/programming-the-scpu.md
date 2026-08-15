@@ -311,11 +311,14 @@ accelerator can skip keeping the rest coherent:
 **SCPU-EMU implements these ranges exactly**, plus VIC bank 0 and 3 and a
 `DEFAULT` mode that mirrors everything except zero page and stack.
 
-One deliberate divergence: SCPU-EMU **never** mirrors `$D000-$DFFF`, whatever
-the optimization mode says. On the real machine that window is chip registers,
-not DRAM the VIC fetches from, and the halted 6510 leaves the physical `$01` at
-`$37` — so a mirrored write intended for RAM under I/O would land on an actual
-register. That is documented at the suppression site.
+On a verified C64-class host, SCPU-EMU now reproduces the real card's
+RAM-under-I/O mechanism. After ROM capture and the bus self-test, a bounded
+takeover stub leaves the halted 6510 at `$01=$34`. `/GAME` remains released for
+ordinary RAM and mirror traffic, making physical DRAM at `$D000-$DFFF`
+reachable, and is asserted only for a genuine VIC/SID/CIA/colour-RAM access.
+This is required for a bank-3 bitmap at `$C000`, whose lower 3904 bytes occupy
+`$D000-$DF3F`. The old blanket suppression remains the fail-safe until that
+physical map verifies, and on host types where it is not yet enabled.
 
 **Note for the C128:** the memory-locations reference describes `$D07A` as
 selecting *"Normal (1 MHz or 2 MHz in 128 Fast mode)"*. So on a SuperCPU 128 the

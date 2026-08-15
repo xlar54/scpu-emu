@@ -87,6 +87,28 @@ TEST( banking_ultimax_replaces_the_map )
 	CHECK_EQ( c64MapRead( 0xE000, m ), REG_CART_ROMH );
 }
 
+TEST( banking_supercpu_port_34_uses_game_as_ram_io_selector )
+{
+	c64BankingInit();
+
+	// Physical 6510 port $34 is LORAM=0, HIRAM=0, CHAREN=1. With both cartridge
+	// lines released it is the all-RAM map the SuperCPU needs for VIC-visible
+	// DRAM underneath $D000-$DFFF.
+	u8 ram = modeFor( 0x34, /*game*/ 1, /*exrom*/ 1 );
+	CHECK_EQ( c64MapRead( 0xA000, ram ), REG_RAM );
+	CHECK_EQ( c64MapRead( 0xD000, ram ), REG_RAM );
+	CHECK_EQ( c64MapRead( 0xDFFF, ram ), REG_RAM );
+	CHECK_EQ( c64MapRead( 0xE000, ram ), REG_RAM );
+
+	// Assert /GAME for one CPU half-cycle and the same D-window selects the
+	// real VIC/SID/CIA/colour-RAM chips. The surrounding regions become the
+	// Ultimax cartridge map, but no guest access observes them while /GAME is
+	// asserted because the selector is scoped to this D-window transaction.
+	u8 io = modeFor( 0x34, /*game*/ 0, /*exrom*/ 1 );
+	CHECK_EQ( c64MapRead( 0xD000, io ), REG_IO );
+	CHECK_EQ( c64MapRead( 0xDFFF, io ), REG_IO );
+}
+
 TEST( banking_port_effective_honours_data_direction )
 {
 	// Lines configured as inputs float high because of the external pull-ups,

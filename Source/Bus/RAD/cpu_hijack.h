@@ -64,7 +64,10 @@ bool radHijackCPU();
 
 // Materialise and cache the Ultimax takeover table while the host still owns
 // its bus. This must run before a legacy probe can leave a C128 under /DMA.
-void radPrepareUltimaxTakeover();
+// physicalPort is written to the halted 6510's on-chip $01 latch by the stub.
+// $35 is the acquisition default; $34 is the real-SuperCPU all-RAM setup used
+// after ROM snapshotting so /GAME can select I/O one physical cycle at a time.
+void radPrepareUltimaxTakeover( u8 physicalPort = 0x35 );
 
 // Reset through an emulated Ultimax cartridge and take the bus while the host
 // CPU is executing a known stream of read-only NOPs.  Unlike the C64-only

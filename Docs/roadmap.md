@@ -39,10 +39,11 @@ KERNAL with the Pi as the CPU.
 - [x] **Runs on real hardware.** A physical C64 boots to a normal screen with
       the Pi as its CPU. The bus self-test passes: reads are live, single
       read/write is stable 20/20, bursts are clean, and every address line
-      verifies. The fix that finally made the display hold was suppressing
-      mirrored writes to `$D000-$DFFF` — that window is chip registers on the
-      real machine, and mirroring RAM shadow bytes onto live VIC-II registers
-      is what produced the rolling picture.
+      verifies. The fix that first made the display hold was suppressing unsafe
+      mirrored writes to `$D000-$DFFF` while the physical host still had I/O
+      banked in. The completed C64 path now installs the real SuperCPU-style
+      `$01=$34` all-RAM map after ROM capture and selects I/O with `/GAME` only
+      for genuine chip accesses, so VIC-visible DRAM under I/O is coherent too.
 - [x] Cycle pacing so raster code behaves, plus the IEC auto-throttle on
       `$DD00` writes
 - [ ] Timing constants validated per Pi model

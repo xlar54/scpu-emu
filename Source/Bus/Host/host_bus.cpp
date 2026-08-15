@@ -121,6 +121,19 @@ void CHostBus::write( u16 addr, u8 value )
 	logAccess( HOSTOP_WRITE, addr, value );
 }
 
+u8 CHostBus::readRAM( u16 addr )
+{
+	// The host bus has no PLA or chip overlay; preserve ordinary read accounting
+	// and logging so tests can still assert on the exact physical operation.
+	return read( addr );
+}
+
+void CHostBus::writeRAM( u16 addr, u8 value )
+{
+	// The host bus has no overlay; preserve normal write accounting and logging.
+	write( addr, value );
+}
+
 bool CHostBus::verifyC64CIA2DDRA( u8 expected )
 {
 	// The host backend has no marginal expansion bus, but use the ordinary

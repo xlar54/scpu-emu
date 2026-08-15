@@ -1722,6 +1722,16 @@ TEST( integration_active_screen_base_tracks_d018_and_vic_bank )
 	CHECK_EQ( f.mem.activeScreenBase(), 0xFFFFFFFFu );
 	CHECK_EQ( f.mem.activeVICBankBase(), 0xC000u );
 	CHECK_EQ( f.mem.activeVICScreenBase(), 0xD000u );
+
+	// The verified real-SuperCPU map makes that physical DRAM deliverable. The
+	// urgent sprite-pointer path must explicitly target RAM too; an ordinary
+	// D-window bus write would select the overlaid VIC/SID/CIA registers.
+	f.wb.setRAMUnderIOAccessible( true );
+	f.mem.setRAMUnderIOAccessible( true );
+	CHECK_EQ( f.mem.activeScreenBase(), 0xD000u );
+	f.mem.write8( 0x0001, 0x34 );			// guest sees RAM under I/O
+	f.mem.write8( 0xD3F8, 0x55 );
+	CHECK_EQ( f.bus.m_Memory[ 0xD3F8 ], (u8)0x55 );
 }
 
 TEST( integration_active_bitmap_base_tracks_mode_d018_and_vic_bank )

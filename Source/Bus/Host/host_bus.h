@@ -52,6 +52,8 @@ public:
 
 	u8   read( u16 addr ) override;
 	void write( u16 addr, u8 value ) override;
+	u8   readRAM( u16 addr ) override;
+	void writeRAM( u16 addr, u8 value ) override;
 	bool verifyC64CIA2DDRA( u8 expected ) override;
 	void writeBurst( const C64BusWrite *writes, u32 count ) override;
 	void readBlock( u16 addr, u8 *dst, u32 length ) override;
