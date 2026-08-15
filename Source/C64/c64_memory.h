@@ -1031,6 +1031,26 @@ public:
 		return (u32)bank << 14;
 	}
 
+	// Passive diagnostic snapshot of CIA2 port A. The frame hook used to call
+	// read8($DD00/$DD02) every 50 frames merely to preserve state for a later
+	// reset dump. Those guest-visible reads re-armed the SuperCPU's automatic
+	// 1MHz IEC poll hold, injecting a roughly millisecond-long slowdown about
+	// once per second. All authoritative pieces are already tracked here, so
+	// reconstruct the same PRA view without touching the physical bus or any
+	// timing state. A live input sample is required; otherwise reporting stale
+	// or invented PA6/PA7 levels would be worse than saying no sample exists.
+	bool trackedCIA2Snapshot( u8 &portA, u8 &ddra ) const
+	{
+		if ( !m_HaveCIA2DDRA || !m_HaveCIA2PortARead )
+			return false;
+		ddra = m_CIA2DDRA;
+		portA = m_LastCIA2PortARead;
+		if ( m_HaveCIA2PortALatch )
+			portA = (u8)( ( portA & (u8)~ddra )
+			              | ( m_CIA2PortALatch & ddra ) );
+		return true;
+	}
+
 	// Timestamp capture is explicitly enabled only by VIDEO_MODE 1. With it
 	// off, the hot VIC/colour write path performs no clock read or ring store.
 	void enableVICLog( bool enabled )

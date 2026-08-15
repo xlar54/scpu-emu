@@ -13,6 +13,16 @@ emulator control register documented in
   `$D01E/$D01F` and their VIC register mirrors are read-to-clear in HDMI mode.
   Collision results are produced from completed HDMI frames, so software can
   observe them up to one displayed frame later than on a cycle-exact VIC-II.
+- Mid-frame sprite-pointer changes are timestamped alongside VIC register
+  writes, so multiplexed sprites can change shape within one rendered frame.
+  A pointer written on raster line N takes effect on line N+1, matching the
+  VIC-II's pointer fetch at the end of the preceding line. Changing `$D018` or
+  the CIA2 VIC-bank selection invalidates the tracked pointer row and reseeds
+  it from the authoritative RAM snapshot. Unchanged pointer rewrites are not
+  logged, preventing them from needlessly overflowing the event ring.
+- Other VIC-visible RAM changes -- screen matrix, bitmap and charset writes --
+  remain frame-snapshot based. Their physical mirroring is unaffected; this is
+  specifically an HDMI replay limitation for mid-frame RAM effects.
 - Illegal ECM/BMM/MCM combinations drive the active graphics area black, while
   the border and sprites retain their independent rendering paths.
 - Open-border sprites are not yet modelled. The renderer clips them to its

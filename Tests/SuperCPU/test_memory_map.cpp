@@ -987,6 +987,35 @@ TEST( nmi_retime_poll_hold_decays_quickly_without_polls )
 	CHECK( !mem.iecThrottleActive() );	// gone within ~a millisecond
 }
 
+TEST( cia2_diagnostic_snapshot_does_not_rearm_the_1mhz_poll_hold )
+{
+	CHostBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	mem.setPacing( 0, 20000000 );
+
+	u8 portA = 0, ddra = 0;
+	CHECK( !mem.trackedCIA2Snapshot( portA, ddra ) );
+
+	// Establish the three pieces of tracked state: DDRA, the hidden output
+	// latch, and one physical input sample. With outputs $17 and PA6/PA7 high,
+	// the reconstructed port read is $D7.
+	mem.write8( 0xDD02, 0x3F );
+	mem.write8( 0xDD00, 0x17 );
+	bus.m_Memory[ 0xDD00 ] = 0xFF;
+	mem.read8( 0xDD00 );
+	mem.tickFast( 110000 );
+	CHECK( !mem.iecThrottleActive() );
+
+	const u64 ioReads = mem.m_IOReads;
+	CHECK( mem.trackedCIA2Snapshot( portA, ddra ) );
+	CHECK_EQ( portA, (u8)0xD7 );
+	CHECK_EQ( ddra, (u8)0x3F );
+	CHECK_EQ( mem.m_IOReads, ioReads );
+	CHECK( !mem.iecThrottleActive() );
+}
+
 TEST( c64_clock_preserves_elapsed_time_across_explicit_speed_changes )
 {
 	CHostBus bus;

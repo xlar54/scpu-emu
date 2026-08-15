@@ -702,16 +702,16 @@ static bool scpuCheckButton( void *ctx )
 		}
 	}
 
-	// These reads go to the physical CIA. Do not insert them into an active
-	// serial transaction merely for diagnostics; take the next scheduled
-	// sample once IEC is quiet instead.
+	// Preserve the already-tracked CIA2 state for a later reset diagnostic.
+	// Do not call read8() here: a guest-visible $DD00/$DD02 poll deliberately
+	// re-arms the SuperCPU's 1MHz IEC hold, so the old diagnostic introduced a
+	// periodic hitch into the machine it was observing.
 	if ( scpu && !hardwareResetPressed
 	     && ( ++s_PreResetSampleFrame % 50 ) == 0
 	     && !scpu->memory().iecBusActive() )
 	{
-		s_PreResetDD00 = scpu->memory().read8( 0xDD00 );
-		s_PreResetDD02 = scpu->memory().read8( 0xDD02 );
-		s_PreResetSampleValid = true;
+		s_PreResetSampleValid = scpu->memory().trackedCIA2Snapshot(
+			s_PreResetDD00, s_PreResetDD02 );
 	}
 
 	if ( radBusButtonPressed() )
