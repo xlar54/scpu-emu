@@ -56,9 +56,12 @@ for f in "$OUT/$NAME.png" "$OUT/$NAME.ram" "$OUT/$NAME.io"; do
 done
 
 echo "[3/3] render and compare"
-RENDER="$OUT/render_state"
-[ -x "$RENDER" ] || g++ -O2 -std=c++14 -DSCPU_HOST_BUILD -o "$RENDER" \
-	"$ROOT/Tools/viceconf/render_state.cpp" "$ROOT/Source/Video/vic_renderer.cpp"
+# Built by `make viceconf` from the same objects as the test suite, so a fix
+# cannot pass here and behave differently on the card.
+RENDER="$ROOT/build/host/render_state"
+REPLAY_BIN="$ROOT/build/host/replay_state"
+[ -x "$RENDER" ] || make -C "$ROOT" viceconf >/dev/null || {
+	echo "cannot build the conformance tools (make viceconf)"; exit 1; }
 
 # A program that stores a collision signature at $C000/$C001 gets those checked
 # too. $D01E and $D01F clear on read, so the guest must sample them itself.
@@ -69,15 +72,15 @@ RC=0
 "$RENDER" "$OUT/$NAME.ram" "$OUT/$NAME.io" "$CHARGEN" "$OUT/$NAME.raw" $COLLIDE || RC=1
 
 # A raster program is several machine states inside one frame, and a state dump
-# is one state. The pixel diff therefore CANNOT pass for these and its
-# percentage means nothing -- say so, rather than emit a number that reads like
-# a regression. What is testable here is where the bands land, which
-# check_raster.py measures from the reference screenshot directly.
-if [ "${MULTISTATE:-}" = "1" ]; then
+# is one state, so render_state's output cannot match it and its percentage
+# means nothing. REPLAY=1 answers that properly: replay_state boots the real
+# machine, runs the program, and rebuilds the frame from the genuine write log
+# through the shipping band planner -- which IS comparable to the screenshot,
+# because a VICE screenshot is the correctly rendered multi-state frame.
+if [ "${REPLAY:-}" = "1" ]; then
+	"$REPLAY_BIN" "$PRG" "$CHARGEN" "$OUT/$NAME.replay.raw" || RC=1
 	python3 "$ROOT/Tools/viceconf/compare.py" \
-		"$OUT/$NAME.raw" "$OUT/$NAME.png" "$OUT/$NAME.diff.png" >/dev/null 2>&1 || true
-	echo "pixel diff        skipped: multi-state frame, one state dump cannot match it"
-	echo "                  use check_raster.py on $NAME.png for band placement"
+		"$OUT/$NAME.replay.raw" "$OUT/$NAME.png" "$OUT/$NAME.diff.png" || RC=1
 else
 	python3 "$ROOT/Tools/viceconf/compare.py" \
 		"$OUT/$NAME.raw" "$OUT/$NAME.png" "$OUT/$NAME.diff.png" || RC=1

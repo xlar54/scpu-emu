@@ -106,26 +106,28 @@ int main( int argc, char **argv )
 	{
 		// The signature distinguishes a stored result from uninitialised RAM.
 		// Without it a program that records nothing reads back $FF and reports
-		// a dramatic failure that means nothing at all.
+		// a dramatic failure that means nothing at all. Skip only the collision
+		// comparison -- returning here would leave the pixel output unwritten
+		// and the caller would diff whatever stale file was lying around.
 		if ( ram[ 0xC002 ] != 0x5A || ram[ 0xC003 ] != 0xA5 )
-		{
 			fprintf( stderr,
 			         "collisions        no signature at $C002/$C003 -- this "
 			         "program records no collision result; skipping\n" );
-			return 0;
+		else
+		{
+			const u8 wantSS = ram[ 0xC000 ];
+			const u8 wantSB = ram[ 0xC001 ];
+			collisionFailed = ( collisions.spriteSprite != wantSS )
+			               || ( collisions.spriteBackground != wantSB );
+			fprintf( stderr,
+			         "collisions        reference   ours\n"
+			         "  $D01E sprite/sprite      $%02X      $%02X  %s\n"
+			         "  $D01F sprite/background  $%02X      $%02X  %s\n",
+			         wantSS, collisions.spriteSprite,
+			         collisions.spriteSprite == wantSS ? "ok" : "MISMATCH",
+			         wantSB, collisions.spriteBackground,
+			         collisions.spriteBackground == wantSB ? "ok" : "MISMATCH" );
 		}
-		const u8 wantSS = ram[ 0xC000 ];
-		const u8 wantSB = ram[ 0xC001 ];
-		collisionFailed = ( collisions.spriteSprite != wantSS )
-		               || ( collisions.spriteBackground != wantSB );
-		fprintf( stderr,
-		         "collisions        reference   ours\n"
-		         "  $D01E sprite/sprite      $%02X      $%02X  %s\n"
-		         "  $D01F sprite/background  $%02X      $%02X  %s\n",
-		         wantSS, collisions.spriteSprite,
-		         collisions.spriteSprite == wantSS ? "ok" : "MISMATCH",
-		         wantSB, collisions.spriteBackground,
-		         collisions.spriteBackground == wantSB ? "ok" : "MISMATCH" );
 	}
 
 	FILE *out = fopen( argv[ 4 ], "wb" );

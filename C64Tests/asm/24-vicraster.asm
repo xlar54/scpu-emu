@@ -78,7 +78,8 @@ fill            lda #$a0                ; solid block character
                 lda $d011
                 and #$7f
                 sta $d011               ; compare line 60, MSB clear
-                asl $d019               ; acknowledge any pending
+                lda #$01
+                sta $d019               ; acknowledge (see note at foot) any pending
                 cli
 
 halt            jmp halt
@@ -101,10 +102,23 @@ setnext         stx band
                 lda lines,x
                 sta $d012
 
-                asl $d019               ; acknowledge
+                lda #$01
+                sta $d019               ; acknowledge (see note at foot)
                 jmp $ea81               ; plain RTI path
 
 band            .byte 0
 lines           .byte 60, 120, 180, 240
 borders         .byte 2, 5, 7, 11
 backs           .byte 0, 6, 11, 12
+
+; Acknowledge note. The classic idiom here is ASL $D019, and it is avoided on
+; purpose. The VIC clears exactly the latch bits set in the byte written, and
+; ASL writes the value AFTER shifting -- bit 0 lands in bit 1 and the stored
+; byte has bit 0 clear. It works on an NMOS 6502 only because of the
+; read-modify-write dummy write, which puts the ORIGINAL value (bit 0 still
+; set) on the bus first. A 65816 does a dummy read instead, so the same
+; instruction never acknowledges and the handler re-enters forever.
+;
+; That is a genuine SuperCPU hazard and worth testing somewhere. It is not what
+; this program is for: an explicit store keeps the test measuring where bands
+; land rather than which core is underneath it.
