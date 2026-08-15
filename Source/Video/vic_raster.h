@@ -19,6 +19,13 @@ struct VICRegWrite
 };
 
 #define VIC_LOG_REG_MASK       0x07FF
+// $050-$057 are the eight sprite POINTERS. They are RAM, not registers -- the
+// last eight bytes of the screen matrix -- but every sprite multiplexer rewrites
+// them several times a frame, and the once-per-frame RAM snapshot can only carry
+// one value each. Timestamping them costs a handful of ring entries per frame
+// (colour RAM was rejected for the opposite reason: a 1000-cell fill would eat
+// half the ring). The register code space is 11 bits and $041-$0FF was unused.
+#define VIC_LOG_REG_SPRPTR     0x050
 #define VIC_LOG_LINE_VALID     0x4000
 #define VIC_LOG_LINE_HIGH      0x8000
 #define SCPU_VIC_LOG_SIZE      2048
@@ -93,6 +100,13 @@ struct VICRasterReplayBand
 	u16 rowCount;
 	u8  vic[ 0x40 ];
 	u8  bank;
+	// Sprite pointers in force across this band. Valid only while the screen
+	// matrix has not moved: if $D018 or the bank changes mid-frame the pointer
+	// bytes come from a different address and the tracked values are stale, so
+	// the flag clears and the renderer falls back to the RAM snapshot -- which
+	// is exactly the behaviour that existed before any of this.
+	u8  spritePtr[ 8 ];
+	bool spritePtrValid;
 };
 
 struct VICRasterReplayPlan
@@ -162,20 +176,24 @@ public:
 
 private:
 	void rePrime( u32 head, u32 generation, const u8 liveVIC[ 0x40 ],
-	              u8 liveBank );
+	              u8 liveBank, const u8 *liveRAM );
 	void makeStaticPlan( VICRasterFrameResult result,
 	                     const VICRasterTiming &timing,
 	                     const u8 liveVIC[ 0x40 ], u8 liveBank,
 	                     const u8 *liveRAM, bool fallback,
 	                     VICRasterReplayPlan &plan );
-	static void applyEvent( u8 vic[ 0x40 ], u8 &bank,
-	                        const VICRegWrite &event );
+	static void applyEvent( u8 vic[ 0x40 ], u8 &bank, u8 spritePtr[ 8 ],
+	                        bool &spritePtrValid, const VICRegWrite &event );
+	// Where this state's sprite pointers live, so they can be re-seeded.
+	static u32 spritePtrAddr( const u8 vic[ 0x40 ], u8 bank );
 	static bool collectPages( VICRasterReplayPlan &plan,
 	                          const u8 *liveRAM );
 
 	CVICRasterTimeline m_Timeline;
 	u8   m_VIC[ 0x40 ];
 	u8   m_Bank;
+	u8   m_SpritePtr[ 8 ];
+	bool m_SpritePtrValid;
 	u32  m_Generation;
 	bool m_Primed;
 	u32  m_Resyncs;

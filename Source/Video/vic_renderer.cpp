@@ -326,7 +326,9 @@ static void renderSpritesOnRow( const VICRenderState &state,
 		if ( state.vic[ 0x10 ] & mask ) spriteX += 256;
 		const int left = (int)spriteX + 8;
 		const u32 pointerAddr = state.screenBase + 0x3F8 + (u32)n;
-		const u8 pointer = state.ram[ (u16)pointerAddr ];
+		const u8 pointer = state.spritePointers
+		                 ? state.spritePointers[ n ]
+		                 : state.ram[ (u16)pointerAddr ];
 		const u32 shape = state.bankBase + (u32)pointer * 64 + spriteLine * 3;
 		const u32 bits = ( (u32)state.ram[ (u16)shape ] << 16 )
 		               | ( (u32)state.ram[ (u16)( shape + 1 ) ] << 8 )

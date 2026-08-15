@@ -40,8 +40,22 @@ s32 CVICRasterTimeline::lineOfEvent( const VICRegWrite &event, u64 anchor,
 u32 CVICRasterTimeline::rowOfEvent( const VICRegWrite &event, u64 anchor,
 	                                const VICRasterTiming &timing )
 {
-	const s32 line = lineOfEvent( event, anchor, timing );
+	s32 line = lineOfEvent( event, anchor, timing );
 	if ( line < 0 ) return timing.frameRows;
+
+	// A sprite pointer written during line N cannot affect line N. The VIC
+	// fetched it in the p-access at the END of line N-1, before the write
+	// happened, so the change first appears on line N+1. Registers are not like
+	// this -- they are sampled as the beam passes -- which is why only the
+	// pointers are shifted. Measured against VICE: without this, every pointer
+	// change lands exactly one row early.
+	//
+	// A write in the last few cycles of a line would miss the next line's fetch
+	// too and take effect a line later still. That is sub-line precision this
+	// model does not carry, and handlers write pointers early in the line.
+	const u16 reg = vicLogRegister( event );
+	if ( reg >= VIC_LOG_REG_SPRPTR && reg < VIC_LOG_REG_SPRPTR + 8 ) line++;
+
 	s32 row = line - timing.topRaster;
 	if ( row < 0 ) row += (s32)timing.rasterLines;
 	if ( row < 0 ) return 0;
@@ -197,11 +211,13 @@ bool CVICRasterTimeline::yScrollVariesInDisplay(
 // --- persistent replay and bounded source-page planning ------------------
 
 CVICRasterReplay::CVICRasterReplay()
-	: m_Bank( 0 ), m_Generation( 0 ), m_Primed( false ), m_Resyncs( 0 ),
+	: m_Bank( 0 ), m_SpritePtrValid( false ), m_Generation( 0 ),
+	  m_Primed( false ), m_Resyncs( 0 ),
 	  m_LostEventResyncs( 0 ), m_ResetResyncs( 0 ),
 	  m_SnapshotFallbacks( 0 )
 {
 	memset( m_VIC, 0, sizeof m_VIC );
+	memset( m_SpritePtr, 0, sizeof m_SpritePtr );
 }
 
 void CVICRasterReplay::invalidate()
@@ -210,24 +226,64 @@ void CVICRasterReplay::invalidate()
 	m_Timeline.invalidate();
 }
 
+u32 CVICRasterReplay::spritePtrAddr( const u8 vic[ 0x40 ], u8 bank )
+{
+	return ( (u32)( bank & 3 ) << 14 )
+	     + ( (u32)( vic[ 0x18 ] >> 4 ) << 10 ) + 0x3F8;
+}
+
 void CVICRasterReplay::rePrime( u32 head, u32 generation,
-	                             const u8 liveVIC[ 0x40 ], u8 liveBank )
+	                             const u8 liveVIC[ 0x40 ], u8 liveBank,
+	                             const u8 *liveRAM )
 {
 	if ( liveVIC ) memcpy( m_VIC, liveVIC, sizeof m_VIC );
 	else           memset( m_VIC, 0, sizeof m_VIC );
 	m_Bank = liveBank & 3;
+
+	// Seed the pointers from the live matrix. Timestamped writes only carry
+	// CHANGES, so without a starting value the first frame after a resync would
+	// show whatever was left in the array.
+	if ( liveRAM )
+	{
+		const u32 base = spritePtrAddr( m_VIC, m_Bank );
+		for ( u32 n = 0; n < 8; n++ )
+			m_SpritePtr[ n ] = liveRAM[ (u16)( base + n ) ];
+		m_SpritePtrValid = true;
+	}
+	else
+	{
+		memset( m_SpritePtr, 0, sizeof m_SpritePtr );
+		m_SpritePtrValid = false;
+	}
+
 	m_Generation = generation;
 	m_Primed = true;
 	m_Timeline.prime( head );
 	m_Resyncs++;
 }
 
-void CVICRasterReplay::applyEvent( u8 vic[ 0x40 ], u8 &bank,
+void CVICRasterReplay::applyEvent( u8 vic[ 0x40 ], u8 &bank, u8 spritePtr[ 8 ],
+	                                bool &spritePtrValid,
 	                                const VICRegWrite &event )
 {
 	const u16 reg = vicLogRegister( event );
-	if ( reg < 0x40 ) vic[ reg ] = event.value;
-	else if ( reg == 0x40 ) bank = event.value & 3;
+	if ( reg < 0x40 )
+	{
+		// Moving the screen matrix moves the pointer bytes with it, so what we
+		// have been tracking no longer describes the address the VIC will read.
+		// Give up rather than guess: the snapshot is then used, which is the
+		// behaviour that existed before pointers were timestamped at all.
+		if ( reg == 0x18 && ( ( vic[ 0x18 ] ^ event.value ) & 0xF0 ) )
+			spritePtrValid = false;
+		vic[ reg ] = event.value;
+	}
+	else if ( reg == 0x40 )
+	{
+		if ( ( bank ^ ( event.value & 3 ) ) != 0 ) spritePtrValid = false;
+		bank = event.value & 3;
+	}
+	else if ( reg >= VIC_LOG_REG_SPRPTR && reg < VIC_LOG_REG_SPRPTR + 8 )
+		spritePtr[ reg - VIC_LOG_REG_SPRPTR ] = event.value;
 }
 
 static void rasterSelectPage( VICRasterReplayPlan &plan, u32 page )
@@ -344,7 +400,7 @@ VICRasterFrameResult CVICRasterReplay::build(
 	{
 		if ( generationChanged ) m_ResetResyncs++;
 		if ( lost ) m_LostEventResyncs++;
-		rePrime( head, generation, liveVIC, liveBank );
+		rePrime( head, generation, liveVIC, liveBank, liveRAM );
 		makeStaticPlan( VIC_RASTER_SNAPSHOT, timing, liveVIC, liveBank,
 		                liveRAM, false, plan );
 		return plan.result;
@@ -355,7 +411,7 @@ VICRasterFrameResult CVICRasterReplay::build(
 		log, head, now, anchor, timing, frame );
 	if ( result == VIC_RASTER_SNAPSHOT )
 	{
-		rePrime( head, generation, liveVIC, liveBank );
+		rePrime( head, generation, liveVIC, liveBank, liveRAM );
 		makeStaticPlan( result, timing, liveVIC, liveBank,
 		                liveRAM, false, plan );
 		return plan.result;
@@ -369,8 +425,12 @@ VICRasterFrameResult CVICRasterReplay::build(
 	u8 startVIC[ 0x40 ];
 	memcpy( startVIC, m_VIC, sizeof startVIC );
 	u8 startBank = m_Bank;
+	u8 startPtr[ 8 ];
+	memcpy( startPtr, m_SpritePtr, sizeof startPtr );
+	bool startPtrValid = m_SpritePtrValid;
 	for ( u32 i = oldTail; i != frame.drawStart; i++ )
-		applyEvent( startVIC, startBank, rasterEvent( log, i ) );
+		applyEvent( startVIC, startBank, startPtr, startPtrValid,
+		            rasterEvent( log, i ) );
 	plan.yScrollVaries = CVICRasterTimeline::yScrollVariesInDisplay(
 		log, frame, anchor, timing, startVIC[ 0x11 ] );
 
@@ -380,15 +440,29 @@ VICRasterFrameResult CVICRasterReplay::build(
 	{
 		const VICRasterBand &source = frame.bands[ b ];
 		for ( u32 i = source.applyBegin; i != source.applyEnd; i++ )
-			applyEvent( m_VIC, m_Bank, rasterEvent( log, i ) );
+			applyEvent( m_VIC, m_Bank, m_SpritePtr, m_SpritePtrValid,
+			            rasterEvent( log, i ) );
 		VICRasterReplayBand &band = plan.bands[ b ];
 		band.firstRow = source.firstRow;
 		band.rowCount = source.rowCount;
 		memcpy( band.vic, m_VIC, sizeof band.vic );
 		band.bank = m_Bank;
+		memcpy( band.spritePtr, m_SpritePtr, sizeof band.spritePtr );
+		band.spritePtrValid = m_SpritePtrValid;
 	}
 	for ( u32 i = frame.finishBegin; i != frame.finishEnd; i++ )
-		applyEvent( m_VIC, m_Bank, rasterEvent( log, i ) );
+		applyEvent( m_VIC, m_Bank, m_SpritePtr, m_SpritePtrValid,
+		            rasterEvent( log, i ) );
+
+	// The matrix may have moved during the frame. Re-seeding at the end means
+	// the NEXT frame starts from truth instead of inheriting the doubt.
+	if ( !m_SpritePtrValid && liveRAM )
+	{
+		const u32 base = spritePtrAddr( m_VIC, m_Bank );
+		for ( u32 n = 0; n < 8; n++ )
+			m_SpritePtr[ n ] = liveRAM[ (u16)( base + n ) ];
+		m_SpritePtrValid = true;
+	}
 
 	if ( !collectPages( plan, liveRAM ) )
 	{

@@ -253,6 +253,44 @@ public:
 		return read8( a );
 	}
 
+	// A write landed on the active screen's sprite pointers.
+	//
+	// There are TWO write paths -- writeFast here and CC64Memory::write8 out of
+	// line -- and both reach this. They are not allowed to diverge, so this is
+	// the one copy: they HAD diverged, with the out-of-line path missing the
+	// log append entirely, which is invisible until something multiplexes
+	// sprites and then shows up as every sprite wearing its last shape.
+	//
+	// The pointers bypass the mirror queue and land on the real bus NOW, like a
+	// VIC register. Double-buffered sprite animation flips a pointer in vblank
+	// and immediately starts redrawing the block the flip retired; a flip that
+	// arrives even a fraction of a frame late leaves the physical VIC showing
+	// the very block the game is busy overwriting -- seen as sprites flickering
+	// between correct and garbage at animation rate. The queued copy still
+	// flushes later; coalescing holds the latest value, so re-sending is
+	// harmless. Same-value rewrites are a no-op on hardware and are skipped.
+	inline void noteSpritePointerWrite( u16 a, u8 old, u8 v )
+	{
+		m_PtrRowWrites++;
+		if ( old != v )
+		{
+			// The VALUE delivered may differ from the value stored: a bank-3
+			// pointer selecting a shape block under the I/O window is remapped
+			// to the block's relocated copy, the only place the real VIC can
+			// actually be fed from. See relocPointerValue().
+			if ( m_C64 ) m_C64->write( a, relocPointerValue( v ) );
+			updateHotShapeBlocks();
+		}
+		// Timestamp it. Sprite pointers are RAM, so otherwise they are carried
+		// only by the once-per-frame snapshot, which applies ONE value to the
+		// whole frame and silently breaks every sprite multiplexer. Logged even
+		// when unchanged: the cost is a handful of ring entries per frame, and
+		// the alternative is a value the replay never learns. Contrast colour
+		// RAM, deliberately NOT timestamped, where one 1000-cell fill would
+		// consume half the ring.
+		appendVICLog( (u16)( VIC_LOG_REG_SPRPTR + ( a & 7 ) ), v );
+	}
+
 	__attribute__((always_inline)) inline void writeFast( u16 a, u8 v )
 	{
 		if ( dosExtensionMapsBank1( a ) )
@@ -284,19 +322,7 @@ public:
 			// harmless. Same-value rewrites are a no-op on real hardware and
 			// are skipped.
 			if ( ( (u32)a & ~7u ) == m_SpritePtrBase )
-			{
-				m_PtrRowWrites++;
-				if ( old != v )
-				{
-					// The VALUE delivered may differ from the value stored:
-					// a bank-3 pointer selecting a shape block under the I/O
-					// window is remapped to the block's relocated copy, the
-					// only place the real VIC can actually be fed from. See
-					// relocPointerValue().
-					if ( m_C64 ) m_C64->write( a, relocPointerValue( v ) );
-					updateHotShapeBlocks();
-				}
-			}
+				noteSpritePointerWrite( a, old, v );
 			return;
 		}
 		write8( a, v );

@@ -359,6 +359,7 @@ void CHDMIDisplay::renderFrame( u64 frameStart, u64 frameTicks )
 		state.charsetBase = charROM ? 0xFFFFFFFF
 		                            : state.bankBase + charset;
 		state.yScrollVaries = m_RasterPlan.yScrollVaries;
+		state.spritePointers = band.spritePtrValid ? band.spritePtr : 0;
 		memcpy( state.vic, band.vic, sizeof state.vic );
 
 		const u32 end = (u32)band.firstRow + band.rowCount;

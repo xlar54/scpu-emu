@@ -981,14 +981,11 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 			noteMirrorWrite();
 		m_RAM[ a ] = value;
 
-		// Active-screen sprite pointers go to the real bus immediately; see
-		// the note in writeFast, which is the path that usually takes them.
-		// Delivered through the same under-I/O relocation as writeFast.
-		if ( old != value && ( (u32)a & ~7u ) == m_SpritePtrBase )
-		{
-			if ( m_C64 ) m_C64->write( a, relocPointerValue( value ) );
-			updateHotShapeBlocks();
-		}
+		// Active-screen sprite pointers: same handling as writeFast, because it
+		// is literally the same function. This path used to carry its own copy
+		// of the logic and had already fallen behind.
+		if ( ( (u32)a & ~7u ) == m_SpritePtrBase )
+			noteSpritePointerWrite( a, old, value );
 	}
 }
 

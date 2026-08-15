@@ -309,6 +309,7 @@ int main( int argc, char **argv )
 		                  && charset >= 0x1000 && charset < 0x2000;
 		state.charsetBase = charROM ? 0xFFFFFFFF : state.bankBase + charset;
 		state.yScrollVaries = plan.yScrollVaries;
+		state.spritePointers = band.spritePtrValid ? band.spritePtr : 0;
 		memcpy( state.vic, band.vic, sizeof state.vic );
 
 		if ( band.firstRow + band.rowCount > VIC_RENDER_HEIGHT ) continue;

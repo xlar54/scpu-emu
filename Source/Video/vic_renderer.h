@@ -70,6 +70,12 @@ struct VICRenderState
 	// the render snapshot makes graphics and sprite decoding self-contained and
 	// avoids dozens of independently-racing scalar reads on core 1.
 	u8 vic[ 0x40 ];
+	// Sprite pointers for THIS band, or null to read them from the screen
+	// matrix as before. The VIC re-fetches a pointer every raster line a sprite
+	// is displaying, so a multiplexer changes them several times per frame --
+	// and the once-per-frame RAM snapshot can only carry one value each. When
+	// the raster planner has tracked them, this is where they arrive.
+	const u8 *spritePointers;
 };
 
 class CVICRenderer
