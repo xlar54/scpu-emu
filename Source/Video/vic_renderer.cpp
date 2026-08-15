@@ -288,14 +288,22 @@ static void renderSpritesOnRow( const VICRenderState &state,
 	                            u32 y, u32 activeLeft, u32 activeRight,
 	                            u32 activeTop, u32 activeBottom,
 	                            const u8 opaqueCells[ 40 ],
-	                            VICRenderCollisions *collisions )
+	                            VICRenderCollisions *collisions,
+	                            bool drawRow )
 {
 	const u8 enabled = state.vic[ 0x15 ];
-	if ( !enabled || !state.ram || state.screenBase >= 0x10000
-	     || y < activeTop || y >= activeBottom )
-		return;
+	if ( !enabled || !state.ram || state.screenBase >= 0x10000 ) return;
+	// Deliberately NOT gated on the display window. Collision detection lives
+	// in the sprite sequencer and is independent of the border unit, so
+	// sprites collide wherever their data is non-transparent -- including rows
+	// and columns the border covers. Only drawing is clipped, below.
 
-	u8 spriteCoverage[ VIC_RENDER_WIDTH ];
+	// Sprite X is nine bits, so a sprite can sit entirely outside the frame and
+	// still collide with another one there. Coverage therefore spans the whole
+	// reachable sprite range rather than the visible width: 511 + 8 for the
+	// display origin + 48 for an expanded sprite.
+	static const u32 SpriteCoverageWidth = 568;
+	u8 spriteCoverage[ SpriteCoverageWidth ];
 	if ( collisions ) memset( spriteCoverage, 0, sizeof spriteCoverage );
 
 	// Sprite zero has the highest sprite-to-sprite priority, so composite from
@@ -327,7 +335,7 @@ static void renderSpritesOnRow( const VICRenderState &state,
 		for ( u32 outputPixel = 0; outputPixel < outputWidth; outputPixel++ )
 		{
 			const int xSigned = left + (int)outputPixel;
-			if ( xSigned < (int)activeLeft || xSigned >= (int)activeRight ) continue;
+			if ( xSigned < 0 ) continue;
 			const u32 x = (u32)xSigned;
 			const u32 sourcePixel = expandX ? outputPixel >> 1 : outputPixel;
 			u8 value;
@@ -347,7 +355,7 @@ static void renderSpritesOnRow( const VICRenderState &state,
 				colour = vicColour( state, 0x27 + (u32)n );
 			}
 
-			if ( collisions )
+			if ( collisions && x < SpriteCoverageWidth )
 			{
 				const u8 previous = spriteCoverage[ x ];
 				if ( previous )
@@ -366,6 +374,10 @@ static void renderSpritesOnRow( const VICRenderState &state,
 						collisions->spriteBackground |= mask;
 				}
 			}
+
+			// Everything above is detection and happens anywhere the sprite
+			// reaches. From here down is drawing, which the border does clip.
+			if ( !drawRow || x < activeLeft || x >= activeRight ) continue;
 
 			if ( behind && context.mode != VIC_RENDER_UNSUPPORTED
 			     && context.mode != VIC_RENDER_INVALID )
@@ -439,9 +451,19 @@ VICRenderMode CVICRenderer::renderRows( const VICRenderState &state,
 			rowState = &spriteState;
 		}
 		u8 *dst = pixels + ( y - firstRow ) * pitch;
+		u8 opaqueCells[ 40 ];
+		memset( opaqueCells, 0, sizeof opaqueCells );
+
 		if ( !displayEnabled || y < activeTop || y >= activeBottom )
 		{
+			// A border row still runs the sprite sequencer, because collisions
+			// occur there on real hardware. It draws nothing: opaqueCells stays
+			// clear, so no sprite/background bit can be raised where there is
+			// no foreground to collide with.
 			memset( dst, border, VIC_RENDER_WIDTH );
+			renderSpritesOnRow( *rowState, context, dst, y,
+			                    activeLeft, activeRight, activeTop,
+			                    activeBottom, opaqueCells, collisions, false );
 			if ( sprites ) finishSpriteRow( *sprites );
 			continue;
 		}
@@ -449,9 +471,6 @@ VICRenderMode CVICRenderer::renderRows( const VICRenderState &state,
 		memset( dst, border, activeLeft );
 		memset( dst + activeRight, border, VIC_RENDER_WIDTH - activeRight );
 		memset( dst + activeLeft, graphicsFill, activeRight - activeLeft );
-
-		u8 opaqueCells[ 40 ];
-		memset( opaqueCells, 0, sizeof opaqueCells );
 		const int originX = VIC_RENDER_DISPLAY_X + ( state.vic[ 0x16 ] & 7 );
 		const int originY = VIC_RENDER_DISPLAY_Y
 		                  + ( state.yScrollVaries
@@ -480,7 +499,8 @@ VICRenderMode CVICRenderer::renderRows( const VICRenderState &state,
 			}
 		}
 		renderSpritesOnRow( *rowState, context, dst, y, activeLeft, activeRight,
-		                    activeTop, activeBottom, opaqueCells, collisions );
+		                    activeTop, activeBottom, opaqueCells, collisions,
+		                    true );
 		if ( sprites ) finishSpriteRow( *sprites );
 	}
 
