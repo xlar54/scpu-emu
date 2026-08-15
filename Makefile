@@ -77,15 +77,17 @@ $(BUILDDIR)/%.o: %.cpp
 	$(CXX) $(CXXFLAGS) -MMD -MP -c -o $@ $<
 
 # --- VICE conformance tools -------------------------------------------------
-# Two host programs that drive the SHIPPING renderer and band planner against a
-# reference emulator. Built from the same objects as the test suite, so a fix
-# cannot pass here and behave differently on the card.
+# Host programs that drive the SHIPPING renderer, band planner and memory map
+# against a reference emulator. Built from the same objects as the test suite,
+# so a fix cannot pass here and behave differently on the card.
 #
 #   render_state  one machine state -> one frame        (geometry, modes, sprites)
 #   replay_state  a running program -> a replayed frame (write log, anchors, bands)
+#   sid_trace     a running program -> its bus traffic  (every SID write delivered)
 #
 # Tools/viceconf/capture.sh drives xscpu64 and diffs the result.
-VICECONF_BIN = $(BUILDDIR)/render_state $(BUILDDIR)/replay_state
+VICECONF_BIN = $(BUILDDIR)/render_state $(BUILDDIR)/replay_state \
+               $(BUILDDIR)/sid_trace
 
 .PHONY: viceconf
 viceconf: $(VICECONF_BIN)
@@ -98,9 +100,14 @@ $(BUILDDIR)/replay_state: $(BUILDDIR)/Tools/viceconf/replay_state.o $(HOST_OBJS)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -o $@ $^
 
+$(BUILDDIR)/sid_trace: $(BUILDDIR)/Tools/viceconf/sid_trace.o $(HOST_OBJS)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -o $@ $^
+
 -include $(HOST_OBJS:.o=.d) $(TEST_OBJS:.o=.d) \
          $(BUILDDIR)/Tools/viceconf/render_state.d \
-         $(BUILDDIR)/Tools/viceconf/replay_state.d
+         $(BUILDDIR)/Tools/viceconf/replay_state.d \
+         $(BUILDDIR)/Tools/viceconf/sid_trace.d
 
 # Builds the Raspberry Pi kernel image. Fetches the AArch64 toolchain and
 # Circle 44.3 into _toolchain/ on first run, applies RAD's Circle settings, then
