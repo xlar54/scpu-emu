@@ -92,9 +92,31 @@ int main( int argc, char **argv )
 	}
 
 	static u8 pixels[ VIC_RENDER_WIDTH * VIC_RENDER_HEIGHT ];
+	VICRenderCollisions collisions;
 	CVICRenderer renderer;
 	const VICRenderMode mode =
-		renderer.render( state, pixels, VIC_RENDER_WIDTH );
+		renderer.render( state, pixels, VIC_RENDER_WIDTH, &collisions );
+
+	// A collision test reads $D01E/$D01F itself -- they clear on read, so the
+	// monitor cannot sample them without destroying what they hold -- and
+	// stores them at $C000/$C001. Compare against what we derived from the
+	// same frame.
+	int collisionFailed = 0;
+	if ( argc > 5 && strcmp( argv[ 5 ], "--collisions" ) == 0 )
+	{
+		const u8 wantSS = ram[ 0xC000 ];
+		const u8 wantSB = ram[ 0xC001 ];
+		collisionFailed = ( collisions.spriteSprite != wantSS )
+		               || ( collisions.spriteBackground != wantSB );
+		fprintf( stderr,
+		         "collisions        reference   ours\n"
+		         "  $D01E sprite/sprite      $%02X      $%02X  %s\n"
+		         "  $D01F sprite/background  $%02X      $%02X  %s\n",
+		         wantSS, collisions.spriteSprite,
+		         collisions.spriteSprite == wantSS ? "ok" : "MISMATCH",
+		         wantSB, collisions.spriteBackground,
+		         collisions.spriteBackground == wantSB ? "ok" : "MISMATCH" );
+	}
 
 	FILE *out = fopen( argv[ 4 ], "wb" );
 	if ( !out ) { fprintf( stderr, "cannot write %s\n", argv[ 4 ] ); return 1; }
@@ -109,5 +131,5 @@ int main( int argc, char **argv )
 	         state.bitmapBase == 0xFFFFFFFF ? "-" : "yes",
 	         io[ 0x11 ], io[ 0x16 ], d018,
 	         io[ 0x20 ] & 15, io[ 0x21 ] & 15 );
-	return 0;
+	return collisionFailed;
 }

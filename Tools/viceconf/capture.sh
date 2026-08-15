@@ -60,6 +60,13 @@ RENDER="$OUT/render_state"
 [ -x "$RENDER" ] || g++ -O2 -std=c++14 -DSCPU_HOST_BUILD -o "$RENDER" \
 	"$ROOT/Tools/viceconf/render_state.cpp" "$ROOT/Source/Video/vic_renderer.cpp"
 
-"$RENDER" "$OUT/$NAME.ram" "$OUT/$NAME.io" "$CHARGEN" "$OUT/$NAME.raw"
-exec python3 "$ROOT/Tools/viceconf/compare.py" \
-	"$OUT/$NAME.raw" "$OUT/$NAME.png" "$OUT/$NAME.diff.png"
+# A program that stores a collision signature at $C000/$C001 gets those checked
+# too. $D01E and $D01F clear on read, so the guest must sample them itself.
+COLLIDE=""
+if [ "${COLLISIONS:-}" = "1" ]; then COLLIDE="--collisions"; fi
+
+RC=0
+"$RENDER" "$OUT/$NAME.ram" "$OUT/$NAME.io" "$CHARGEN" "$OUT/$NAME.raw" $COLLIDE || RC=1
+python3 "$ROOT/Tools/viceconf/compare.py" \
+	"$OUT/$NAME.raw" "$OUT/$NAME.png" "$OUT/$NAME.diff.png" || RC=1
+exit $RC
