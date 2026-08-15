@@ -416,9 +416,14 @@ VICRenderMode CVICRenderer::renderRows( const VICRenderState &state,
 	const bool displayEnabled = context.mode != VIC_RENDER_BLANK;
 	const bool columns40 = ( state.vic[ 0x16 ] & 0x08 ) != 0;
 	const bool rows25 = ( state.vic[ 0x11 ] & 0x08 ) != 0;
-	const u32 activeLeft = VIC_RENDER_DISPLAY_X + ( columns40 ? 0 : 8 );
+	// CSEL narrows the display window ASYMMETRICALLY: the VIC's first visible
+	// X moves 24 -> 31 and its last moves 343 -> 334, so the aperture loses
+	// seven pixels on the left and nine on the right, not eight and eight.
+	// Measured against VICE, which put the 38-column edges one pixel left of
+	// where a symmetric trim placed them.
+	const u32 activeLeft = VIC_RENDER_DISPLAY_X + ( columns40 ? 0 : 7 );
 	const u32 activeRight = VIC_RENDER_DISPLAY_X + VIC_RENDER_DISPLAY_W
-	                      - ( columns40 ? 0 : 8 );
+	                      - ( columns40 ? 0 : 9 );
 	const u32 activeTop = VIC_RENDER_DISPLAY_Y + ( rows25 ? 0 : 4 );
 	const u32 activeBottom = VIC_RENDER_DISPLAY_Y + VIC_RENDER_DISPLAY_H
 	                       - ( rows25 ? 0 : 4 );

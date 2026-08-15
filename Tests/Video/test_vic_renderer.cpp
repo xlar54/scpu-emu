@@ -200,8 +200,17 @@ TEST( vic_renderer_applies_fine_scroll_and_reduced_border_apertures )
 	f.state.vic[ 0x16 ] = 0x00;
 	f.state.vic[ 0x11 ] = 0x13;
 	f.renderer.render( f.state, f.pixels, VIC_RENDER_WIDTH );
-	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 7, VIC_RENDER_DISPLAY_Y + 4 ), 14 );
-	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 8, VIC_RENDER_DISPLAY_Y + 4 ), 6 );
+	// CSEL=0 trims seven pixels from the left and nine from the right, not
+	// eight from each. Pin both edges: a symmetric trim moves them one pixel
+	// and matched VICE nowhere.
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 6, VIC_RENDER_DISPLAY_Y + 4 ), 14 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 7, VIC_RENDER_DISPLAY_Y + 4 ), 6 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + VIC_RENDER_DISPLAY_W - 10,
+	                   VIC_RENDER_DISPLAY_Y + 4 ), 6 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + VIC_RENDER_DISPLAY_W - 9,
+	                   VIC_RENDER_DISPLAY_Y + 4 ), 14 );
+	// RSEL=0 remains symmetric: four lines from the top and four from the
+	// bottom, so the row above the aperture is still border.
 	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 8, VIC_RENDER_DISPLAY_Y + 3 ), 14 );
 }
 
