@@ -51,6 +51,7 @@ tests will report that no accelerator was detected.
 | `15-scpu128probe` | ML/C128 | read-only SCPU128, 8722 MMU, ROM-window and 24-bit bank fingerprints | creates `SCPU128 LOG` as a sequential file on device 8 |
 | `16-nmitiming` | ML | CIA2 Timer-A one-shot timing, native-window delivery and 1024-edge stress | repeatable sweep signatures, zero misses, and native/deferred totals adding to `$40` |
 | `17-supermon816` | ML | native-mode 65816 machine-language monitor adapted for the C64/SuperCPU | `Supermon 816 1.1.10` prompt; visible input cursor; `X` returns to BASIC |
+| `18-ramspeed` | ML | identical two-million-pair loops in private SRAM and SuperRAM | memory check passes; raw jiffy counts provide an old/new firmware comparison |
 
 `01-speed` reports raw jiffies, the Normal/Turbo ratio, and an effective MHz
 estimate obtained by treating the forced-Normal run as the 1.0 MHz reference.
@@ -158,6 +159,15 @@ width directives and canonical forms such as `PEA #$1234`, `PEI $12`, and
 For example, `M 00A000 00A003` dumps exactly four bytes and
 `D 00C000 00C00F` disassembles the requested 24-bit address range.
 Enter `X` to restore the C64 memory map and return to BASIC.
+
+`18-ramspeed` forces the software Turbo request and performs the same 2,097,152
+absolute-long read/write pairs first in private SRAM bank `$01`, then in
+SuperRAM bank `$02`. It remains in 6502 emulation mode so the ordinary KERNAL
+IRQ maintains the jiffy clock. Both destination pages are verified afterward.
+Run it on the old and new firmware with the same physical switch position and
+video standard; compare the hexadecimal `BANK $02 SUPERRAM` jiffy counts.
+Lower is faster. The bank `$01` figure is the control and should remain close
+between firmware builds.
 
 The assembler's `.AS`/`.AL` directives control how immediate operands are
 encoded; they do not alter the CPU's saved M flag. Code entered with `.AS`

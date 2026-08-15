@@ -60,6 +60,8 @@ call :asm "16-nmitiming.asm" "16-NMITIMING"
 if errorlevel 1 exit /b 1
 call :asm "supermon816.asm" "17-SUPERMON816"
 if errorlevel 1 exit /b 1
+call :asm "18-ramspeed.asm" "18-RAMSPEED"
+if errorlevel 1 exit /b 1
 
 if exist "%DISK%" del /q "%DISK%"
 if exist "%DISKS%\SCPU-TESTS.d64" del /q "%DISKS%\SCPU-TESTS.d64"
@@ -80,7 +82,8 @@ if exist "%DISKS%\SCPU-TESTS.d64" del /q "%DISKS%\SCPU-TESTS.d64"
     -write "%PRG%\14-SPRITEBALLS.prg" "14-spriteballs" ^
     -write "%PRG%\15-SCPU128PROBE.prg" "15-scpu128probe" ^
     -write "%PRG%\16-NMITIMING.prg" "16-nmitiming" ^
-    -write "%PRG%\17-SUPERMON816.prg" "17-supermon816"
+    -write "%PRG%\17-SUPERMON816.prg" "17-supermon816" ^
+    -write "%PRG%\18-RAMSPEED.prg" "18-ramspeed"
 if errorlevel 1 exit /b 1
 
 echo.
