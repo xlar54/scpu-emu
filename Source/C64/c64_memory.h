@@ -1036,11 +1036,58 @@ public:
 	inline void noteRasterPrecise( u16 line )
 	{
 		const u32 now = (u32)c64Now();
+		const u16 exact = (u16)( line & 0x1FF );
+
+		// Tag the writes this handler ALREADY made with the exact line.
+		//
+		// They are on the compare line by construction -- the handler only runs
+		// because the beam reached it -- but they were logged before this anchor
+		// existed, so appendVICLog's forward-looking window could not tag them
+		// and they fall back to cycle arithmetic. That arithmetic reads the
+		// anchor cycle as the START of the line, when it is really some way in:
+		// interrupt latency plus however much of the handler ran before the
+		// compare write. Every earlier write therefore computes one line low and
+		// its raster split lands a row early.
+		//
+		// Not theoretical. Against VICE, 24-vicraster put all four of its splits
+		// a row out -- 64 border pixels wrong per split, the rest of the frame
+		// perfect. Estimating the phase instead of measuring it is not enough
+		// either: one global anchor places every event in the frame, so one
+		// handler's phase gets applied to another's writes and a split straddles
+		// the boundary. A tag is exact and belongs to the event itself.
+		//
+		// Bounded to one raster line and a few events: a program that writes VIC
+		// registers continuously has no "first write of the handler", and must
+		// not have unrelated history relabelled.
+		const u32 perLine = m_C64 ? c64CyclesPerLine( m_C64->signals().video )
+		                          : 63;
+		const u32 head = m_VICLogHead;
+		u32 lineStart = now;
+		for ( u32 back = 1; back <= 8 && back <= head; back++ )
+		{
+			VICRegWrite &e =
+				m_VICLog[ ( head - back ) & ( SCPU_VIC_LOG_SIZE - 1 ) ];
+			// Unsigned, so a stale or future stamp wraps huge and stops us.
+			if ( (u32)( now - e.cycle ) >= perLine ) break;
+			lineStart = e.cycle;
+			if ( vicLogHasRasterLine( e ) ) continue;	// already exact
+			// lineLow first, then the valid bit with a release: a consumer that
+			// sees VIC_LOG_LINE_VALID is guaranteed to see the line that goes
+			// with it. One that samples mid-update sees no tag and falls back to
+			// arithmetic, which is merely the old behaviour for one frame.
+			e.lineLow = (u8)exact;
+			const u16 tagged = (u16)( ( e.reg & VIC_LOG_REG_MASK )
+			                        | VIC_LOG_LINE_VALID
+			                        | ( ( exact & 0x100 ) ? VIC_LOG_LINE_HIGH
+			                                              : 0 ) );
+			__atomic_store_n( &e.reg, tagged, __ATOMIC_RELEASE );
+		}
+
 		m_LastPreciseAnchor = now;
-		m_LastPreciseLine = (u16)( line & 0x1FF );
+		m_LastPreciseLine = exact;
 		__atomic_store_n( &m_RasterAnchor,
-		                  ( 1ULL << 63 ) | ( (u64)now << 16 )
-		                                | (u64)( line & 0x1FF ),
+		                  ( 1ULL << 63 ) | ( (u64)lineStart << 16 )
+		                                | (u64)exact,
 		                  __ATOMIC_RELAXED );
 	}
 	inline void noteRasterCoarse( u16 line )
