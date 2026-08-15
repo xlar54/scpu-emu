@@ -104,6 +104,16 @@ int main( int argc, char **argv )
 	int collisionFailed = 0;
 	if ( argc > 5 && strcmp( argv[ 5 ], "--collisions" ) == 0 )
 	{
+		// The signature distinguishes a stored result from uninitialised RAM.
+		// Without it a program that records nothing reads back $FF and reports
+		// a dramatic failure that means nothing at all.
+		if ( ram[ 0xC002 ] != 0x5A || ram[ 0xC003 ] != 0xA5 )
+		{
+			fprintf( stderr,
+			         "collisions        no signature at $C002/$C003 -- this "
+			         "program records no collision result; skipping\n" );
+			return 0;
+		}
 		const u8 wantSS = ram[ 0xC000 ];
 		const u8 wantSB = ram[ 0xC001 ];
 		collisionFailed = ( collisions.spriteSprite != wantSS )

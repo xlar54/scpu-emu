@@ -145,6 +145,13 @@ ptrs            lda #13
                 sta $c000
                 lda $d01f
                 sta $c001
+                ; Signature, so the harness can tell a real result from
+                ; uninitialised RAM. Without it a program that stores nothing
+                ; reads back $FF and looks like a spectacular failure.
+                lda #$5a
+                sta $c002
+                lda #$a5
+                sta $c003
 
 halt            jmp halt
 
