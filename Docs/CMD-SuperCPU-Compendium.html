@@ -369,6 +369,65 @@ cartridge fitted:</p>
 <tr><td>everything else</td><td>RAM</td></tr>
 </table>
 
+
+<h3>The $D000-$DFFF window, and why a bus master cannot write it</h3>
+
+<p>The table above describes what the CPU sees. <strong>The VIC-II does not obey
+it.</strong> The video chip fetches DRAM at <code>$D000-$DFFF</code> unconditionally,
+whatever <code>$01</code> says, because its accesses do not run through the same
+decode. So that 4KB is chip registers to the processor and ordinary graphics memory
+to the VIC at the same instant, and software uses the difference deliberately.</p>
+
+<p>This matters far more than a 4KB curiosity suggests, because of where a bitmap
+lands. A VIC bank 3 bitmap based at <code>$C000</code> occupies 8000 bytes, so it runs
+to <code>$DF3F</code> &mdash; and <strong>half of it lies under the I/O window</strong>:</p>
+
+<table>
+<tr><th style="width:34%">Region</th><th style="width:22%">Size</th><th>Reachable by a DMA bus master?</th></tr>
+<tr><td><code>$C000-$CFFF</code></td><td>4096 bytes</td><td>yes &mdash; ordinary DRAM</td></tr>
+<tr><td><code>$D000-$DF3F</code></td><td>3904 bytes</td><td><strong>no</strong> &mdash; decodes as I/O</td></tr>
+</table>
+
+<p>At 320 bytes per character row that boundary falls 12.8 rows in, or <strong>pixel
+row 102 of 200</strong>. A cartridge-side accelerator that cannot write under the window
+therefore renders the top half of such a picture correctly and leaves the bottom half
+showing whatever the DRAM already held.</p>
+
+<h3>Worked example, measured live</h3>
+
+<p>Accolade&rsquo;s <em>Test Drive</em> does exactly this. Read from the running game at
+its driving screen:</p>
+
+<table>
+<tr><th style="width:26%">Register</th><th style="width:16%">Value</th><th>Meaning</th></tr>
+<tr><td><code>$DD00</code></td><td><code>$C4</code></td><td>VIC bank 3, base <code>$C000</code></td></tr>
+<tr><td><code>$D011</code></td><td><code>$BB</code></td><td>bitmap mode, display enabled</td></tr>
+<tr><td><code>$D016</code></td><td><code>$D8</code></td><td>multicolour</td></tr>
+<tr><td><code>$D018</code></td><td><code>$81</code></td><td>bitmap <code>$C000</code>, screen matrix <code>$E000</code></td></tr>
+</table>
+
+<p>The graphics do not <em>load</em> there &mdash; the dashboard file loads at
+<code>$6800</code> and is copied into the bitmap afterwards. Reading load addresses off
+the disk is therefore actively misleading for this question; only the live
+<code>$D018</code>/<code>$DD00</code> pair answers it.</p>
+
+<div class="box note"><span class="lab">Why holding DMA does not help</span>
+<p>The obvious fix &mdash; bank I/O out by writing <code>$01</code> &mdash; is not
+available to a cartridge. The 6510&rsquo;s port pins are a separate 6-bit I/O port, not
+part of the address/data bus, so asserting <code>/DMA</code> tri-states the CPU&rsquo;s
+bus drivers while those pins keep driving the PLA with whatever <code>$01</code> last
+held. The expansion port carries <code>/GAME</code> and <code>/EXROM</code> but no
+LORAM or HIRAM. A bus master therefore cannot make the PLA decode that window as RAM by
+any means available on the connector alone.</p></div>
+
+<p class="small">How the real SuperCPU resolves this is under investigation at the time
+of writing. The leading candidate is that the card leaves the halted 6510&rsquo;s bank
+bits in an all-RAM state and asserts <code>/GAME</code> only for genuine I/O cycles,
+which would give it DRAM under the window without losing register access. That is not
+yet confirmed and should not be quoted as established. What IS established is the
+constraint above, and that any accelerator failing to solve it loses the bottom half of
+every bank-3 bitmap based at <code>$C000</code> &mdash; a class of titles, not one
+game.</p>
 <h2>6. The bank-1 ROM shadow</h2>
 
 <p>The accelerator keeps ROM images in its own fast SRAM — bank 1 — and serves
