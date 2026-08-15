@@ -551,6 +551,41 @@ all that is required.</p>
 <h3>Speed test</h3>
 <p>Bit 6 of <code>$D0B8</code> reads 1 in 1&nbsp;MHz mode and 0 in turbo.</p>
 
+<h3>What CMD&rsquo;s own firmware actually touches</h3>
+
+<p>The register set above is what the hardware <em>offers</em>. This is what CMD&rsquo;s
+SuperCPU DOS <em>uses</em>, counted over a complete boot &mdash; a different and, for an
+implementer, more actionable question. Identical profile on 2.04 and 1.4.</p>
+
+<table>
+<tr><th style="width:22%">Location</th><th style="width:14%">Reads</th><th style="width:14%">Writes</th><th>Role</th></tr>
+<tr><td><code>$D07E</code> / <code>$D07F</code></td><td>&mdash;</td><td>278 / 275</td><td>register bank enable / disable</td></tr>
+<tr><td><code>$D0BE</code> / <code>$D0BF</code></td><td>&mdash;</td><td>269 / 271</td><td>DOS extension on / off</td></tr>
+<tr><td><code>$D0B0</code></td><td>269</td><td>&mdash;</td><td>version / hardware detect</td></tr>
+<tr><td><code>$D0B2</code>&ndash;<code>$D0B7</code></td><td>4</td><td>10</td><td>status, optimisation, switches</td></tr>
+<tr><td><code>$D073</code>, <code>$D078</code>, <code>$D07B</code></td><td>&mdash;</td><td>1&ndash;2 each</td><td>speed and SIMM configuration, once</td></tr>
+<tr><td><code>$D2xx</code></td><td>7</td><td>118</td><td>DOS scratch RAM</td></tr>
+</table>
+
+<p>The individual counts matter less than the shape. <strong>The register bank is not
+opened once at startup and left open.</strong> It is opened and closed hundreds of times,
+in near-lockstep with the DOS-extension strobes &mdash; roughly 550 writes to
+<code>$D07E</code>/<code>$D07F</code> and 540 to <code>$D0BE</code>/<code>$D0BF</code>
+before the machine reaches its prompt. The firmware treats both as fine-grained gates
+around individual operations rather than as configuration.</p>
+
+<div class="box note"><span class="lab">Consequence for a reimplementation</span>
+<p>Any per-access cost on the bank-enable and DOS-extension paths is multiplied by
+several hundred during boot alone, and by far more in normal DOS use. Those two paths
+need to be cheap and exactly right before anything else in the register file is worth
+optimising. Sections&nbsp;41&ndash;42 assume this.</p></div>
+
+<p class="small">Recorded honestly: this is CMD&rsquo;s instruction stream, but observed
+through an emulator executing the ROM rather than off a logic analyser on real hardware.
+The sequence is the firmware&rsquo;s own; the paths it takes depend on what the machine
+underneath answers, so a divergent implementation could produce a divergent profile. It
+also covers the boot path only &mdash; error handlers, and routines reached only by
+particular software, are outside it.</p>
 <!-- ===================== PART IV ===================== -->
 <h1><span class="partnum">Part IV</span>Programming the 65816</h1>
 
@@ -1970,6 +2005,19 @@ that survived nine diagnostic builds on one board was identified in a single boo
 running the unchanged image on another. Board-to-board DRAM margin varies more than it
 is comfortable to assume, and "does this reproduce elsewhere" is the cheapest question
 available at every stage.</li>
+<li><strong>Internal consistency is not correctness.</strong> Two components you
+wrote agreeing with each other proves only that they share an assumption. A VIC-II
+renderer here had its display origin and its sprite offset wrong <em>together</em>, so
+every sprite still landed on the row every test asserted; 653,801 checks agreed with one
+another and all of them were a row out. It was invisible until the same code was driven
+against an outside reference. Prefer an oracle that has never seen your source.</li>
+<li><strong>A harness that reports a failure it cannot legitimately measure is worse
+than no harness.</strong> Three separate times a rig produced a confident, specific,
+entirely false result &mdash; a collision check comparing against uninitialised memory,
+a pixel diff run against a multi-state frame it could never match, and a block-move
+comparison against vectors captured mid-instruction, which reported 20,000 failures in a
+core that was correct. Each would have cost a day. Make an instrument refuse to answer
+questions outside its competence, and say so in its output.</li>
 </ol>
 
 

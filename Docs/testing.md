@@ -54,11 +54,50 @@ is an **explicit exemption** with its own targeted test asserting that it
 evidence behind each entry, is in
 [research/65816-reference.md](research/65816-reference.md) section 10.
 
+## Conformance against outside references
+
+The differential test above has a structural blind spot: it compares our 65816
+against our 6502, so it proves the two agree, not that either is right. It is
+also emulation-mode only by construction. Four tools exist to check the same
+code against authorities that have never seen this source. All are built by
+`make viceconf`, from the same objects as the test suite, so nothing can pass
+here and behave differently on the card.
+
+| tool | reference | what it establishes |
+|---|---|---|
+| `render_state` | VICE screenshot | one machine state renders identically — modes, geometry, sprites, collisions |
+| `replay_state` | VICE screenshot | a *running* program does: write log → anchors → band planner → renderer, end to end |
+| `sid_trace` | VICE state dump + our bus log | every SID write reaches the chip, once, in order, unmerged |
+| `ss816` | SingleStepTests vectors | the 65816 in **native** mode, against hardware-derived truth |
+| `scpu_trace` | CMD's own SuperCPU ROM | every register access CMD's firmware makes is answered by something we model |
+
+`Tools/viceconf/capture.sh` drives VICE headless and diffs the result;
+`REPLAY=1` selects the running-program path, `COLLISIONS=1` the collision check.
+`Tools/viceconf/fetch_ss816.sh` gets the CPU vectors, which are not committed.
+
+Two things these are deliberately strict about, both learned the expensive way.
+An instrument must refuse to answer questions outside its competence: a
+collision check with no stored result reports "no signature" rather than
+comparing against uninitialised memory, and a block-move vector captured
+mid-instruction is skipped loudly rather than reported as 10,000 CPU failures.
+And a clean result is only worth what its coverage is worth — `scpu_trace`
+covers the boot path, so it says nothing about routines only particular
+software reaches.
+
 ## What is not covered
 
 Everything under `Source/Bus/RAD/` and `Source/App/`. It needs a Pi and a C64,
 and its correctness is a question of nanosecond timing against a real VIC-II
 rather than of logic. `Tools/hardware_tests/` is where that work goes.
+
+Two limits are worth stating explicitly because they are contracts rather than
+gaps. Mid-frame rewrites of screen, charset or bitmap memory are outside the
+HDMI fidelity contract — source and colour RAM are one coherent snapshot per
+frame. Sprite pointers are the exception: they are timestamped, because every
+multiplexer rewrites them and the cost is a few ring entries per frame. And the
+whole physical-delivery half — bus timing, the read eye, contention with the
+HDMI blit — cannot be reached from host tests at all. `28-iecload` exists to
+put a number on that half, but it needs hardware to run.
 
 ## Adding a test
 
