@@ -69,9 +69,20 @@ public:
 	// After ROM snapshot and the ordinary bus self-test, run the physical 6510
 	// briefly under the Ultimax injector and leave $01=$34. With /GAME released
 	// this exposes all RAM; a timed /GAME assertion then selects real I/O for a
-	// single guest cycle. Initially supported only on C64-class hosts.
+	// single guest cycle. Initially supported only on C64-class hosts. Failure is
+	// a capability result, not an acquisition failure: boot may reacquire the
+	// conventional map and continue with the established suppression fallback.
+	enum RAMUnderIOFailure
+	{
+		RAMUNDERIO_OK = 0,
+		RAMUNDERIO_PRECONDITION = 1,
+		RAMUNDERIO_TAKEOVER = 2,
+		RAMUNDERIO_RAM_MAP = 4,
+		RAMUNDERIO_IO_MAP = 8
+	};
 	bool prepareRAMUnderIOAccess();
 	bool ramUnderIOReady() const { return m_RAMUnderIOReady; }
+	u8 ramUnderIOFailure() const { return m_RAMUnderIOFailure; }
 
 	// Flash the border a few times, as visible proof that we hold the bus and
 	// can drive it. Costs a fraction of a second and happens before the CPU
@@ -301,6 +312,7 @@ private:
 	C64Signals m_Signals;
 	bool       m_Acquired;
 	bool       m_RAMUnderIOReady;
+	u8         m_RAMUnderIOFailure;
 	bool       m_TrafficHalted;
 	u8         m_SelfTestFailure; // bit 0: single R/W, bit 1: burst, bit 2: first-transfer series
 	u16        m_ReadTimingConfigured, m_ReadTimingStart, m_ReadTimingEnd,

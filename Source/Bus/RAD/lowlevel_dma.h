@@ -241,11 +241,14 @@ void busReadByte_p2( register u32 &g2, bool selectIOWithGame = false )
 {
 	// A real SuperCPU leaves the halted 6510's CHAREN/HIRAM/LORAM pins in an
 	// all-RAM group, then selects Ultimax only for a genuine $D000-$DFFF I/O
-	// cycle. Assert /GAME after BA arbitration and address setup, while PHI2 is
-	// still in the VIC half, so the PLA sees a stable selector before the CPU
-	// half begins. Ordinary RAM and mirror traffic never takes this branch.
-	if ( selectIOWithGame ) CLR_GPIO( bGAME_OUT );
+	// cycle. Do not assert /GAME during the preceding VIC half: on a synchronous
+	// FPGA host that can remap the VIC's own $D000-$DFFF fetch and corrupt the
+	// lower half of a bank-3 bitmap even though the following CPU read works.
+	// Select I/O only after PHI2 enters the CPU half, matching RAD's original
+	// DMA_READBYTE_P2_IO ordering. Ordinary RAM and mirror traffic never takes
+	// this branch.
 	WAIT_FOR_CPU_HALFCYCLE
+	if ( selectIOWithGame ) CLR_GPIO( bGAME_OUT );
 	RESTART_CYCLE_COUNTER
 }
 
@@ -444,13 +447,19 @@ void busWriteByte_p1( register u32 &g2, u16 addr, u8 data,
 	CLR_GPIO( ( D_FLAG & ( ~DD ) ) );
 
 	HANDLE_BUS_AVAILABLE
-	// BA is now high and the target CPU half has not begun. Select Ultimax only
-	// for this genuine I/O cycle; leaving /GAME low while waiting for BA would
-	// unnecessarily alter the VIC's intervening fetches.
-	if ( selectIOWithGame ) CLR_GPIO( bGAME_OUT );
 	WAIT_UP_TO_CYCLE( busTiming.TIMING_ENABLE_RWOUT_ADDR_LATCH_WRITING - 40 );
 	OUT_GPIO( RW_OUT );
 	CLR_GPIO( bLATCH_A_OE | bDIR_Dx );
+	// Select Ultimax only for the target CPU write. In particular, do not pull
+	// /GAME low while BA arbitration is still occurring in a VIC half-cycle:
+	// FPGA cartridge decoders may register that level and apply it to the VIC's
+	// own fetch. Assert it at the CPU-half edge, not as late as data enable: the
+	// latter displayed the bitmap correctly on the 64U but then lost a live chip
+	// write and froze Test Drive. This gives the decoder the complete CPU half
+	// while still excluding every VIC half. p2 releases it after the falling
+	// edge where the chip accepts the write.
+	WAIT_FOR_CPU_HALFCYCLE
+	if ( selectIOWithGame ) CLR_GPIO( bGAME_OUT );
 	WAIT_UP_TO_CYCLE( busTiming.TIMING_ENABLE_DATA_WRITING );
 	CLR_GPIO( bOE_Dx );
 }

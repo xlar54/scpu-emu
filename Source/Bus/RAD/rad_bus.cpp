@@ -45,6 +45,7 @@ CRADBus::CRADBus()
 	: m_Reads( 0 ), m_Writes( 0 ), m_BurstWrites( 0 ),
 	  m_LastTransferCycles( 0 ), m_Transfers( 0 ), m_SerialTransfers( 0 ),
 	  m_ReadPrimes( 0 ), m_Acquired( false ), m_RAMUnderIOReady( false ),
+	  m_RAMUnderIOFailure( RAMUNDERIO_OK ),
 	  m_TrafficHalted( false ),
 	  m_SelfTestFailure( 0 ),
 	  m_ReadTimingConfigured( 0 ), m_ReadTimingStart( 0 ), m_ReadTimingEnd( 0 ),
@@ -2152,9 +2153,13 @@ u8 CRADBus::sidReadPOTFiltered( u16 addr )
 
 bool CRADBus::prepareRAMUnderIOAccess()
 {
+	m_RAMUnderIOFailure = RAMUNDERIO_OK;
 	if ( !m_Acquired || m_TrafficHalted
 	     || m_Signals.machine != MACHINE_C64 )
+	{
+		m_RAMUnderIOFailure = RAMUNDERIO_PRECONDITION;
 		return false;
+	}
 
 	// The acquisition path deliberately leaves the physical host in its normal
 	// $01=$37/$35 map until BASIC and KERNAL have been snapshotted and the bus
@@ -2171,6 +2176,8 @@ bool CRADBus::prepareRAMUnderIOAccess()
 		// normally on failure. Reflect that ownership change so a later release()
 		// cannot drive a bus we no longer own.
 		m_Acquired = false;
+		m_RAMUnderIOFailure = RAMUNDERIO_TAKEOVER;
+		RADLOG( "RAM-under-I/O capability: takeover failed" );
 		return false;
 	}
 
@@ -2200,6 +2207,10 @@ bool CRADBus::prepareRAMUnderIOAccess()
 
 	if ( !ramOK || !ioOK )
 	{
+		m_RAMUnderIOFailure = ( ramOK ? 0 : RAMUNDERIO_RAM_MAP )
+		                        | ( ioOK ? 0 : RAMUNDERIO_IO_MAP );
+		RADLOG( "RAM-under-I/O capability: RAM map=%s I/O select=%s",
+		        ramOK ? "pass" : "FAIL", ioOK ? "pass" : "FAIL" );
 		radSelectIOWithGame = false;
 		SET_GPIO( bGAME_OUT );
 		// Do not let the physical CPU execute even one instruction with $01=$34.
@@ -2211,6 +2222,7 @@ bool CRADBus::prepareRAMUnderIOAccess()
 	}
 
 	m_RAMUnderIOReady = true;
+	m_RAMUnderIOFailure = RAMUNDERIO_OK;
 	m_LastTransferCycles = hostCycles();
 	return true;
 }

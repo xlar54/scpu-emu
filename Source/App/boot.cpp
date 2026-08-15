@@ -2376,18 +2376,39 @@ void scpuBootRun( CLogger *logger )
 	// validated independently.
 	if ( radBus.signals().machine == MACHINE_C64 )
 	{
-		if ( !radBus.prepareRAMUnderIOAccess() )
+		const bool underIOReady = radBus.prepareRAMUnderIOAccess();
+		const u8 underIOFailure = radBus.ramUnderIOFailure();
+		if ( !underIOReady )
 		{
-			CScopedLoggingIRQs underIOFailIRQs;
-			scpuHDMIShowFailure();
-			logger->Write( "SCPU", LogError,
-			               "RAM-under-I/O preparation failed; the C64 was reset and released" );
-			logger->Write( "SCPU", LogNotice,
-			               "press the RAD button to reboot and retry." );
-			scpuWaitForButtonThenReboot();
+			// Some FPGA hosts accept the ordinary badline acquisition but not a
+			// second GAME/Ultimax reset takeover. That means the native under-I/O
+			// optimisation is unavailable, not that SuperCPU emulation is unsafe.
+			// The failed probe has reset and released the host; reacquire the exact
+			// K371 conventional map and retain the established D-window suppression
+			// plus sprite-relocation fallback.
+			if ( !radBus.acquired() && !radBus.acquire() )
+			{
+				CScopedLoggingIRQs underIOFatalIRQs;
+				scpuHDMIShowFailure();
+				logger->Write( "SCPU", LogError,
+				               "RAM-under-I/O probe failed and legacy reacquisition failed" );
+				logger->Write( "SCPU", LogNotice,
+				               "press the RAD button to reboot and retry." );
+				scpuWaitForButtonThenReboot();
+			}
+			superCPU.setRAMUnderIOAccessible( false );
+			superCPU.setUnderIORelocate( cfgMirrorD000Relocate != 0 );
+			{
+				CScopedLoggingIRQs underIOFallbackIRQs;
+				logger->Write( "SCPU", LogWarning,
+				               "physical RAM under I/O unavailable (failure=$%02X); "
+				               "continuing with compatibility fallback",
+				               (unsigned)underIOFailure );
+			}
 		}
-		superCPU.setRAMUnderIOAccessible( true );
+		else
 		{
+			superCPU.setRAMUnderIOAccessible( true );
 			CScopedLoggingIRQs underIOLogIRQs;
 			logger->Write( "SCPU", LogNotice,
 			               "physical RAM under I/O: enabled; /GAME selects chip accesses" );
