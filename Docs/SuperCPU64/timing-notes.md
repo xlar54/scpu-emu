@@ -162,3 +162,54 @@ Commodore 64U flawlessly. Its first SuperCPU animation was stable and it no
 longer required a second RAD reset. Separate C64U firmware/configuration is not
 part of the production path; older `kernel8-64u.img` and `config-64u.txt` files
 on development cards are historical artifacts only.
+
+## Open question: why `IO_STRETCH` defaults to 0 on RAD
+
+`IO_STRETCH 1` charges every access that reaches the real C64 bus a whole C64
+cycle, the way a real SuperCPU pays for one — it stalls until PHI2, performs the
+access at 1MHz, then runs on. `Config/default.cfg` explains why that matters:
+a raster poll loop
+
+```
+        LDA $D012 / CMP #x / BNE
+```
+
+takes exactly **one** C64 cycle per iteration on real hardware, because the
+processor's nine cycles vanish inside the stall. Charge only the opcode cycles
+and the same loop becomes nine emulated cycles, so I/O-bound code runs several
+times too fast and anything timing itself against a CIA lands in the wrong place
+in its own instruction stream.
+
+Given that, `IO_STRETCH 0` looks like the less accurate setting — yet it is the
+default here, and `Source/Common/config.h` records only "Default off on RAD"
+without saying why. **Nobody has written the reason down.** This section exists
+so that gap is visible rather than rediscovered.
+
+### The leading hypothesis, unverified
+
+On RAD a bus access is not free wall-clock time: it costs roughly a microsecond
+of *real* time, because the Pi genuinely drives the expansion port and waits.
+The emulator paces emulated cycles against real time, so that microsecond may
+already be absorbed by the pacer. If so, adding a modelled stretch on top would
+charge for the same stall twice and make I/O-bound code run too **slow**.
+
+That is an inference from how the pacing works, not something the code states.
+It fits the "on RAD" qualifier — a host build has no physical bus and no such
+natural cost, which would explain why the default is backend-specific.
+
+### How to settle it
+
+The poll loop above is its own instrument. Run a known iteration count on the
+card and time it:
+
+* ~1&nbsp;µs per iteration with `IO_STRETCH 0` confirms the hypothesis — the
+  physical access already costs what the model would have charged, and 0 is
+  correct on RAD.
+* Substantially faster than that means I/O-bound code really is running too
+  fast, and the default deserves revisiting.
+
+Until someone runs it, treat the default as load-bearing and unexplained.
+**Do not delete the penalty model to optimise it away.** `IO_STRETCH` is a
+runtime setting, tests all run with it off, and a deletion would make the
+emulator quietly wrong for anyone who switches it on. Skipping the computation
+when the setting is off is fine; removing the ability to compute it is not.
