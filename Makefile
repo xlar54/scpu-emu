@@ -85,10 +85,12 @@ $(BUILDDIR)/%.o: %.cpp
 #   replay_state  a running program -> a replayed frame (write log, anchors, bands)
 #   sid_trace     a running program -> its bus traffic  (every SID write delivered)
 #   ss816         SingleStepTests vectors -> our 65816   (external CPU truth)
+#   scpu_trace    CMD's own ROM -> our register layer   (coverage, not semantics)
 #
 # Tools/viceconf/capture.sh drives xscpu64 and diffs the result.
 VICECONF_BIN = $(BUILDDIR)/render_state $(BUILDDIR)/replay_state \
-               $(BUILDDIR)/sid_trace $(BUILDDIR)/ss816
+               $(BUILDDIR)/sid_trace $(BUILDDIR)/ss816 \
+               $(BUILDDIR)/scpu_trace
 
 .PHONY: viceconf
 viceconf: $(VICECONF_BIN)
@@ -109,11 +111,16 @@ $(BUILDDIR)/ss816: $(BUILDDIR)/Tools/viceconf/ss816.o $(HOST_OBJS)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -o $@ $^
 
+$(BUILDDIR)/scpu_trace: $(BUILDDIR)/Tools/viceconf/scpu_trace.o $(HOST_OBJS)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -o $@ $^
+
 -include $(HOST_OBJS:.o=.d) $(TEST_OBJS:.o=.d) \
          $(BUILDDIR)/Tools/viceconf/render_state.d \
          $(BUILDDIR)/Tools/viceconf/replay_state.d \
          $(BUILDDIR)/Tools/viceconf/sid_trace.d \
-         $(BUILDDIR)/Tools/viceconf/ss816.d
+         $(BUILDDIR)/Tools/viceconf/ss816.d \
+         $(BUILDDIR)/Tools/viceconf/scpu_trace.d
 
 # Builds the Raspberry Pi kernel image. Fetches the AArch64 toolchain and
 # Circle 44.3 into _toolchain/ on first run, applies RAD's Circle settings, then
