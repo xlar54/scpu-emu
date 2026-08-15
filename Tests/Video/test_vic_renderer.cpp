@@ -112,20 +112,20 @@ TEST( vic_renderer_multicolor_text_decodes_pairs_and_hires_cells )
 	f.chars[ 8 ] = 0x1B;
 	CHECK_EQ( f.renderer.render( f.state, f.pixels, VIC_RENDER_WIDTH ),
 	          VIC_RENDER_MULTICOLOR_TEXT );
-	CHECK_EQ( f.pixel( 32, 36 ), 6 );
-	CHECK_EQ( f.pixel( 33, 36 ), 6 );
-	CHECK_EQ( f.pixel( 34, 36 ), 2 );
-	CHECK_EQ( f.pixel( 35, 36 ), 2 );
-	CHECK_EQ( f.pixel( 36, 36 ), 5 );
-	CHECK_EQ( f.pixel( 37, 36 ), 5 );
-	CHECK_EQ( f.pixel( 38, 36 ), 3 );
-	CHECK_EQ( f.pixel( 39, 36 ), 3 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X, VIC_RENDER_DISPLAY_Y ), 6 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 1, VIC_RENDER_DISPLAY_Y ), 6 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 2, VIC_RENDER_DISPLAY_Y ), 2 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 3, VIC_RENDER_DISPLAY_Y ), 2 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 4, VIC_RENDER_DISPLAY_Y ), 5 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 5, VIC_RENDER_DISPLAY_Y ), 5 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 6, VIC_RENDER_DISPLAY_Y ), 3 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 7, VIC_RENDER_DISPLAY_Y ), 3 );
 
 	f.colours[ 0 ] = 3;
 	f.chars[ 8 ] = 0x80;
 	f.renderer.render( f.state, f.pixels, VIC_RENDER_WIDTH );
-	CHECK_EQ( f.pixel( 32, 36 ), 3 );
-	CHECK_EQ( f.pixel( 33, 36 ), 6 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X, VIC_RENDER_DISPLAY_Y ), 3 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 1, VIC_RENDER_DISPLAY_Y ), 6 );
 }
 
 TEST( vic_renderer_extended_colour_text_uses_code_high_bits_for_background )
@@ -138,8 +138,8 @@ TEST( vic_renderer_extended_colour_text_uses_code_high_bits_for_background )
 	f.chars[ 8 ] = 0x80;
 	CHECK_EQ( f.renderer.render( f.state, f.pixels, VIC_RENDER_WIDTH ),
 	          VIC_RENDER_EXTENDED_TEXT );
-	CHECK_EQ( f.pixel( 32, 36 ), 7 );
-	CHECK_EQ( f.pixel( 33, 36 ), 4 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X, VIC_RENDER_DISPLAY_Y ), 7 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 1, VIC_RENDER_DISPLAY_Y ), 4 );
 }
 
 TEST( vic_renderer_standard_bitmap_uses_screen_nibbles )
@@ -151,8 +151,8 @@ TEST( vic_renderer_standard_bitmap_uses_screen_nibbles )
 	f.ram[ 0x2000 ] = 0x80;
 	CHECK_EQ( f.renderer.render( f.state, f.pixels, VIC_RENDER_WIDTH ),
 	          VIC_RENDER_STANDARD_BITMAP );
-	CHECK_EQ( f.pixel( 32, 36 ), 10 );
-	CHECK_EQ( f.pixel( 33, 36 ), 5 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X, VIC_RENDER_DISPLAY_Y ), 10 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 1, VIC_RENDER_DISPLAY_Y ), 5 );
 }
 
 TEST( vic_renderer_multicolor_bitmap_decodes_all_four_sources )
@@ -166,14 +166,14 @@ TEST( vic_renderer_multicolor_bitmap_decodes_all_four_sources )
 	f.ram[ 0x2000 ] = 0x1B;
 	CHECK_EQ( f.renderer.render( f.state, f.pixels, VIC_RENDER_WIDTH ),
 	          VIC_RENDER_MULTICOLOR_BITMAP );
-	CHECK_EQ( f.pixel( 32, 36 ), 6 );
-	CHECK_EQ( f.pixel( 33, 36 ), 6 );
-	CHECK_EQ( f.pixel( 34, 36 ), 10 );
-	CHECK_EQ( f.pixel( 35, 36 ), 10 );
-	CHECK_EQ( f.pixel( 36, 36 ), 5 );
-	CHECK_EQ( f.pixel( 37, 36 ), 5 );
-	CHECK_EQ( f.pixel( 38, 36 ), 7 );
-	CHECK_EQ( f.pixel( 39, 36 ), 7 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X, VIC_RENDER_DISPLAY_Y ), 6 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 1, VIC_RENDER_DISPLAY_Y ), 6 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 2, VIC_RENDER_DISPLAY_Y ), 10 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 3, VIC_RENDER_DISPLAY_Y ), 10 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 4, VIC_RENDER_DISPLAY_Y ), 5 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 5, VIC_RENDER_DISPLAY_Y ), 5 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 6, VIC_RENDER_DISPLAY_Y ), 7 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 7, VIC_RENDER_DISPLAY_Y ), 7 );
 }
 
 TEST( vic_renderer_illegal_mode_drives_graphics_black )
@@ -194,15 +194,15 @@ TEST( vic_renderer_applies_fine_scroll_and_reduced_border_apertures )
 	f.chars[ 8 ] = 0x80;
 	f.state.vic[ 0x16 ] = 0x0B;
 	f.renderer.render( f.state, f.pixels, VIC_RENDER_WIDTH );
-	CHECK_EQ( f.pixel( 32, 36 ), 6 );
-	CHECK_EQ( f.pixel( 35, 36 ), 2 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X, VIC_RENDER_DISPLAY_Y ), 6 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 3, VIC_RENDER_DISPLAY_Y ), 2 );
 
 	f.state.vic[ 0x16 ] = 0x00;
 	f.state.vic[ 0x11 ] = 0x13;
 	f.renderer.render( f.state, f.pixels, VIC_RENDER_WIDTH );
-	CHECK_EQ( f.pixel( 39, 40 ), 14 );
-	CHECK_EQ( f.pixel( 40, 40 ), 6 );
-	CHECK_EQ( f.pixel( 40, 39 ), 14 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 7, VIC_RENDER_DISPLAY_Y + 4 ), 14 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 8, VIC_RENDER_DISPLAY_Y + 4 ), 6 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 8, VIC_RENDER_DISPLAY_Y + 3 ), 14 );
 }
 
 TEST( vic_renderer_standard_sprite_uses_pointer_position_and_x_msb )
@@ -211,15 +211,15 @@ TEST( vic_renderer_standard_sprite_uses_pointer_position_and_x_msb )
 	f.sprite( 0, 24, 50, 0x20, 2 );
 	f.ram[ 0x0800 ] = 0x80;
 	f.renderer.render( f.state, f.pixels, VIC_RENDER_WIDTH );
-	CHECK_EQ( f.pixel( 32, 36 ), 2 );
-	CHECK_EQ( f.pixel( 33, 36 ), 6 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X, VIC_RENDER_DISPLAY_Y ), 2 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 1, VIC_RENDER_DISPLAY_Y ), 6 );
 
 	memset( f.ram + 0x0800, 0, 64 );
 	f.ram[ 0x0800 ] = 0x80;
 	f.state.vic[ 0 ] = 0;
 	f.state.vic[ 0x10 ] = 1;
 	f.renderer.render( f.state, f.pixels, VIC_RENDER_WIDTH );
-	CHECK_EQ( f.pixel( 264, 36 ), 2 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 232, VIC_RENDER_DISPLAY_Y ), 2 );
 }
 
 TEST( vic_renderer_multicolor_sprite_decodes_shared_and_individual_colours )
@@ -231,13 +231,13 @@ TEST( vic_renderer_multicolor_sprite_decodes_shared_and_individual_colours )
 	f.state.vic[ 0x26 ] = 7;
 	f.ram[ 0x0800 ] = 0x6C;
 	f.renderer.render( f.state, f.pixels, VIC_RENDER_WIDTH );
-	CHECK_EQ( f.pixel( 32, 36 ), 5 );
-	CHECK_EQ( f.pixel( 33, 36 ), 5 );
-	CHECK_EQ( f.pixel( 34, 36 ), 2 );
-	CHECK_EQ( f.pixel( 35, 36 ), 2 );
-	CHECK_EQ( f.pixel( 36, 36 ), 7 );
-	CHECK_EQ( f.pixel( 37, 36 ), 7 );
-	CHECK_EQ( f.pixel( 38, 36 ), 6 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X, VIC_RENDER_DISPLAY_Y ), 5 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 1, VIC_RENDER_DISPLAY_Y ), 5 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 2, VIC_RENDER_DISPLAY_Y ), 2 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 3, VIC_RENDER_DISPLAY_Y ), 2 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 4, VIC_RENDER_DISPLAY_Y ), 7 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 5, VIC_RENDER_DISPLAY_Y ), 7 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 6, VIC_RENDER_DISPLAY_Y ), 6 );
 }
 
 TEST( vic_renderer_sprite_x_and_y_expansion_repeat_pixels_and_lines )
@@ -248,11 +248,11 @@ TEST( vic_renderer_sprite_x_and_y_expansion_repeat_pixels_and_lines )
 	f.state.vic[ 0x1D ] = 1;
 	f.ram[ 0x0800 ] = 0x80;
 	f.renderer.render( f.state, f.pixels, VIC_RENDER_WIDTH );
-	CHECK_EQ( f.pixel( 32, 36 ), 2 );
-	CHECK_EQ( f.pixel( 33, 36 ), 2 );
-	CHECK_EQ( f.pixel( 32, 37 ), 2 );
-	CHECK_EQ( f.pixel( 33, 37 ), 2 );
-	CHECK_EQ( f.pixel( 34, 36 ), 6 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X, VIC_RENDER_DISPLAY_Y ), 2 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 1, VIC_RENDER_DISPLAY_Y ), 2 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X, VIC_RENDER_DISPLAY_Y + 1 ), 2 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 1, VIC_RENDER_DISPLAY_Y + 1 ), 2 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 2, VIC_RENDER_DISPLAY_Y ), 6 );
 }
 
 TEST( vic_renderer_sprite_priority_respects_foreground_graphics )
@@ -265,8 +265,8 @@ TEST( vic_renderer_sprite_priority_respects_foreground_graphics )
 	f.state.vic[ 0x1B ] = 1;
 	f.ram[ 0x0800 ] = 0xC0;
 	f.renderer.render( f.state, f.pixels, VIC_RENDER_WIDTH );
-	CHECK_EQ( f.pixel( 32, 36 ), 5 );
-	CHECK_EQ( f.pixel( 33, 36 ), 2 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X, VIC_RENDER_DISPLAY_Y ), 5 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 1, VIC_RENDER_DISPLAY_Y ), 2 );
 }
 
 TEST( vic_renderer_multicolor_value_01_does_not_occlude_behind_sprite )
@@ -282,8 +282,8 @@ TEST( vic_renderer_multicolor_value_01_does_not_occlude_behind_sprite )
 	f.state.vic[ 0x1B ] = 1;
 	f.ram[ 0x0800 ] = 0xF0;
 	f.renderer.render( f.state, f.pixels, VIC_RENDER_WIDTH );
-	CHECK_EQ( f.pixel( 32, 36 ), 2 );  // sprite over background-colour 1
-	CHECK_EQ( f.pixel( 34, 36 ), 6 );  // value 10 remains foreground
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X, VIC_RENDER_DISPLAY_Y ), 2 );  // sprite over background-colour 1
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 2, VIC_RENDER_DISPLAY_Y ), 6 );  // value 10 remains foreground
 
 	// The same foreground rule applies to multicolour bitmap data.
 	f.state.vic[ 0x11 ] = 0x3B;
@@ -291,8 +291,8 @@ TEST( vic_renderer_multicolor_value_01_does_not_occlude_behind_sprite )
 	f.ram[ 0x0400 ] = 0xA5;
 	f.ram[ 0x2000 ] = 0x60;
 	f.renderer.render( f.state, f.pixels, VIC_RENDER_WIDTH );
-	CHECK_EQ( f.pixel( 32, 36 ), 2 );
-	CHECK_EQ( f.pixel( 34, 36 ), 5 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X, VIC_RENDER_DISPLAY_Y ), 2 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X + 2, VIC_RENDER_DISPLAY_Y ), 5 );
 }
 
 TEST( vic_renderer_reports_sprite_collision_latches )
@@ -329,7 +329,7 @@ TEST( vic_renderer_lower_numbered_sprite_wins_overlap )
 	f.ram[ 0x0800 ] = 0x80;
 	f.ram[ 0x0840 ] = 0x80;
 	f.renderer.render( f.state, f.pixels, VIC_RENDER_WIDTH );
-	CHECK_EQ( f.pixel( 32, 36 ), 2 );
+	CHECK_EQ( f.pixel( VIC_RENDER_DISPLAY_X, VIC_RENDER_DISPLAY_Y ), 2 );
 }
 
 TEST( vic_renderer_scanline_bands_match_a_whole_frame )

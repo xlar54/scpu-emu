@@ -282,7 +282,7 @@ TEST( vic_raster_replay_latches_sprite_y_and_y_expand_at_trigger )
 	u8 liveVIC[ 0x40 ];
 	defaultVIC( liveVIC );
 	liveVIC[ 0x00 ] = 32;
-	liveVIC[ 0x01 ] = 54;              // output rows 40..60
+	liveVIC[ 0x01 ] = 54;              // output rows 39..59
 	liveVIC[ 0x15 ] = 1;
 	liveVIC[ 0x27 ] = 2;
 	u8 ram[ 65536 ] = {};
@@ -309,11 +309,11 @@ TEST( vic_raster_replay_latches_sprite_y_and_y_expand_at_trigger )
 	CHECK_EQ( replay.build( log, 3, ( 263 + 40 ) * 63, 1ULL << 63, 1,
 	                        timing, liveVIC, 0, ram, plan ), VIC_RASTER_REPLAY );
 	renderReplay( plan, ram, chars, colours, pixels );
-	CHECK_EQ( pixels[ 40 * VIC_RENDER_WIDTH + 40 ], 2 );
-	CHECK_EQ( pixels[ 50 * VIC_RENDER_WIDTH + 40 ], 0 );
-	CHECK_EQ( pixels[ 50 * VIC_RENDER_WIDTH + 41 ], 2 );
-	CHECK_EQ( pixels[ 60 * VIC_RENDER_WIDTH + 40 ], 2 );
-	CHECK_EQ( pixels[ 61 * VIC_RENDER_WIDTH + 40 ], 0 );
+	CHECK_EQ( pixels[ 39 * VIC_RENDER_WIDTH + 40 ], 2 );
+	CHECK_EQ( pixels[ 49 * VIC_RENDER_WIDTH + 40 ], 0 );
+	CHECK_EQ( pixels[ 49 * VIC_RENDER_WIDTH + 41 ], 2 );
+	CHECK_EQ( pixels[ 59 * VIC_RENDER_WIDTH + 40 ], 2 );
+	CHECK_EQ( pixels[ 60 * VIC_RENDER_WIDTH + 40 ], 0 );
 }
 
 TEST( vic_raster_replay_detects_fli_and_uses_a_neutral_vertical_origin )

@@ -225,7 +225,7 @@ static void prepareSpriteRow( const VICRenderState &state, u32 row,
 			const u8 mask = (u8)( 1u << n );
 			if ( !( enabled & mask ) ) continue;
 			const bool expand = ( state.vic[ 0x17 ] & mask ) != 0;
-			const int top = (int)state.vic[ n * 2 + 1 ] - 14;
+			const int top = (int)state.vic[ n * 2 + 1 ] - 15;
 			const int height = expand ? 42 : 21;
 			if ( (int)row < top || (int)row >= top + height ) continue;
 			sequencer.active |= mask;
@@ -244,7 +244,7 @@ static void prepareSpriteRow( const VICRenderState &state, u32 row,
 		{
 			const u8 mask = (u8)( 1u << n );
 			if ( sequencer.active & mask || !( enabled & mask ) ) continue;
-			const int top = (int)state.vic[ n * 2 + 1 ] - 14;
+			const int top = (int)state.vic[ n * 2 + 1 ] - 15;
 			if ( top != (int)row ) continue;
 			const bool expand = ( state.vic[ 0x17 ] & mask ) != 0;
 			sequencer.active |= mask;
@@ -308,7 +308,7 @@ static void renderSpritesOnRow( const VICRenderState &state,
 		const bool expandX = ( state.vic[ 0x1D ] & mask ) != 0;
 		const bool multicolor = ( state.vic[ 0x1C ] & mask ) != 0;
 		const bool behind = ( state.vic[ 0x1B ] & mask ) != 0;
-		const int top = (int)state.vic[ n * 2 + 1 ] - 14;
+		const int top = (int)state.vic[ n * 2 + 1 ] - 15;
 		const int outputLine = (int)y - top;
 		const int outputHeight = expandY ? 42 : 21;
 		if ( outputLine < 0 || outputLine >= outputHeight ) continue;
