@@ -75,8 +75,9 @@ that level; changing it will move them.
 
 It is large, has its own build configuration, and RAD is specific about which
 settings to use. Vendoring would mean either shipping a fork or shipping
-something that silently drifts from what RAD expects. `ThirdParty/` records what
-to fetch; the script does the fetching.
+something that silently drifts from what RAD expects. The dependency section of
+the [top-level README](../README.md#third-party-dependencies) records what to
+fetch; the script does the fetching.
 
 ## SD card
 
