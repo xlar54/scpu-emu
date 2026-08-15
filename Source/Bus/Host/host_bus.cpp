@@ -84,6 +84,13 @@ u8 CHostBus::read( u16 addr )
 			// $D011 bit 7 is raster bit 8; the low bits belong to whatever the
 			// program last wrote to the control register.
 			v = (u8)( ( m_Memory[ 0xD011 ] & 0x7F ) | ( ( raster & 0x100 ) ? 0x80 : 0 ) );
+	} else if ( addr == 0xD019 && m_CycleSource )
+	{
+		// Unused bits of the interrupt register read as 1 on a real VIC, and a
+		// handler that tests them cares. Bit 7 is the summary bit.
+		advanceRaster();
+		v = (u8)( 0x70 | ( m_RasterLatch ? 0x01 : 0 ) );
+		if ( m_RasterLatch && ( m_Memory[ 0xD01A ] & 0x01 ) ) v |= 0x80;
 	} else
 	{
 		v = m_Memory[ addr ];
@@ -97,6 +104,19 @@ void CHostBus::write( u16 addr, u8 value )
 {
 	m_Cycles++;
 	m_Writes++;
+	// The VIC clears exactly the latch bits that are SET in the written byte.
+	// Modelled strictly, because the strictness is the interesting part: the
+	// classic ASL $D019 idiom only acknowledges by way of the NMOS
+	// read-modify-write dummy write, which carries the original value with bit
+	// 0 still set. The shifted value that follows it has bit 0 clear. A 65816
+	// omits that dummy write, so the same instruction does NOT acknowledge --
+	// which is a real SuperCPU compatibility hazard, and one this bus will now
+	// reproduce rather than paper over.
+	if ( addr == 0xD019 && m_CycleSource )
+	{
+		advanceRaster();
+		if ( value & 0x01 ) m_RasterLatch = false;
+	}
 	m_Memory[ addr ] = value;
 	logAccess( HOSTOP_WRITE, addr, value );
 }
@@ -132,13 +152,71 @@ void CHostBus::readBlock( u16 addr, u8 *dst, u32 length )
 
 u16 CHostBus::rasterLineInternal() const
 {
-	// Derived from the bus cycle count so that code polling the beam makes
-	// progress instead of spinning forever. It advances more slowly than a real
-	// VIC-II, because only accesses that reach the bus tick it -- good enough
-	// for "wait until the beam reaches line N", not for raster-exact timing.
 	u32 perLine = c64CyclesPerLine( m_Signals.video );
 	u32 lines   = c64RasterLines( m_Signals.video );
+
+	// With a cycle source the beam runs on emulated C64 time, which is the only
+	// thing a raster split can be measured against.
+	if ( m_CycleSource )
+		return (u16)( ( m_CycleSource( m_CycleContext ) / perLine ) % lines );
+
+	// Otherwise derive it from the bus cycle count so that code polling the
+	// beam makes progress instead of spinning forever. It advances more slowly
+	// than a real VIC-II, because only accesses that reach the bus tick it --
+	// good enough for "wait until the beam reaches line N", not for
+	// raster-exact timing.
 	return (u16)( ( m_Cycles / perLine ) % lines );
+}
+
+void CHostBus::setRasterClock( CycleSource source, void *context )
+{
+	m_CycleSource = source;
+	m_CycleContext = context;
+	m_RasterLatch = false;
+	m_RasterIRQsRaised = 0;
+	m_RasterSeenLine = source
+	                 ? source( context ) / c64CyclesPerLine( m_Signals.video )
+	                 : 0;
+}
+
+void CHostBus::advanceRaster()
+{
+	if ( !m_CycleSource ) return;
+
+	const u32 perLine = c64CyclesPerLine( m_Signals.video );
+	const u32 lines   = c64RasterLines( m_Signals.video );
+	const u64 nowLine = m_CycleSource( m_CycleContext ) / perLine;
+	if ( nowLine <= m_RasterSeenLine ) return;
+
+	// Absolute line numbers are monotonic, so "was the compare crossed?" is
+	// exact no matter how coarsely this is sampled -- no tick loop, and no way
+	// for a split to be missed because nobody looked during its line.
+	const u16 compare = (u16)( m_Memory[ 0xD012 ]
+	                  | ( ( m_Memory[ 0xD011 ] & 0x80 ) ? 0x100 : 0 ) );
+	if ( compare < lines )
+	{
+		// First absolute line strictly after the last one accounted for that is
+		// congruent to the compare line.
+		const u64 first = m_RasterSeenLine + 1;
+		u64 delta = ( (u64)compare + lines - ( first % lines ) ) % lines;
+		if ( first + delta <= nowLine )
+		{
+			if ( !m_RasterLatch ) m_RasterIRQsRaised++;
+			m_RasterLatch = true;
+		}
+	}
+
+	m_RasterSeenLine = nowLine;
+}
+
+bool CHostBus::irqAsserted()
+{
+	if ( m_CycleSource )
+	{
+		advanceRaster();
+		if ( m_RasterLatch && ( m_Memory[ 0xD01A ] & 0x01 ) ) return true;
+	}
+	return m_IRQ;
 }
 
 u16 CHostBus::rasterLine()

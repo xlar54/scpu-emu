@@ -56,13 +56,29 @@ public:
 	void writeBurst( const C64BusWrite *writes, u32 count ) override;
 	void readBlock( u16 addr, u8 *dst, u32 length ) override;
 
-	bool irqAsserted() override { return m_IRQ; }
+	bool irqAsserted() override;
 	bool nmiAsserted() override { return m_NMI; }
 	u16  rasterLine() override;
 
 	// Free-running raster position, without charging a bus cycle. Used to
 	// answer reads of $D011/$D012 -- see the note in read().
 	u16  rasterLineInternal() const;
+
+	// --- optional raster-accurate VIC timing -------------------------------
+	// The default raster counter advances on BUS ACCESSES, which is enough for
+	// "wait until the beam reaches line N" and useless for anything that needs
+	// a raster split to land on a particular line. Supply an emulated-C64-cycle
+	// source and the counter runs on that instead, with a working raster
+	// interrupt: $D012/$D011 bit 7 compare, latch in $D019 bit 0, enable in
+	// $D01A bit 0, acknowledged by writing bit 0 back.
+	//
+	// Still not a VIC-II. It produces no picture and fetches no memory -- it is
+	// a clock and an interrupt, which is exactly what a raster program needs in
+	// order to generate a write log worth replaying.
+	typedef u64 ( *CycleSource )( void *context );
+	void setRasterClock( CycleSource source, void *context );
+
+	u32 rasterIRQsRaised() const { return m_RasterIRQsRaised; }
 
 	const char *name() const override { return "host (simulated)"; }
 
@@ -91,6 +107,18 @@ public:
 
 private:
 	void logAccess( u8 op, u16 addr, u8 value );
+
+	// Fold elapsed time into the raster IRQ latch. Lazy rather than ticked:
+	// the compare fires on the absolute line number, which is monotonic, so
+	// "did any line between the last look and now match?" is exact however
+	// coarsely it is sampled.
+	void advanceRaster();
+
+	CycleSource m_CycleSource = 0;
+	void       *m_CycleContext = 0;
+	u64         m_RasterSeenLine = 0;	// absolute lines already accounted for
+	bool        m_RasterLatch = false;	// $D019 bit 0
+	u32         m_RasterIRQsRaised = 0;
 };
 
 #endif
