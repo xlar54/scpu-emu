@@ -27,12 +27,18 @@ CWriteBuffer::CWriteBuffer()
 	  m_DisplayScrubSpriteBytes( 0 ),
 	  m_WritesSkipped( 0 ), m_WritesCoalesced( 0 ),
 	  m_BytesFlushed( 0 ), m_Flushes( 0 ),
+	  m_PolicyEntriesExamined( 0 ), m_PolicyZeroProgressScans( 0 ),
+	  m_PolicyNoProgressCacheHits( 0 ),
 	  m_IOWindowSuppressed( 0 ),
 	  m_Bus( 0 ), m_RAM( 0 ),
 	  m_Mode( SCPU_OPT_DEFAULT ), m_ExcludeZPStack( true ),
 	  m_DeliveryEnabled( true ),
 	  m_RangeLo( 0x0000 ), m_RangeHi( 0xFFFF ),
-	  m_Head( 0 ), m_Count( 0 )
+	  m_Head( 0 ), m_Count( 0 ), m_QueueGeneration( 0 ),
+	  m_NoProgressValid( false ), m_NoProgressDeferHot( false ),
+	  m_NoProgressQueueGeneration( 0 ), m_NoProgressHotGeneration( 0 ),
+	  m_NoProgressScreenBase( 0xFFFFFFFF ),
+	  m_NoProgressBitmapBase( 0xFFFFFFFF )
 {
 	m_DisplayScrubSampled[ 0 ] = m_DisplayScrubSampled[ 1 ] = 0;
 	m_DisplayScrubMismatches[ 0 ] = m_DisplayScrubMismatches[ 1 ] = 0;
@@ -50,6 +56,8 @@ void CWriteBuffer::attach( IC64Bus *bus, const u8 *ram )
 	m_DisplayScrubScreenOffset = m_DisplayScrubGraphicsOffset = 0;
 	m_DisplayScrubSpriteOffset = 0;
 	m_DisplayScrubTurn = 0;
+	m_QueueGeneration++;
+	m_NoProgressValid = false;
 }
 
 void CWriteBuffer::clearDirty()
@@ -97,6 +105,8 @@ void CWriteBuffer::resetStats()
 	m_DisplayScrubSampled[ 0 ] = m_DisplayScrubSampled[ 1 ] = 0;
 	m_DisplayScrubMismatches[ 0 ] = m_DisplayScrubMismatches[ 1 ] = 0;
 	m_BytesFlushed = m_Flushes = 0;
+	m_PolicyEntriesExamined = m_PolicyZeroProgressScans = 0;
+	m_PolicyNoProgressCacheHits = 0;
 	m_IOWindowSuppressed = 0;
 }
 
@@ -256,6 +266,7 @@ bool CWriteBuffer::onRamWrite( u16 addr, u8 value )
 	{
 		m_List[ ( m_Head + m_Count ) & ( SCPU_WRITEBUF_CAPACITY - 1 ) ] = addr;
 		m_Count++;
+		m_QueueGeneration++;
 	}
 	return true;
 }
@@ -347,6 +358,7 @@ u32 CWriteBuffer::flushSelectedChunk( u32 maxBytes, bool deferHot,
 		m_Head = ( m_Head + 1 ) & mask;
 		m_Count--;
 	}
+	m_PolicyEntriesExamined += examined;
 
 	if ( selected == 0 )
 		return 0;
@@ -358,6 +370,8 @@ u32 CWriteBuffer::flushSelectedChunk( u32 maxBytes, bool deferHot,
 		m_Dirty[ a >> 6 ] &= ~( 1ULL << ( a & 63 ) );
 		m_Synced[ a >> 6 ] |= 1ULL << ( a & 63 );
 	}
+	m_QueueGeneration++;
+	m_NoProgressValid = false;
 	return selected;
 }
 
@@ -366,6 +380,11 @@ u32 CWriteBuffer::flushUpToPolicy( u32 maxBytes, bool deferHot,
 {
 	if ( m_Count == 0 || maxBytes == 0 )
 		return m_Count;
+	if ( noProgressCacheMatches( deferHot, screenBase, bitmapBase ) )
+	{
+		m_PolicyNoProgressCacheHits++;
+		return m_Count;
+	}
 
 	if ( !m_Bus )
 	{
@@ -373,6 +392,8 @@ u32 CWriteBuffer::flushUpToPolicy( u32 maxBytes, bool deferHot,
 		clearDirty();
 		m_Count = 0;
 		m_Head = 0;
+		m_QueueGeneration++;
+		m_NoProgressValid = false;
 		return 0;
 	}
 
@@ -382,7 +403,12 @@ u32 CWriteBuffer::flushUpToPolicy( u32 maxBytes, bool deferHot,
 		const u32 n = flushSelectedChunk( maxBytes - sent, deferHot,
 		                                  screenBase, 1000, false,
 		                                  bitmapBase, 8000 );
-		if ( n == 0 ) break;
+		if ( n == 0 )
+		{
+			m_PolicyZeroProgressScans++;
+			rememberNoProgress( deferHot, screenBase, bitmapBase );
+			break;
+		}
 		sent += n;
 	}
 
@@ -591,4 +617,6 @@ void CWriteBuffer::discard()
 	for ( u32 i = 0; i < 0x10000 / 64; i++ ) m_Synced[ i ] = 0;
 	m_Head = 0;
 	m_Count = 0;
+	m_QueueGeneration++;
+	m_NoProgressValid = false;
 }

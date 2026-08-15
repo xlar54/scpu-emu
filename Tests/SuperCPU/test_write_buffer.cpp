@@ -637,6 +637,69 @@ TEST( writebuf_visible_drain_skips_screen_and_keeps_making_progress )
 	CHECK( f.wb.hasPendingInRange( 0x7400, 1000 ) );
 }
 
+TEST( writebuf_repeated_zero_progress_display_scan_is_cached )
+{
+	WBFixture f;
+	f.wb.setOptMode( SCPU_OPT_NONE );
+
+	// With only the active matrix pending, a visible drain has no eligible
+	// byte. The first call must prove that once; later scheduler opportunities
+	// must not stream the same 1000-entry queue through cache again.
+	for ( u32 i = 0; i < 1000; i++ )
+		f.poke( (u16)( 0x7400 + i ), (u8)( i ^ 0x5A ) );
+	f.wb.flushUpToPolicy( 64, false, 0x7400 );
+	CHECK_EQ( f.wb.pending(), 1000u );
+	CHECK_EQ( f.wb.m_PolicyEntriesExamined, 1000u );
+	CHECK_EQ( f.wb.m_PolicyZeroProgressScans, 1u );
+
+	for ( u32 i = 0; i < 32; i++ )
+		f.wb.flushUpToPolicy( 64, false, 0x7400 );
+	CHECK_EQ( f.wb.m_PolicyEntriesExamined, 1000u );
+	CHECK_EQ( f.wb.m_PolicyZeroProgressScans, 1u );
+	CHECK_EQ( f.wb.m_PolicyNoProgressCacheHits, 32u );
+
+	// A new cold byte invalidates the negative result and must make progress.
+	f.poke( 0x2000, 0xA5 );
+	f.wb.flushUpToPolicy( 64, false, 0x7400 );
+	CHECK_EQ( f.bus.m_Memory[ 0x2000 ], 0xA5 );
+	CHECK_EQ( f.wb.pending(), 1000u );
+	CHECK( f.wb.m_PolicyEntriesExamined > 1000u );
+
+	// So does a display-map change: the old matrix is now ordinary traffic.
+	f.wb.flushUpToPolicy( 64, false, 0x8000 );
+	CHECK_EQ( f.wb.pending(), 936u );
+}
+
+TEST( writebuf_zero_progress_cache_tracks_hot_sprite_generation )
+{
+	CHostBus bus;
+	u8 ram[ 0x10000 ] = { 0 };
+	u64 hot[ 1024 / 64 ] = { 0 };
+	u32 hotGeneration = 1;
+	CWriteBuffer wb;
+	wb.attach( &bus, ram );
+	wb.setOptMode( SCPU_OPT_NONE );
+	wb.attachHotShapeBlocks( hot, &hotGeneration );
+
+	const u32 block = 0x1000 >> 6;
+	hot[ block >> 6 ] |= 1ULL << ( block & 63 );
+	wb.onRamWrite( 0x1010, 0x37 ); ram[ 0x1010 ] = 0x37;
+	wb.flushUpToPolicy( 64, true );
+	CHECK_EQ( wb.pending(), 1u );
+	const u64 examined = wb.m_PolicyEntriesExamined;
+	wb.flushUpToPolicy( 64, true );
+	CHECK_EQ( wb.m_PolicyEntriesExamined, examined );
+	CHECK_EQ( wb.m_PolicyNoProgressCacheHits, 1u );
+
+	// The sprite retired this block. Its generation change must invalidate the
+	// cached negative result even though the queue itself did not change.
+	hot[ block >> 6 ] &= ~( 1ULL << ( block & 63 ) );
+	hotGeneration++;
+	wb.flushUpToPolicy( 64, true );
+	CHECK_EQ( wb.pending(), 0u );
+	CHECK_EQ( bus.m_Memory[ 0x1010 ], 0x37 );
+}
+
 TEST( writebuf_visible_drain_skips_bitmap_and_keeps_making_progress )
 {
 	WBFixture f;

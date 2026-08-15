@@ -315,6 +315,9 @@ void CC64Memory::ciaTimerNMIDue()
 // unless displayed, and allocation just ruled displaying out.
 u8 CC64Memory::allocRelocBlock( u8 v )
 {
+	// Callers must rebuild the hot-shape set immediately after a successful
+	// allocation: changing m_PtrReloc can make a formerly deferred source block
+	// deliverable. noteSpritePointerWrite() currently supplies that ordering.
 	// Forbidden span 1: the active and most-recent screen matrices, as blocks.
 	// Double-buffered programs can queue pointer-row bytes for one while the
 	// other is active; stealing either matrix makes the next flip destructive.

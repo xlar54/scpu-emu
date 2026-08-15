@@ -160,7 +160,12 @@ public:
 	// sprite shape must reach real DRAM whole, never as the render's
 	// cleared/partial transient, because the VIC fetches shapes on the
 	// sprite's own display lines.
-	void attachHotShapeBlocks( const u64 *bits ) { m_HotBlocks = bits; }
+	void attachHotShapeBlocks( const u64 *bits, const u32 *generation = 0 )
+	{
+		m_HotBlocks = bits;
+		m_HotBlocksGeneration = generation;
+		m_NoProgressValid = false;
+	}
 
 	// flushUpTo with display-time policy. Hot sprite-shape bytes and bytes in
 	// the active 1000-byte screen matrix or 8000-byte bitmap are skipped, not
@@ -250,6 +255,9 @@ public:
 	u64 m_WritesCoalesced;	// accepted writes that hit an already-dirty address
 	u64 m_BytesFlushed;		// bytes actually sent over the bus
 	u64 m_Flushes;
+	u64 m_PolicyEntriesExamined;	// FIFO entries inspected by display policy
+	u64 m_PolicyZeroProgressScans;	// complete policy scans that sent nothing
+	u64 m_PolicyNoProgressCacheHits;	// repeated scans avoided by the cache
 
 	// Writes aimed at $D000-$DFFF that were refused. Non-zero means the
 	// emulated banking had the I/O window mapped as RAM while the real machine
@@ -294,6 +302,7 @@ private:
 	u16 m_DisplayScrubSpriteOffset = 0;
 	u8  m_DisplayScrubTurn = 0;
 	const u64 *m_HotBlocks = 0;
+	const u32 *m_HotBlocksGeneration = 0;
 	// Relocation wiring; see attachRelocation().
 	const u8  *m_PtrReloc = 0;
 	const u8  *m_RelocInUse = 0;
@@ -325,6 +334,49 @@ private:
 	u16 m_List[ SCPU_WRITEBUF_CAPACITY ];
 	u32 m_Head;
 	u32 m_Count;
+
+	// A visible-picture drain may find that every queued byte belongs to the
+	// active matrix/bitmap or a hot sprite block. The old scheduler repeated
+	// that complete scan at every one of 128 opportunities per frame -- up to
+	// millions of FIFO inspections and repeated streaming of this 128KB ring
+	// through the Pi 3's shared L2 while transferring no byte. Cache that
+	// negative result until either the queue or the eligibility policy changes.
+	u32 m_QueueGeneration;
+	bool m_NoProgressValid;
+	bool m_NoProgressDeferHot;
+	u32 m_NoProgressQueueGeneration;
+	u32 m_NoProgressHotGeneration;
+	u32 m_NoProgressScreenBase;
+	u32 m_NoProgressBitmapBase;
+
+	bool canCacheNoProgress( bool deferHot ) const
+	{
+		return !deferHot || !m_HotBlocks || m_HotBlocksGeneration;
+	}
+	bool noProgressCacheMatches( bool deferHot, u32 screenBase,
+	                             u32 bitmapBase ) const
+	{
+		if ( !m_NoProgressValid
+		     || m_NoProgressQueueGeneration != m_QueueGeneration
+		     || m_NoProgressDeferHot != deferHot
+		     || m_NoProgressScreenBase != screenBase
+		     || m_NoProgressBitmapBase != bitmapBase )
+			return false;
+		return !deferHot || !m_HotBlocks
+		    || ( m_HotBlocksGeneration
+		         && m_NoProgressHotGeneration == *m_HotBlocksGeneration );
+	}
+	void rememberNoProgress( bool deferHot, u32 screenBase, u32 bitmapBase )
+	{
+		if ( !canCacheNoProgress( deferHot ) ) return;
+		m_NoProgressDeferHot = deferHot;
+		m_NoProgressQueueGeneration = m_QueueGeneration;
+		m_NoProgressHotGeneration = m_HotBlocksGeneration
+		                          ? *m_HotBlocksGeneration : 0;
+		m_NoProgressScreenBase = screenBase;
+		m_NoProgressBitmapBase = bitmapBase;
+		m_NoProgressValid = true;
+	}
 
 	// Scratch used to build the burst handed to the bus.
 	C64BusWrite m_Burst[ SCPU_WRITEBUF_CHUNK ];

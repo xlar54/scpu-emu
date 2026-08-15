@@ -1266,8 +1266,16 @@ public:
 	// Under-I/O pointers are tracked as their RELOCATED block when one exists:
 	// that is the block actually being delivered to and fetched from.
 	u64  m_HotShapeBlocks[ 1024 / 64 ] = { 0 };
+	u32  m_HotShapeGeneration = 0;
 	void updateHotShapeBlocks()
 	{
+		// The write buffer caches a completed display-time scan that found no
+		// deliverable byte. Publish every rebuild so a pointer/bank/mode change
+		// cannot leave that negative result live after eligibility changed.
+		// Producer and consumer both run on core 0 today. Do not move queue
+		// flushing to another core without synchronizing this generation with
+		// the rebuilt bits; publishing first is not a cross-core protocol.
+		m_HotShapeGeneration++;
 		for ( u32 i = 0; i < 1024 / 64; i++ ) m_HotShapeBlocks[ i ] = 0;
 		if ( m_SpritePtrBase == 0xFFFFFFFF )
 			return;

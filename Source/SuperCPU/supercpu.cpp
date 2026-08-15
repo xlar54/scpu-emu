@@ -100,7 +100,8 @@ bool CSuperCPU::init( IC64Bus *bus, SCPUCoreType core, u32 simmMB )
 	m_Memory.setIOInterceptor( &m_Registers );
 
 	m_WriteBuffer.attach( m_Bus, m_Memory.m_RAM );
-	m_WriteBuffer.attachHotShapeBlocks( m_Memory.m_HotShapeBlocks );
+	m_WriteBuffer.attachHotShapeBlocks( m_Memory.m_HotShapeBlocks,
+	                                    &m_Memory.m_HotShapeGeneration );
 	m_WriteBuffer.attachRelocation( m_Memory.m_PtrReloc, m_Memory.m_RelocInUse,
 	                                &m_Memory.m_RelocCount );
 

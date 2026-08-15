@@ -253,6 +253,9 @@ struct SCPUResetDiagnostic
 	u64 mirrorAccepted;
 	u64 mirrorSkipped;
 	u64 mirrorFlushed;
+	u64 mirrorEntriesExamined;
+	u64 mirrorZeroProgressScans;
+	u64 mirrorNoProgressCacheHits;
 	u8 scrubPhaseOn;
 	u64 scrubSampledText;
 	u64 scrubSampledBitmap;
@@ -336,6 +339,9 @@ static void scpuSnapshotResetDiagnostic( CSuperCPU *scpu )
 		d.mirrorAccepted = w.m_WritesAccepted;
 		d.mirrorSkipped = w.m_WritesSkipped;
 		d.mirrorFlushed = w.m_BytesFlushed;
+		d.mirrorEntriesExamined = w.m_PolicyEntriesExamined;
+		d.mirrorZeroProgressScans = w.m_PolicyZeroProgressScans;
+		d.mirrorNoProgressCacheHits = w.m_PolicyNoProgressCacheHits;
 		d.scrubPhaseOn = scpu->displayScrubPhaseOn() ? 1 : 0;
 		d.scrubSampledText = w.m_DisplayScrubSampled[ 0 ];
 		d.scrubSampledBitmap = w.m_DisplayScrubSampled[ 1 ];
@@ -540,6 +546,11 @@ static void scpuEmitResetDiagnostic()
 	               (unsigned long long)d.mirrorAccepted,
 	               (unsigned long long)d.mirrorSkipped,
 	               (unsigned long long)d.mirrorFlushed );
+	s_Logger->Write( "SCPU", LogNotice,
+	               "  mirror scan: examined=%llu zero=%llu cached=%llu",
+	               (unsigned long long)d.mirrorEntriesExamined,
+	               (unsigned long long)d.mirrorZeroProgressScans,
+	               (unsigned long long)d.mirrorNoProgressCacheHits );
 	s_Logger->Write( "SCPU", LogNotice,
 	               "  display scrub: phase=%s repaired=%llu (physical sampling disabled)",
 	               d.scrubPhaseOn ? "ON" : "OFF",
