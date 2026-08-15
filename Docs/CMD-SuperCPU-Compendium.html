@@ -417,17 +417,48 @@ available to a cartridge. The 6510&rsquo;s port pins are a separate 6-bit I/O po
 part of the address/data bus, so asserting <code>/DMA</code> tri-states the CPU&rsquo;s
 bus drivers while those pins keep driving the PLA with whatever <code>$01</code> last
 held. The expansion port carries <code>/GAME</code> and <code>/EXROM</code> but no
-LORAM or HIRAM. A bus master therefore cannot make the PLA decode that window as RAM by
-any means available on the connector alone.</p></div>
+LORAM or HIRAM.</p>
+<p>What the connector does carry is <code>/GAME</code>, and that turns out to be
+enough &mdash; but only in combination with something done BEFORE the processor is
+halted. See below.</p></div>
 
-<p class="small">How the real SuperCPU resolves this is under investigation at the time
-of writing. The leading candidate is that the card leaves the halted 6510&rsquo;s bank
-bits in an all-RAM state and asserts <code>/GAME</code> only for genuine I/O cycles,
-which would give it DRAM under the window without losing register access. That is not
-yet confirmed and should not be quoted as established. What IS established is the
-constraint above, and that any accelerator failing to solve it loses the bottom half of
-every bank-3 bitmap based at <code>$C000</code> &mdash; a class of titles, not one
-game.</p>
+<h3>How it is actually done</h3>
+
+<p>The port cannot be rewritten once the processor is halted &mdash; but it can be set
+<em>beforehand</em>. The takeover leaves the 6510&rsquo;s port at <code>$34</code>:
+LORAM and HIRAM both low, CHAREN high. Those pins then hold that value for the entire
+session, and by the PLA table above, LORAM and HIRAM low means
+<code>$D000-$DFFF</code> decodes as <strong>RAM</strong>.</p>
+
+<p>That alone would cost the accelerator its I/O registers. The second half of the
+trick recovers them: asserting <code>/GAME</code> selects <strong>Ultimax</strong>, and
+the Ultimax map puts real I/O back at <code>$D000-$DFFF</code>. So the one line the
+cartridge does control selects between the two views, per access:</p>
+
+<table>
+<tr><th style="width:26%">Access</th><th style="width:24%"><code>/GAME</code></th><th>What $D000-$DFFF is</th></tr>
+<tr><td>ordinary read/write</td><td>pulsed asserted for one CPU half-cycle</td><td>I/O registers (Ultimax)</td></tr>
+<tr><td>RAM read/write</td><td>left released</td><td>physical DRAM &mdash; reachable</td></tr>
+</table>
+
+<p>The elegant part is the ordering. You cannot change <code>$01</code> after halting the
+CPU, so you pre-set it to the <em>permissive</em> state while the machine can still be
+made to execute, and then use the line you do control to impose the <em>restrictive</em>
+state whenever you actually want a register. Both views remain available for the whole
+session from a single controllable signal.</p>
+
+<div class="box note"><span class="lab">Confirmed by repair, not by argument</span>
+<p>SCPU-EMU previously suppressed every mirrored write to this window, and lost the
+bottom half of exactly the pictures described above. Implementing the two-view scheme
+&mdash; a separate RAM read/write path on the bus interface that leaves <code>/GAME</code>
+released &mdash; repaired <em>Test Drive</em> and a second title on real hardware. The
+constraint, the mechanism and the fix are therefore all confirmed on a physical
+machine rather than reasoned about.</p></div>
+
+<p class="small">Worth noting for anyone reimplementing: the same-polarity idle-prime
+protection that guards ordinary writes applies to the RAM path too. It is the bus
+warmth rule, not an I/O rule, and skipping it there would reintroduce the first-write
+corruption it exists to prevent.</p>
 <h2>6. The bank-1 ROM shadow</h2>
 
 <p>The accelerator keeps ROM images in its own fast SRAM — bank 1 — and serves
