@@ -272,22 +272,26 @@ public:
 	inline void noteSpritePointerWrite( u16 a, u8 old, u8 v )
 	{
 		m_PtrRowWrites++;
-		if ( old != v )
-		{
-			// The VALUE delivered may differ from the value stored: a bank-3
-			// pointer selecting a shape block under the I/O window is remapped
-			// to the block's relocated copy, the only place the real VIC can
-			// actually be fed from. See relocPointerValue().
-			if ( m_C64 ) m_C64->write( a, relocPointerValue( v ) );
-			updateHotShapeBlocks();
-		}
+		if ( old == v ) return;
+
+		// The VALUE delivered may differ from the value stored: a bank-3
+		// pointer selecting a shape block under the I/O window is remapped to
+		// the block's relocated copy, the only place the real VIC can actually
+		// be fed from. See relocPointerValue().
+		if ( m_C64 ) m_C64->write( a, relocPointerValue( v ) );
+		updateHotShapeBlocks();
+
 		// Timestamp it. Sprite pointers are RAM, so otherwise they are carried
 		// only by the once-per-frame snapshot, which applies ONE value to the
-		// whole frame and silently breaks every sprite multiplexer. Logged even
-		// when unchanged: the cost is a handful of ring entries per frame, and
-		// the alternative is a value the replay never learns. Contrast colour
-		// RAM, deliberately NOT timestamped, where one 1000-cell fill would
-		// consume half the ring.
+		// whole frame and silently breaks every sprite multiplexer. Contrast
+		// colour RAM, deliberately NOT timestamped, where one 1000-cell fill
+		// would consume half the ring.
+		//
+		// CHANGES only. An unchanged write leaves RAM alone, so the replay --
+		// which seeds from RAM and then follows changes -- already holds the
+		// right value and has nothing to learn. Logging them anyway would let a
+		// program that rewrites a pointer in a tight loop fill the 2048-entry
+		// ring, force a resync, and lose every raster effect in that frame.
 		appendVICLog( (u16)( VIC_LOG_REG_SPRPTR + ( a & 7 ) ), v );
 	}
 
