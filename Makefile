@@ -122,6 +122,31 @@ $(BUILDDIR)/scpu_trace: $(BUILDDIR)/Tools/viceconf/scpu_trace.o $(HOST_OBJS)
          $(BUILDDIR)/Tools/viceconf/ss816.d \
          $(BUILDDIR)/Tools/viceconf/scpu_trace.d
 
+# Re-render the compendium PDF from its HTML source.
+#
+# The PDF is the artifact people read and the HTML is the source, so they go
+# stale apart silently -- which is exactly what happened, because there was no
+# command to run. Chromium's print-to-PDF is what produced the original
+# (Producer: Skia/PDF), so using it again keeps pagination and fonts consistent.
+.PHONY: docs-pdf
+docs-pdf:
+	@src="$(CURDIR)/Docs/CMD-SuperCPU-Compendium.html"; \
+	out="$(CURDIR)/Docs/CMD-SuperCPU-Compendium.pdf"; \
+	for c in "/c/Program Files/Google/Chrome/Application/chrome.exe" \
+	         "/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe" \
+	         "/c/Program Files/Microsoft/Edge/Application/msedge.exe" \
+	         "$$(command -v google-chrome 2>/dev/null)" \
+	         "$$(command -v chromium 2>/dev/null)"; do \
+	  [ -n "$$c" ] && [ -x "$$c" ] || continue; \
+	  echo "  rendering with $$c"; \
+	  "$$c" --headless --disable-gpu --no-sandbox --no-pdf-header-footer \
+	        --print-to-pdf="$$(cygpath -m "$$out" 2>/dev/null || echo $$out)" \
+	        "file:///$$(cygpath -m "$$src" 2>/dev/null || echo $$src)" || exit 1; \
+	  echo "  wrote $$out"; exit 0; \
+	done; \
+	echo "  no Chromium-based browser found -- install one, or print"; \
+	echo "  Docs/CMD-SuperCPU-Compendium.html to PDF by hand"; exit 1
+
 # Builds the Raspberry Pi kernel image. Fetches the AArch64 toolchain and
 # Circle 44.3 into _toolchain/ on first run, applies RAD's Circle settings, then
 # builds. See Docs/build.md.
