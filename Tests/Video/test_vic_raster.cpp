@@ -48,6 +48,7 @@ static void renderReplay( const VICRasterReplayPlan &plan, const u8 *ram,
 {
 	memset( pixels, 0xFF, VIC_RENDER_WIDTH * VIC_RENDER_HEIGHT );
 	CVICRenderer renderer;
+	VICRenderSpriteSequencer sprites = {};
 	for ( u32 b = 0; b < plan.bandCount; b++ )
 	{
 		const VICRasterReplayBand &band = plan.bands[ b ];
@@ -70,7 +71,8 @@ static void renderReplay( const VICRasterReplayPlan &plan, const u8 *ram,
 		memcpy( state.vic, band.vic, sizeof state.vic );
 		renderer.renderRows( state,
 		                     pixels + band.firstRow * VIC_RENDER_WIDTH,
-		                     VIC_RENDER_WIDTH, band.firstRow, band.rowCount );
+		                     VIC_RENDER_WIDTH, band.firstRow, band.rowCount,
+		                     0, &sprites );
 	}
 }
 
@@ -272,6 +274,46 @@ TEST( vic_raster_replay_changes_sprite_state_inside_a_sprite )
 	renderReplay( plan, ram, chars, colours, pixels );
 	CHECK_EQ( pixels[ 45 * VIC_RENDER_WIDTH + 40 ], 2 );
 	CHECK_EQ( pixels[ 55 * VIC_RENDER_WIDTH + 40 ], 5 );
+}
+
+TEST( vic_raster_replay_latches_sprite_y_and_y_expand_at_trigger )
+{
+	const VICRasterTiming timing = ntscTiming();
+	u8 liveVIC[ 0x40 ];
+	defaultVIC( liveVIC );
+	liveVIC[ 0x00 ] = 32;
+	liveVIC[ 0x01 ] = 54;              // output rows 40..60
+	liveVIC[ 0x15 ] = 1;
+	liveVIC[ 0x27 ] = 2;
+	u8 ram[ 65536 ] = {};
+	u8 chars[ 4096 ] = {};
+	u8 colours[ 1024 ] = {};
+	u8 pixels[ VIC_RENDER_WIDTH * VIC_RENDER_HEIGHT ];
+	ram[ 0x07F8 ] = 0x20;
+	for ( u32 line = 0; line < 21; line++ )
+		ram[ 0x0800 + line * 3 ] = 0x80;
+	ram[ 0x0800 + 10 * 3 ] = 0x40;
+
+	VICRegWrite log[ SCPU_VIC_LOG_SIZE ] = {};
+	// At output row 50, move the Y trigger to that very row and enable Y
+	// expansion. A register-per-band renderer restarts and stretches the
+	// sprite here. The VIC's already-active sequencer must instead continue
+	// original line 10 and finish at row 60.
+	log[ 0 ] = exactRasterWrite( 65 * 63, 0x01, 64, 65 );
+	log[ 1 ] = exactRasterWrite( 65 * 63 + 1, 0x17, 1, 65 );
+	log[ 2 ] = exactRasterWrite( ( 263 + 20 ) * 63, 0x20, 6, 20 );
+	CVICRasterReplay replay;
+	VICRasterReplayPlan plan;
+	replay.build( log, 0, 0, 1ULL << 63, 1, timing,
+	              liveVIC, 0, ram, plan );
+	CHECK_EQ( replay.build( log, 3, ( 263 + 40 ) * 63, 1ULL << 63, 1,
+	                        timing, liveVIC, 0, ram, plan ), VIC_RASTER_REPLAY );
+	renderReplay( plan, ram, chars, colours, pixels );
+	CHECK_EQ( pixels[ 40 * VIC_RENDER_WIDTH + 40 ], 2 );
+	CHECK_EQ( pixels[ 50 * VIC_RENDER_WIDTH + 40 ], 0 );
+	CHECK_EQ( pixels[ 50 * VIC_RENDER_WIDTH + 41 ], 2 );
+	CHECK_EQ( pixels[ 60 * VIC_RENDER_WIDTH + 40 ], 2 );
+	CHECK_EQ( pixels[ 61 * VIC_RENDER_WIDTH + 40 ], 0 );
 }
 
 TEST( vic_raster_replay_detects_fli_and_uses_a_neutral_vertical_origin )

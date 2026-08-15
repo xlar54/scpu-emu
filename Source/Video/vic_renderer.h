@@ -38,6 +38,21 @@ struct VICRenderCollisions
 	u8 spriteBackground;
 };
 
+// Per-frame state for the parts of the VIC-II sprite sequencer that do not
+// follow register writes line by line. A sprite's Y position and Y-expansion
+// state are sampled when its raster comparison triggers; later writes affect
+// the next trigger, not the display already in progress. Zero-initialize this
+// once at the start of each rendered frame and pass it through every band.
+struct VICRenderSpriteSequencer
+{
+	u8  active;
+	u8  expanded;
+	u8  y[ 8 ];
+	u8  rowsLeft[ 8 ];
+	u16 nextRow;
+	bool primed;
+};
+
 struct VICRenderState
 {
 	const u8 *ram;
@@ -64,14 +79,16 @@ public:
 	// pitch is measured in bytes and must be at least VIC_RENDER_WIDTH.
 	VICRenderMode render( const VICRenderState &state, u8 *pixels,
 	                      u32 pitch,
-	                      VICRenderCollisions *collisions = 0 ) const;
+	                      VICRenderCollisions *collisions = 0,
+	                      VICRenderSpriteSequencer *sprites = 0 ) const;
 
 	// Render only the selected output scanlines. pixels points at storage for
 	// firstRow (not at the start of a full-frame image), so callers can reuse a
 	// small band buffer. The result is byte-for-byte identical to render().
 	VICRenderMode renderRows( const VICRenderState &state, u8 *pixels,
 	                          u32 pitch, u32 firstRow, u32 rowCount,
-	                          VICRenderCollisions *collisions = 0 ) const;
+	                          VICRenderCollisions *collisions = 0,
+	                          VICRenderSpriteSequencer *sprites = 0 ) const;
 };
 
 #endif

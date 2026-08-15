@@ -727,11 +727,11 @@ static bool scpuCheckButton( void *ctx )
 			CScopedLoggingIRQs saveIRQs;
 			if ( !scpuSaveRuntimeBusDiag( runtime ) )
 				s_Logger->Write( "SCPU", LogError,
-							               "K361 could not save post-handoff runtime to %s",
+							               "K362 could not save post-handoff runtime to %s",
 				               SCPU_BUS_DIAG_FILE );
 			else
 				s_Logger->Write( "SCPU", LogNotice,
-							               "K361 saved post-handoff runtime to %s",
+							               "K362 saved post-handoff runtime to %s",
 				               SCPU_BUS_DIAG_FILE );
 		}
 		s_RebootRequested = true;
@@ -764,11 +764,11 @@ static bool scpuCheckButton( void *ctx )
 			CScopedLoggingIRQs saveIRQs;
 			if ( !scpuSaveRuntimeBusDiag( s_ResetDiagnostic.runtime ) )
 				s_Logger->Write( "SCPU", LogError,
-							               "K361 could not save post-handoff runtime to %s",
+							               "K362 could not save post-handoff runtime to %s",
 				               SCPU_BUS_DIAG_FILE );
 			else
 				s_Logger->Write( "SCPU", LogNotice,
-							               "K361 saved post-handoff runtime to %s",
+							               "K362 saved post-handoff runtime to %s",
 				               SCPU_BUS_DIAG_FILE );
 		}
 
@@ -1328,7 +1328,7 @@ static void scpuAppendRuntimeBusDiag( char *dst, u32 capacity, u32 &length,
 		scpuLineChar( dst, capacity, length, '\n' );
 	}
 	scpuLineText( dst, capacity, length,
-	              "post-handoff runtime: build=361 handoff=" );
+	              "post-handoff runtime: build=362 handoff=" );
 	scpuLineDecimal( dst, capacity, length, r.valid ? 1 : 0 );
 	if ( r.valid )
 	{

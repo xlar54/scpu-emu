@@ -205,6 +205,84 @@ static inline bool outputToSource( const VICRenderState &state,
 	return true;
 }
 
+static void prepareSpriteRow( const VICRenderState &state, u32 row,
+	                          VICRenderSpriteSequencer &sequencer,
+	                          VICRenderState &rowState )
+{
+	rowState = state;
+	const u8 enabled = state.vic[ 0x15 ];
+	const bool continuous = sequencer.primed && sequencer.nextRow == row;
+	if ( !continuous )
+	{
+		// A discontinuous band render has no earlier rows from which to derive
+		// the internal DMA state. Seed it from sprites whose static extent
+		// already covers this row; this also preserves sprites with Y < 14 at
+		// the top of the HDMI aperture.
+		sequencer.active = 0;
+		sequencer.expanded = 0;
+		for ( u32 n = 0; n < 8; n++ )
+		{
+			const u8 mask = (u8)( 1u << n );
+			if ( !( enabled & mask ) ) continue;
+			const bool expand = ( state.vic[ 0x17 ] & mask ) != 0;
+			const int top = (int)state.vic[ n * 2 + 1 ] - 14;
+			const int height = expand ? 42 : 21;
+			if ( (int)row < top || (int)row >= top + height ) continue;
+			sequencer.active |= mask;
+			if ( expand ) sequencer.expanded |= mask;
+			sequencer.y[ n ] = state.vic[ n * 2 + 1 ];
+			sequencer.rowsLeft[ n ] = (u8)( top + height - (int)row );
+		}
+		sequencer.primed = true;
+	}
+	else
+	{
+		// Only an inactive sprite can respond to a new Y comparison. Writes to
+		// Y or Y-expand while its DMA is active must not remap the remaining
+		// rows of the sprite already being displayed.
+		for ( u32 n = 0; n < 8; n++ )
+		{
+			const u8 mask = (u8)( 1u << n );
+			if ( sequencer.active & mask || !( enabled & mask ) ) continue;
+			const int top = (int)state.vic[ n * 2 + 1 ] - 14;
+			if ( top != (int)row ) continue;
+			const bool expand = ( state.vic[ 0x17 ] & mask ) != 0;
+			sequencer.active |= mask;
+			if ( expand ) sequencer.expanded |= mask;
+			else          sequencer.expanded &= (u8)~mask;
+			sequencer.y[ n ] = state.vic[ n * 2 + 1 ];
+			sequencer.rowsLeft[ n ] = expand ? 42 : 21;
+		}
+	}
+
+	// Enable, X, colour, priority and multicolour remain live per line. Only
+	// the trigger-owned Y/Y-expand fields come from the sequencer.
+	rowState.vic[ 0x15 ] = enabled & sequencer.active;
+	rowState.vic[ 0x17 ] = (u8)( ( state.vic[ 0x17 ]
+	                              & (u8)~sequencer.active )
+	                            | ( sequencer.expanded
+	                              & sequencer.active ) );
+	for ( u32 n = 0; n < 8; n++ )
+		if ( sequencer.active & ( 1u << n ) )
+			rowState.vic[ n * 2 + 1 ] = sequencer.y[ n ];
+	sequencer.nextRow = (u16)( row + 1 );
+}
+
+static void finishSpriteRow( VICRenderSpriteSequencer &sequencer )
+{
+	for ( u32 n = 0; n < 8; n++ )
+	{
+		const u8 mask = (u8)( 1u << n );
+		if ( !( sequencer.active & mask ) ) continue;
+		if ( sequencer.rowsLeft[ n ] ) sequencer.rowsLeft[ n ]--;
+		if ( !sequencer.rowsLeft[ n ] )
+		{
+			sequencer.active &= (u8)~mask;
+			sequencer.expanded &= (u8)~mask;
+		}
+	}
+}
+
 static void renderSpritesOnRow( const VICRenderState &state,
 	                            const VICRenderContext &context, u8 *dst,
 	                            u32 y, u32 activeLeft, u32 activeRight,
@@ -307,7 +385,8 @@ static void renderSpritesOnRow( const VICRenderState &state,
 
 VICRenderMode CVICRenderer::render( const VICRenderState &state, u8 *pixels,
 	                                u32 pitch,
-	                                VICRenderCollisions *collisions ) const
+	                                VICRenderCollisions *collisions,
+	                                VICRenderSpriteSequencer *sprites ) const
 {
 	if ( collisions )
 	{
@@ -315,13 +394,14 @@ VICRenderMode CVICRenderer::render( const VICRenderState &state, u8 *pixels,
 		collisions->spriteBackground = 0;
 	}
 	return renderRows( state, pixels, pitch, 0, VIC_RENDER_HEIGHT,
-	                   collisions );
+	                   collisions, sprites );
 }
 
 VICRenderMode CVICRenderer::renderRows( const VICRenderState &state,
 	                                    u8 *pixels, u32 pitch,
 	                                    u32 firstRow, u32 rowCount,
-	                                    VICRenderCollisions *collisions ) const
+	                                    VICRenderCollisions *collisions,
+	                                    VICRenderSpriteSequencer *sprites ) const
 {
 	if ( !pixels || pitch < VIC_RENDER_WIDTH ) return VIC_RENDER_BLANK;
 	if ( firstRow >= VIC_RENDER_HEIGHT ) rowCount = 0;
@@ -346,10 +426,18 @@ VICRenderMode CVICRenderer::renderRows( const VICRenderState &state,
 	const u32 endRow = firstRow + rowCount;
 	for ( u32 y = firstRow; y < endRow; y++ )
 	{
+		VICRenderState spriteState;
+		const VICRenderState *rowState = &state;
+		if ( sprites )
+		{
+			prepareSpriteRow( state, y, *sprites, spriteState );
+			rowState = &spriteState;
+		}
 		u8 *dst = pixels + ( y - firstRow ) * pitch;
 		if ( !displayEnabled || y < activeTop || y >= activeBottom )
 		{
 			memset( dst, border, VIC_RENDER_WIDTH );
+			if ( sprites ) finishSpriteRow( *sprites );
 			continue;
 		}
 
@@ -386,8 +474,9 @@ VICRenderMode CVICRenderer::renderRows( const VICRenderState &state,
 					        (u32)( copyRight - copyLeft ) );
 			}
 		}
-		renderSpritesOnRow( state, context, dst, y, activeLeft, activeRight,
+		renderSpritesOnRow( *rowState, context, dst, y, activeLeft, activeRight,
 		                    activeTop, activeBottom, opaqueCells, collisions );
+		if ( sprites ) finishSpriteRow( *sprites );
 	}
 
 	return context.mode;

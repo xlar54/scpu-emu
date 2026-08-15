@@ -270,6 +270,7 @@ void CHDMIDisplay::run()
 void CHDMIDisplay::renderFrame( u64 frameStart, u64 frameTicks )
 {
 	VICRenderCollisions collisions = {};
+	VICRenderSpriteSequencer sprites = {};
 	// A real IEC transfer produces hundreds of CIA2 accesses per millisecond.
 	// K355 held the last complete picture during those frames. Preserve its
 	// protection without freezing the display: an active frame enters a
@@ -368,7 +369,8 @@ void CHDMIDisplay::renderFrame( u64 frameStart, u64 frameTicks )
 			observeSerialActivity();
 			const u64 bandStart = hdmiCounter();
 			m_Renderer.renderRows( state, m_BandPixels, VIC_RENDER_WIDTH,
-			                       first, HDMI_RENDER_BAND_ROWS, &collisions );
+			                       first, HDMI_RENDER_BAND_ROWS, &collisions,
+			                       &sprites );
 			observeSerialActivity();
 			presentRows( m_BandPixels, first, HDMI_RENDER_BAND_ROWS );
 			const u64 bandEnd = hdmiCounter();
