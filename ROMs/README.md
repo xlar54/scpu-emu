@@ -1,6 +1,7 @@
 # ROMs
 
-**No ROM images are committed to this repository, and none are required.**
+**No ROM images are committed to this repository. The four runtime images are
+required on the SD card.**
 
 ## Local development set
 
@@ -19,17 +20,19 @@ cp characters.901225-01.bin chargen.rom
 M=https://www.zimmers.net/anonftp/pub/cbm/firmware/misc/cmd
 curl -sSLO $M/scpu-dos-2.04.bin         # 128K SuperCPU DOS, sha1 6aa529a7b1b6de53e8979e407a77b4d5657727f5
 curl -sSLO $M/scpu-dos-1.4.bin          # 128K, earlier revision, sha1 3422a7735f0f959d990ab39512d8815a5d8eab7a
+cp scpu-dos-2.04.bin scpu.rom
 ```
 
 `Tests/Integration/test_real_kernal.cpp` uses `kernal.rom` and `basic.rom` to
-boot a genuine KERNAL through the CPU core. Those tests report as *skipped*
-rather than failing when the files are absent, so a fresh clone still goes
-green.
+boot a genuine KERNAL through the CPU core. Those host-side tests report as
+*skipped* rather than failing when the local files are absent, so a fresh clone
+still goes green. That development convenience does not change the firmware's
+runtime requirement.
 
-The SuperCPU DOS images are 128KB. `make sdcard` stages **1.4** as
-`SCPU/scpu.rom`, and the firmware maps it at `$F80000`. It is entirely optional: SCPU-EMU boots the machine's own
-KERNAL out of bank 0, so without it `$F80000` simply reads open bus and
-everything still works.
+The SuperCPU DOS images are 128KB. `make sdcard` stages **2.04** as
+`SCPU/scpu.rom`, and the firmware maps it at `$F80000`. The runtime preflight
+requires this exact 128KB image along with the three C64 ROMs. An incomplete set
+is reported on HDMI and leaves the physical machine to boot normally.
 
 **The two images are for different machines.** This is the thing to get right:
 
@@ -61,39 +64,25 @@ start — `SEI`, set up the stack, then enable the hardware registers at `$D07E`
 So both the bootmap window and the `$F80000` mapping have to be right for it to
 get anywhere.
 
-**What this does not do:** it makes the ROM *readable*, not *executed*. A real
-SuperCPU has a "bootmap" mode in which it maps its own ROM over bank 0 at reset
-so that its code runs before the C64's KERNAL. SCPU-EMU does not do that yet,
-deliberately — it changes what happens at power-on, before the machine gets far
-enough to read `scpu.cfg`, so a mistake there could not be backed out from the
-SD card. See [../Docs/roadmap.md](../Docs/roadmap.md).
+`BOOTMAP 1` maps this ROM over bank 0 at reset so its code runs before the C64
+KERNAL, matching the real accelerator. `BOOTMAP 0` remains the SD-card recovery
+setting if that boot path is being diagnosed.
 
-## Default: no files at all
+## Required runtime set
 
-SCPU-EMU snapshots BASIC and KERNAL off the running machine over the bus at
-start-up. After a KERNAL cold start `$01 = $37` leaves both banked in, so while
-holding DMA we can simply read `$A000-$BFFF` and `$E000-$FFFF` into shadow RAM.
-Costs 16384 bus cycles, about 16ms.
-
-This is the recommended path: the KERNAL you run is the one actually fitted to
-your machine.
-
-## Optional files
-
-Place in `SCPU/` on the SD card:
+Place all four files in `SCPU/` on the SD card:
 
 | File | Size | Notes |
 |---|---|---|
-| `kernal.rom` | 8192 | overrides the snapshot |
-| `basic.rom` | 8192 | overrides the snapshot |
-| `chargen.rom` | 4096 | cannot be snapshotted — see below |
-| `scpu.rom` | any power of two up to 512K | the accelerator's own ROM, mapped at `$F80000`. Staged from `scpu-dos-2.04.bin`. |
+| `kernal.rom` | 8192 | C64 KERNAL 901227-03 |
+| `basic.rom` | 8192 | C64 BASIC 901226-01 |
+| `chargen.rom` | 4096 | C64 character ROM 901225-01 |
+| `scpu.rom` | 131072 | SuperCPU DOS 2.04, mapped at `$F80000` |
 
-Use the first three to pin a specific KERNAL revision. `scpu.rom` is the real
-SuperCPU ROM image — SuperCPU DOS, which brings JiffyDOS with it.
-
-A `scpu.rom` that is not a power of two is refused with a warning rather than
-loaded, because a non-power-of-two image cannot mirror cleanly into its region.
+If any file is absent or has an unusable size, startup prints the complete
+required-file checklist, does not assert `/DMA`, and reports `BOOTING NORMALLY`.
+`scpu.rom` is the real SuperCPU ROM image — SuperCPU DOS, which brings JiffyDOS
+with it.
 
 ## Why chargen is different
 
@@ -109,7 +98,11 @@ to copy it into RAM before takeover — see
 
 ## Legal
 
-C64 ROMs are copyrighted by Commodore's successors; the SuperCPU ROM is
-copyrighted by CMD. Dump them from hardware you own, or obtain them from a
-source you are entitled to use. Do not commit them here — `.gitignore` is set up
-to prevent it.
+Commodore ROMs are copyright Commodore International Corporation. The SuperCPU
+ROM is **copyright CMD**. CMD is a trademark of Creative Micro Designs.
+
+Dump them from hardware you own, or obtain them from a source you are entitled
+to use. Do not commit them here — `.gitignore` is set up to prevent it.
+
+The SuperCPU ROM is available from **CoreI64 — Thomas Christoph** at
+<https://www.corei64.com/shop/>.

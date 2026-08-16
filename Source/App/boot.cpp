@@ -4,18 +4,9 @@
 
    Start-up sequence.
 
-   ROM policy. Two paths, in order of preference:
-
-     1. Files on the SD card under SCPU/. Use this to run a real SuperCPU ROM
-        image (which brings JiffyDOS and the SuperCPU DOS with it), or to pin a
-        specific KERNAL revision. No ROM images ship with this project.
-     2. Snapshot the ROMs off the live machine over the bus. Needs no files at
-        all and gives you the KERNAL actually fitted to the computer. The
-        character ROM cannot be captured this way -- exposing it needs CHAREN
-        low and with the 6510 held off the bus nothing can rewrite its port --
-        so chargen stays blank unless supplied as a file. That only matters for
-        programs that read the character set through the CPU; the VIC-II reads
-        it directly on the C64 side and is unaffected.
+   ROM policy: basic.rom, kernal.rom, chargen.rom and the SuperCPU DOS 2.04
+   scpu.rom are required under SCPU/. If any image is missing or unusable, the
+   firmware leaves the Commodore bus untouched so the machine boots normally.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -1727,9 +1718,6 @@ static bool scpuWaitForDiagnosticWindow( CSuperCPU &scpu )
 
 void scpuBootRun( CLogger *logger )
 {
-	logger->Write( "SCPU", LogNotice, "SCPU-EMU starting" );
-	logger->Write( "SCPU", LogNotice, "if you are reading this on HDMI, the Pi"
-	               " firmware and our kernel both loaded correctly" );
 	s_PiThrottledStartupValid = scpuReadPiThrottled( s_PiThrottledStartup );
 	s_PiARMClockStartupValid = scpuReadPiARMClock( s_PiARMClockStartup );
 	scpuLogPiThrottled( logger, "at startup", s_PiThrottledStartupValid,
@@ -1742,32 +1730,42 @@ void scpuBootRun( CLogger *logger )
 	// single blink cannot be mistaken for one.
 	actLED.Blink( 1 );
 
-	// Optional ROM images. Anything not supplied here is taken off the machine.
-	if ( loadROMFile( logger, SCPU_ROM_DIR "basic.rom", romBuffer, C64_BASIC_SIZE ) )
+	// Validate the complete ROM set before touching the Commodore bus. Loading
+	// all four first also lets a missing file produce one clear checklist rather
+	// than failing later with a partly configured accelerator.
+	const bool basicLoaded =
+		loadROMFile( logger, SCPU_ROM_DIR "basic.rom", romBuffer, C64_BASIC_SIZE );
+	if ( basicLoaded )
 		superCPU.setBasicROM( romBuffer );
 
-	if ( loadROMFile( logger, SCPU_ROM_DIR "kernal.rom", romBuffer, C64_KERNAL_SIZE ) )
+	const bool kernalLoaded =
+		loadROMFile( logger, SCPU_ROM_DIR "kernal.rom", romBuffer, C64_KERNAL_SIZE );
+	if ( kernalLoaded )
 		superCPU.setKernalROM( romBuffer );
 
-	if ( loadROMFile( logger, SCPU_ROM_DIR "chargen.rom", romBuffer, C64_CHARROM_SIZE ) )
+	const bool chargenLoaded =
+		loadROMFile( logger, SCPU_ROM_DIR "chargen.rom", romBuffer, C64_CHARROM_SIZE );
+	if ( chargenLoaded )
 		superCPU.setCharROM( romBuffer );
 
-	// The SuperCPU's own ROM -- SuperCPU DOS and its JiffyDOS support. Entirely
-	// optional: SCPU-EMU boots the machine's own KERNAL out of bank 0, so
-	// without this the accelerator still works and $F80000 simply reads open
-	// bus. With it, software that knows about the accelerator can reach the
-	// code CMD shipped.
-	//
-	// Note this only makes the ROM READABLE. It does not map it over bank 0 at
-	// reset -- see the bootmap note in registers.h. Changing what runs at
-	// power-on is a different decision, and one that cannot be backed out from
-	// the config file, because the machine would never get far enough to read
-	// it.
+	const u32 scpuROMSize = loadROMFileSized( logger, SCPU_ROM_DIR "scpu.rom",
+	                                          scpuROMBuffer, SCPU_ROM_MAXSIZE );
+	const bool scpuROMLoaded = scpuROMSize == 128u * 1024u;
+	if ( scpuROMLoaded )
+		superCPU.memoryMap().setROM( scpuROMBuffer, scpuROMSize );
+
+	if ( !basicLoaded || !kernalLoaded || !chargenLoaded || !scpuROMLoaded )
 	{
-		const u32 scpuROMSize = loadROMFileSized( logger, SCPU_ROM_DIR "scpu.rom",
-		                                          scpuROMBuffer, SCPU_ROM_MAXSIZE );
-		if ( scpuROMSize )
-			superCPU.memoryMap().setROM( scpuROMBuffer, scpuROMSize );
+		logger->Write( "SCPU", LogError,
+		               "ERROR: MISSING ROMS IN SCPU DIRECTORY:" );
+		logger->Write( "SCPU", LogNotice, "-> basic.rom (901226-01)" );
+		logger->Write( "SCPU", LogNotice, "-> kernal.rom (901227-03)" );
+		logger->Write( "SCPU", LogNotice, "-> chargen.rom (901225-01)" );
+		logger->Write( "SCPU", LogNotice, "-> scpu.rom (2.04)" );
+		logger->Write( "SCPU", LogNotice, "" );
+		logger->Write( "SCPU", LogNotice, "BOOTING NORMALLY" );
+		radUnmountFileSystem();
+		return;
 	}
 
 	// From here on the SD card is not touched again: the FAT driver takes
@@ -1919,6 +1917,7 @@ void scpuBootRun( CLogger *logger )
 	// live. Logging is bought back the other way instead -- CScopedLoggingIRQs
 	// unmasks around individual log writes, which happen between bus
 	// operations, never inside one.
+	logger->Write( "SCPU", LogNotice, "READY." );
 	DisableIRQs();
 
 	if ( !superCPU.init( &radBus, core, SCPU_SIMM_16MB, (u8)cfgREUSize ) )

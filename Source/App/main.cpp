@@ -46,6 +46,7 @@
 #include "../Bus/RAD/gpio_defs.h"
 #include "../Bus/RAD/c128_refresh.h"
 #include "../Common/helpers.h"
+#include "../Common/version.h"
 #include "boot.h"
 
 CLogger *logger;
@@ -110,6 +111,30 @@ void CSCPUKernel::Run( void )
 	// Run the ARM flat out: every bus access is timed against the cycle
 	// counter, and a throttled clock would move all the timing constants.
 	m_CPUThrottle.SetSpeed( CPUSpeedMaximum );
+
+	// This deliberately precedes even the SD-card mount. If startup fails, the
+	// identity and licensing context are still the first project text visible
+	// on the HDMI console.
+	logger->Write( "SCPU", LogNotice, "SuperCPU Emulator - Build #%s",
+	               SCPU_EMULATOR_BUILD );
+	logger->Write( "SCPU", LogNotice, "" );
+	logger->Write( "SCPU", LogNotice, "Author: Scott Hutter / xlar54" );
+	logger->Write( "SCPU", LogNotice, "https://github.com/xlar54/scpu-emu" );
+	logger->Write( "SCPU", LogNotice, "" );
+	logger->Write( "SCPU", LogNotice,
+	               "RAD REU developed by Carsten Dachsbacher" );
+	logger->Write( "SCPU", LogNotice, "https://github.com/frntc/RAD" );
+	logger->Write( "SCPU", LogNotice, "" );
+	logger->Write( "SCPU", LogNotice,
+	               "Portions of this project are based on source code from the "
+	               "VICE Team (VICE Commodore Emulator) and are distributed "
+	               "under the terms of the GNU General Public License (GPL)." );
+	logger->Write( "SCPU", LogNotice, "" );
+	logger->Write( "SCPU", LogNotice,
+	               "CMD is a trademark of Creative Micro Designs, Inc." );
+	logger->Write( "SCPU", LogNotice,
+	               "Commodore is a trademark of its respective owner(s)." );
+	logger->Write( "SCPU", LogNotice, "" );
 
 	radMountFileSystem();
 

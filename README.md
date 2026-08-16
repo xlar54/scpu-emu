@@ -42,10 +42,85 @@ See [Docs/build.md](Docs/build.md) for the Circle setup, and
 
 ## ROMs
 
-None ship with this project. SCPU-EMU works with no ROM files at all: it
-snapshots BASIC and KERNAL off the running machine over the bus. Supply files
-only if you want a specific KERNAL revision or a real SuperCPU ROM image. See
+None ship with this project. Firmware startup requires `basic.rom`,
+`kernal.rom`, `chargen.rom`, and the 128KB SuperCPU DOS 2.04 image as
+`scpu.rom` under `SCPU/` on the SD card. If the set is incomplete, the RAD does
+not acquire the bus and the physical Commodore boots normally. See
 [ROMs/README.md](ROMs/README.md).
+
+**The SuperCPU ROM is copyright CMD.** It is not included here and never will
+be. It is available from CoreI64 — Thomas Christoph — at
+<https://www.corei64.com/shop/>.
+
+Commodore ROMs are copyright Commodore International Corporation. CMD is a
+trademark of Creative Micro Designs. Dump ROMs from hardware you own, or obtain
+them from a source you are entitled to use.
+
+## Configuration — `SCPU/scpu.cfg`
+
+The card is configured by a single plain-text file, `SCPU/scpu.cfg`, staged from
+[Config/default.cfg](Config/default.cfg) by `make sdcard`. One `KEY value` per
+line, `#` for comments. The Pi reads it before any emulation starts, so a
+setting always takes effect no matter how badly the emulated machine behaves —
+which is what makes it a safe recovery path.
+
+**`Config/default.cfg` is the authoritative reference.** Every key carries a
+comment there explaining what it does and why its default is what it is. The
+table below covers the settings you would normally choose between; the rest are
+timing and cache parameters that should be left alone unless you are working on
+bus timing itself.
+
+### Machine
+
+| Key | Values | Notes |
+|---|---|---|
+| `JIFFYDOS` | `1` on, `0` off | The virtual replacement for the physical switch on a real SuperCPU. `POKE 53429,128` / `POKE 53429,0` changes it until the Pi reboots. |
+| `REUSIZE` | `1` none, `2` 128K, `3` 256K, `4` 512K, `5` 2MB, `6` 4MB, `7` 16MB | RAM Expansion Unit. 1MB is deliberately absent — selectors are appended, never renumbered, so a card in the field cannot change machine because the table grew. |
+| `CPU_CORE` | `1` 65816, `0` 6502 | `0` is a fallback: everything a normal C64 does still works, but SuperRAM is unreachable because a 6502 cannot name an address above `$FFFF`. Quickest way to find out whether the CPU core is responsible for a regression. |
+| `BOOTMAP` | `1` on, `0` off | Runs the SuperCPU ROM at reset. Firmware startup requires the 128KB SuperCPU DOS 2.04 image at `SCPU/scpu.rom`. **If the machine does not boot, set this to 0.** |
+| `C128_MODE` | `0` auto, `1` force C64 path, `2` force native C128 | `2` is experimental. On a C128 the physical machine type and the operating mode are different things, and `$0001` is internal to the 8502 so a DMA master cannot read it. |
+| `BOOT_ANIMATION` | `1` on, `0` faithful | `1` runs the C64 startup animation that SuperCPU DOS 2.04 carries but skips. A deliberate one-byte deviation from strict fidelity. |
+
+### Video
+
+`VIDEO_MODE` selects what the **Pi's HDMI output** shows. It does not change how
+the C64's own screen is driven — the physical VIC-II does that in every mode.
+
+| Value | HDMI output |
+|---|---|
+| `0` | Firmware text console. The safe baseline; the runtime path is unchanged. |
+| `1` | The VIC-II picture, rendered by the Pi from its memory shadow. |
+| `2` | C128 VDC picture. Reserved for future native C128 support. |
+
+> **`VIDEO_MODE 1` is experimental.** The Pi has to reconstruct the picture from
+> its shadow while simultaneously meeting the C64's bus timing, and the two
+> compete for the same scarce resource. Because of those timing and bandwidth
+> limits it may not give the output you expect — expect artefacts, missing
+> updates, or reduced fidelity on demanding software. `VIDEO_MODE 0` is the
+> baseline to fall back to, and the mode to use when diagnosing anything else.
+
+### Display mirroring
+
+The Pi's shadow RAM is authoritative and physical DRAM is write-only, existing
+purely so the VIC-II has something to fetch. These control how much of that
+shadow gets pushed back out, and when.
+
+| Key | Default | Notes |
+|---|---|---|
+| `MIRROR_DISPLAY_BYTES` | `1024` | Visible-display delivery allowance, roughly 8KB/frame, spread over 128 points so no single pause is long. `0` restores strict border-only mirroring. |
+| `MIRROR_D000_RELOCATE` | `1` | Translates sprite shape pointers that land under `$D000-$DFFF`, which is DRAM to the VIC but I/O to any bus master and therefore unreachable. Without it, 3D Pool/SCPU's balls alternate between correct and garbage at frame rate. |
+| `DISPLAY_SCRUB` | `0` | Targeted repair for sparse stored-data changes on bitmap screens. Text and charset modes are deliberately excluded. Leave disabled until bitmap-only hardware trials validate it. |
+| `VECTOR_REROUTE` | `1` | Fetches interrupt vectors from the accelerator's ROM window under the conditions VICE models as `scpu64_interrupt_reroute()`. Ordinary C64 operation in emulation mode is unaffected. |
+
+### Timing and caching
+
+`IO_STRETCH`, the `WAIT_*` family and the `CACHING_*` family describe the bus
+protocol and the Pi's cache behaviour. These are the values the whole design
+rests on, and a wrong one produces symptoms — phantom keypresses, half
+directories, corrupted loads — that look nothing like a timing problem. Read the
+comments in `Config/default.cfg` and
+[Docs/SuperCPU64/timing-notes.md](Docs/SuperCPU64/timing-notes.md) before
+changing any of them.
 
 ## Third-party dependencies
 
