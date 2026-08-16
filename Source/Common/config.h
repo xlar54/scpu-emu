@@ -29,7 +29,7 @@
 #define _config_h
 
 
-#define TIMING_NAMES 42
+#define TIMING_NAMES 43
 const char timingNames[TIMING_NAMES][32] = {
 	"WAIT_FOR_SIGNALS", 
 	"WAIT_CYCLE_READ", 
@@ -135,7 +135,12 @@ const char timingNames[TIMING_NAMES][32] = {
 	// Selects the eventual HDMI presentation source. This first-stage parser
 	// deliberately does not alter runtime behaviour; mode 0 remains the exact
 	// master-branch text-console path until the renderer lands separately.
-	"VIDEO_MODE"
+	"VIDEO_MODE",
+	// Size of the emulated RAM Expansion Unit. A SELECTOR, not a size:
+	// 1 none, 2 128K, 3 256K, 4 512K, 5 2MB, 6 4MB, 7 16MB. 1 rather than
+	// 0 means "no REU" so a missing or mistyped key is distinguishable
+	// from a deliberate off. See Source/REU/reu.h.
+	"REUSIZE"
 };
 
 // Which CPU core boot.cpp should install. Set from CPU_CORE in the config file;
@@ -202,6 +207,11 @@ extern int cfgDisplayScrubPeriodS;
 // What the Pi's HDMI output will show. Stage 1 only parses and validates this
 // value; no runtime path consumes it yet.
 extern int cfgVideoMode;
+
+// Emulated REU size, as a REUSIZE_* selector from Source/REU/reu.h.
+// Defaults to "no REU fitted", so an unconfigured card behaves exactly as
+// it did before the unit existed.
+extern int cfgREUSize;
 
 #define SCPU_CFG_VIDEO_CONSOLE  0
 #define SCPU_CFG_VIDEO_VICII    1

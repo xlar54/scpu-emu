@@ -30,6 +30,7 @@
 #include <circle/util.h>
 #include "../Bus/RAD/lowlevel_arm64.h"
 #include "config.h"
+#include "../REU/reu.h"
 #include "helpers.h"
 
 int atoi( char* str )
@@ -100,6 +101,7 @@ int cfgDisplayScrub = 0;
 int cfgDisplayScrubMask = 1;
 int cfgDisplayScrubPeriodS = 0;
 int cfgVideoMode = SCPU_CFG_VIDEO_DEFAULT;
+int cfgREUSize = REUSIZE_NONE;
 
 char cfg[ 65536 ];
 
@@ -129,6 +131,7 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	cfgBusHaltAfterS = 0;
 	cfgBusAccessSentinel = 0;
 	cfgDisplayScrub = 0;
+	cfgREUSize = REUSIZE_NONE;
 	cfgDisplayScrubMask = 1;
 	cfgDisplayScrubPeriodS = 0;
 	cfgVideoMode = SCPU_CFG_VIDEO_DEFAULT;
@@ -158,6 +161,7 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	bool displayScrubMaskSeen = false;
 	bool displayScrubPeriodSeen = false;
 	bool videoModeSeen = false;
+	bool reuSizeSeen = false;
 
 	while ( *cfgPos != 0 )
 	{
@@ -196,6 +200,7 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 						if ( i == 39 ) displayScrubMaskSeen = true;
 						if ( i == 40 ) displayScrubPeriodSeen = true;
 						if ( i == 41 ) videoModeSeen = true;
+						if ( i == 42 ) reuSizeSeen = true;
 						while ( *ptr == '\t' || *ptr == ' ' ) ptr++;
 					#ifdef DEBUG_OUT
 						logger->Write( "RaspiMenu", LogNotice, "  %s >%d< (%s)", timingNames[ i ], timingValues[ i ], ptr );
@@ -317,6 +322,16 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 		if ( cfgVideoMode < SCPU_CFG_VIDEO_CONSOLE
 		     || cfgVideoMode > SCPU_CFG_VIDEO_VDC )
 			cfgVideoMode = SCPU_CFG_VIDEO_DEFAULT;
+	}
+
+	// An out-of-range REUSIZE selects no unit rather than the nearest valid
+	// size. A machine that silently has a DIFFERENT REU from the one asked for
+	// is harder to diagnose than one that plainly has none.
+	if ( reuSizeSeen )
+	{
+		cfgREUSize = timingValues[ 42 ];
+		if ( cfgREUSize < REUSIZE_NONE || cfgREUSize > REUSIZE_16MB )
+			cfgREUSize = REUSIZE_NONE;
 	}
 
 	return 1;

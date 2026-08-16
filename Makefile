@@ -38,7 +38,8 @@ HOST_SRCS = \
 	Source/SuperCPU/memory_map.cpp \
 	Source/Bus/Host/host_bus.cpp \
 	Source/Video/vic_raster.cpp \
-	Source/Video/vic_renderer.cpp
+	Source/Video/vic_renderer.cpp \
+	Source/REU/reu.cpp
 
 TEST_SRCS = \
 	Tests/test_main.cpp \
@@ -52,7 +53,8 @@ TEST_SRCS = \
 	Tests/Integration/test_kernal_boot.cpp \
 	Tests/Integration/test_real_kernal.cpp \
 	Tests/Integration/test_kernal_65816.cpp \
-	Tests/SuperCPU/test_memory_map.cpp
+	Tests/SuperCPU/test_memory_map.cpp \
+	Tests/REU/test_reu.cpp
 
 HOST_OBJS = $(HOST_SRCS:%.cpp=$(BUILDDIR)/%.o)
 TEST_OBJS = $(TEST_SRCS:%.cpp=$(BUILDDIR)/%.o)
