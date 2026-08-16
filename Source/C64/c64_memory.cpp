@@ -984,11 +984,10 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 			noteMirrorWrite();
 		m_RAM[ a ] = value;
 
-		// Active-screen sprite pointers: same handling as writeFast, because it
-		// is literally the same function. This path used to carry its own copy
-		// of the logic and had already fallen behind.
-		if ( ( (u32)a & ~7u ) == m_SpritePtrBase )
-			noteSpritePointerWrite( a, old, value );
+		// Same side effects as writeFast, because it is literally the same
+		// function. This path used to carry its own copy and had already
+		// fallen behind once.
+		noteRAMWriteSideEffects( a, old, value );
 	}
 }
 

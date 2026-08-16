@@ -77,6 +77,7 @@ static u32 s_HeartbeatPCHigh = 0;
 static u32 s_HeartbeatStalledRuns = 0;
 static bool s_HeartbeatDumped = false;
 static u32 s_DisplayScrubPhaseGeneration = 0;
+static u32 s_ResyncDiagnosticGeneration = 0;
 // Native-C128 bring-up may execute garbage continuously rather than settling
 // into a tight loop, so the ordinary stall detector never fires. Keep a small
 // sampled PC history and force one bounded capture early in startup.
@@ -910,6 +911,26 @@ static bool scpuCheckButton( void *ctx )
 		               "display scrub phase: %s; repaired=%llu (physical sampling disabled)",
 		               scpu->displayScrubPhaseOn() ? "ON" : "OFF",
 		               (unsigned long long)wb.m_DisplayScrubBytes );
+	}
+
+	// K381 is deliberately self-timed so one hardware run contains both the
+	// no-repair and restored-repair observations. These messages occur only
+	// after IEC is quiet; logging must never lengthen a live serial handshake.
+	if ( scpu
+	     && scpu->resyncDiagnosticGeneration() != s_ResyncDiagnosticGeneration )
+	{
+		s_ResyncDiagnosticGeneration = scpu->resyncDiagnosticGeneration();
+		CScopedLoggingIRQs irqs;
+		if ( scpu->resyncDiagnosticPhase() == SCPU_RESYNC_DIAG_HOLD )
+			s_Logger->Write( "SCPU", LogNotice,
+			               "K381: IEC quiet and dirty queue drained; background resync HELD for about 10 seconds" );
+		else if ( scpu->resyncDiagnosticPhase() == SCPU_RESYNC_DIAG_REPAIRING )
+			s_Logger->Write( "SCPU", LogNotice,
+			               "K381: targeted active-display rewrite STARTED; shadow changed during hold=%s",
+			               scpu->resyncDiagnosticShadowChanged() ? "YES -- RUN CONFOUNDED" : "no" );
+		else if ( scpu->resyncDiagnosticPhase() == SCPU_RESYNC_DIAG_COMPLETE )
+			s_Logger->Write( "SCPU", LogNotice,
+			               "K381: targeted active-display rewrite COMPLETE" );
 	}
 
 	// --- heartbeat and stall self-detection ---------------------------------
@@ -1900,7 +1921,7 @@ void scpuBootRun( CLogger *logger )
 	// operations, never inside one.
 	DisableIRQs();
 
-	if ( !superCPU.init( &radBus, core, SCPU_SIMM_16MB ) )
+	if ( !superCPU.init( &radBus, core, SCPU_SIMM_16MB, (u8)cfgREUSize ) )
 	{
 		// init() releases /DMA on every failure path, so the C64 is running its
 		// own CPU again and is usable -- it simply has no accelerator.

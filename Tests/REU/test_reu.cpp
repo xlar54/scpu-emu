@@ -411,3 +411,218 @@ TEST( reu_reset_clears_registers_but_keeps_expansion_contents )
 	reu.read( 0xDF02, lo ); reu.read( 0xDF03, hi );
 	CHECK_EQ( (u16)( lo | ( hi << 8 ) ), (u16)0 );
 }
+
+// --- integration: is the unit actually REACHABLE through the machine? -------
+// The tests above prove the REU's logic in isolation. They would all still pass
+// if nothing ever routed an access to it. These prove the wiring, which is the
+// half that silently rots -- and the half that had no coverage at all when the
+// under-I/O fix landed.
+
+#include "../../Source/REU/reu_wiring.h"
+
+namespace {
+
+// Every optional IIOInterceptor method has a harmless default. A forwarding
+// class that forgets one therefore compiles and silently changes machine
+// policy. Distinctive answers here make the chain's complete contract testable.
+struct PolicyPrimary : public IIOInterceptor
+{
+	bool dos;
+	u16 lastWriteAddress;
+	u8 lastWriteValue;
+
+	PolicyPrimary() : dos( false ), lastWriteAddress( 0 ), lastWriteValue( 0 ) {}
+
+	bool ioRead( u16 addr, u8 &value ) override
+	{
+		if ( addr != 0xDEAD ) return false;
+		value = 0xA5;
+		return true;
+	}
+	bool ioWrite( u16 addr, u8 value ) override
+	{
+		lastWriteAddress = addr;
+		lastWriteValue = value;
+		return addr == 0xBEEF;
+	}
+	bool ioAccessNeedsStretch( u16 addr, bool write ) const override
+		{ return addr == 0x1111 && write; }
+	bool ioAccessUsesWriteBuffer( u16 addr, bool write ) const override
+		{ return addr == 0x2222 && write; }
+	bool dosExtensionEnabled() const override { return dos; }
+	const bool *dosExtensionStatePtr() const override { return &dos; }
+	bool simmWindowWritesEnabled() const override { return false; }
+	bool interruptRerouteRequested() const override { return true; }
+};
+
+} // namespace
+
+TEST( reu_interceptor_chain_forwards_the_complete_primary_contract )
+{
+	PolicyPrimary primary;
+	CIOInterceptorChain chain;
+	chain.attach( &primary, 0 );
+
+	u8 value = 0;
+	CHECK( chain.ioRead( 0xDEAD, value ) );
+	CHECK_EQ( value, (u8)0xA5 );
+	CHECK( chain.ioWrite( 0xBEEF, 0x6C ) );
+	CHECK_EQ( primary.lastWriteAddress, (u16)0xBEEF );
+	CHECK_EQ( primary.lastWriteValue, (u8)0x6C );
+	CHECK( chain.ioAccessNeedsStretch( 0x1111, true ) );
+	CHECK( !chain.ioAccessNeedsStretch( 0x1111, false ) );
+	CHECK( chain.ioAccessUsesWriteBuffer( 0x2222, true ) );
+	CHECK( !chain.ioAccessUsesWriteBuffer( 0x2222, false ) );
+	CHECK( !chain.dosExtensionEnabled() );
+	CHECK_EQ( chain.dosExtensionStatePtr(), &primary.dos );
+	CHECK( !chain.simmWindowWritesEnabled() );
+	CHECK( chain.interruptRerouteRequested() );
+
+	primary.dos = true;
+	CHECK( chain.dosExtensionEnabled() );
+	CHECK( *chain.dosExtensionStatePtr() );
+}
+
+TEST( reu_chain_preserves_the_cached_live_dos_extension_mapping )
+{
+	CC64Memory mem;
+	PolicyPrimary primary;
+	CIOInterceptorChain chain;
+	u8 bank1[ 0x10000 ];
+	std::memset( bank1, 0, sizeof bank1 );
+
+	chain.attach( &primary, 0 );
+	mem.setIOInterceptor( &chain );
+	mem.setROMShadow( bank1 );
+	mem.reset();
+	mem.m_RAM[ 0x1234 ] = 0x11;
+	bank1[ 0x1234 ] = 0xA1;
+
+	CHECK_EQ( mem.readFast( 0x1234 ), (u8)0x11 );
+	primary.dos = true;
+	CHECK_EQ( mem.readFast( 0x1234 ), (u8)0xA1 );
+	primary.dos = false;
+	CHECK_EQ( mem.readFast( 0x1234 ), (u8)0x11 );
+}
+
+TEST( reu_is_reachable_through_the_memory_layer )
+{
+	CC64Memory mem;
+	CREU reu;
+	CREUInterceptor reuIO;
+	CIOInterceptorChain chain;
+	FakeHost host;
+
+	reu.init( REUSIZE_512K );
+	reu.attachHost( &host );
+	reuIO.attach( &reu );
+	// No primary here: this is specifically asking whether the chain delivers
+	// to the secondary, which is the slot the REU occupies in the machine.
+	chain.attach( 0, &reuIO );
+	mem.setIOInterceptor( &chain );
+
+	// Reading the status register through ordinary guest memory access must
+	// reach the unit. The size bit is the tell: nothing else in the machine
+	// would answer $DF00 with it set.
+	const u8 status = mem.read8( 0xDF00 );
+	CHECK( ( status & 0x10 ) != 0 );
+}
+
+TEST( reu_transfer_driven_entirely_through_guest_writes )
+{
+	CC64Memory mem;
+	CREU reu;
+	CREUInterceptor reuIO;
+	CIOInterceptorChain chain;
+	FakeHost host;
+
+	reu.init( REUSIZE_512K );
+	reu.attachHost( &host );
+	reuIO.attach( &reu );
+	chain.attach( 0, &reuIO );
+	mem.setIOInterceptor( &chain );
+
+	for ( u32 i = 0; i < 32; i++ ) host.mem[ 0x0C00 + i ] = (u8)( i + 0x40 );
+
+	// Program and fire using nothing but guest-visible stores, exactly as a
+	// program on the machine would.
+	mem.write8( 0xDF02, 0x00 );
+	mem.write8( 0xDF03, 0x0C );
+	mem.write8( 0xDF04, 0x00 );
+	mem.write8( 0xDF05, 0x08 );
+	mem.write8( 0xDF06, 0x00 );
+	mem.write8( 0xDF07, 32 );
+	mem.write8( 0xDF08, 0 );
+	mem.write8( 0xDF01, 0x90 );		// EXECUTE | no-$FF00 | stash
+
+	CHECK_EQ( reu.transfers(), 1u );
+	for ( u32 i = 0; i < 32; i++ )
+		CHECK_EQ( reu.peek( 0x000800 + i ), (u8)( i + 0x40 ) );
+}
+
+TEST( reu_ff00_trigger_arrives_through_a_plain_ram_write )
+{
+	// $FF00 is ordinary RAM, so the trigger cannot come through the I/O
+	// interceptor. It has to ride the RAM write path, and this proves the hook
+	// is on it -- in the shared helper both write paths call, so writeFast and
+	// write8 cannot drift apart over it the way they did over sprite pointers.
+	CC64Memory mem;
+	CREU reu;
+	CREUInterceptor reuIO;
+	CIOInterceptorChain chain;
+	FakeHost host;
+
+	reu.init( REUSIZE_512K );
+	reu.attachHost( &host );
+	reuIO.attach( &reu );
+	chain.attach( 0, &reuIO );
+	mem.setIOInterceptor( &chain );
+
+	struct Trampoline
+	{
+		static void fire( void *ctx ) { ( (CREU *)ctx )->noteFF00Write(); }
+	};
+	mem.setFF00Hook( &Trampoline::fire, &reu );
+
+	host.mem[ 0x0D00 ] = 0x99;
+	mem.write8( 0xDF02, 0x00 );
+	mem.write8( 0xDF03, 0x0D );
+	mem.write8( 0xDF04, 0x00 );
+	mem.write8( 0xDF05, 0x0C );
+	mem.write8( 0xDF06, 0x00 );
+	mem.write8( 0xDF07, 1 );
+	mem.write8( 0xDF08, 0 );
+	mem.write8( 0xDF01, 0x80 );		// EXECUTE, waiting for $FF00
+
+	CHECK_EQ( reu.transfers(), 0u );
+	mem.write8( 0xFF00, 0x00 );		// the trigger
+	CHECK_EQ( reu.transfers(), 1u );
+	CHECK_EQ( reu.peek( 0x000C00 ), (u8)0x99 );
+
+	// And again with a value that changes nothing: the REU triggers on the bus
+	// cycle, not on a value change, so same-value elimination must not swallow
+	// it. This is the case a naive implementation gets wrong.
+	mem.write8( 0xDF01, 0x80 );
+	mem.write8( 0xFF00, 0x00 );		// identical byte, still a trigger
+	CHECK_EQ( reu.transfers(), 2u );
+}
+
+TEST( reu_absent_leaves_the_io_window_exactly_as_it_was )
+{
+	// An unconfigured machine must behave as it did before the unit existed --
+	// the chain still stands, but every REU access declines and falls through.
+	CC64Memory mem;
+	CREU reu;
+	CREUInterceptor reuIO;
+	CIOInterceptorChain chain;
+
+	reu.init( REUSIZE_NONE );
+	reuIO.attach( &reu );
+	chain.attach( 0, &reuIO );
+	mem.setIOInterceptor( &chain );
+
+	u8 v = 0x5A;
+	CHECK( !chain.ioRead( 0xDF00, v ) );
+	CHECK_EQ( v, (u8)0x5A );
+	CHECK( !chain.ioWrite( 0xDF01, 0x90 ) );
+}

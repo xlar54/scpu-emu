@@ -86,6 +86,7 @@ void radResetMachine()
 }
 
 static u8 takeoverROM[ 256 ];
+static int takeoverResetHold = 1 << 20;
 
 static const u8 takeoverROMPrefix[] = {
 	0x78,                         // SEI
@@ -99,6 +100,14 @@ static const u8 takeoverROMPrefix[] = {
 
 void radPrepareUltimaxTakeover( u8 physicalPort )
 {
+	// The all-RAM takeover is a second reset-time Ultimax transition after the
+	// machine has already been acquired once.  A real C64 sees the original
+	// setup interval reliably, but the 64U's synchronous cartridge-port logic
+	// can miss /GAME before RESET is released.  Give only this $01=$34
+	// transition more setup time; the normal acquisition path remains byte-for-
+	// byte and timing-for-timing unchanged.
+	takeoverResetHold = physicalPort == 0x34 ? ( 1 << 23 ) : ( 1 << 20 );
+
 	// Materialise the exact 256-byte image generated from upstream RAD's
 	// C64Side/ultimax_memcfg.a.  Keeping a complete table also keeps the timed
 	// response loop identical to startWithUltimax(): one indexed byte load.
@@ -140,7 +149,7 @@ bool radHijackCPUWithUltimax()
 		CLR_GPIO( bRESET_OUT | bGAME_OUT | bDMA_OUT );
 		CLR_GPIO( bMPLEX_SEL );
 
-		DELAY( 1 << 20 );
+		DELAY( takeoverResetHold );
 
 		WAIT_FOR_CPU_HALFCYCLE
 		BEGIN_CYCLE_COUNTER

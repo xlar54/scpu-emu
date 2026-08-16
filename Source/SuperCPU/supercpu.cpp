@@ -86,7 +86,15 @@ void CSuperCPU::enablePhysicalMirror()
 	}
 }
 
-bool CSuperCPU::init( IC64Bus *bus, SCPUCoreType core, u32 simmMB )
+// $FF00 is ordinary RAM, so the trigger cannot arrive through the I/O
+// interceptor. The memory layer calls this on every write to that address.
+void CSuperCPU::reuFF00Trampoline( void *context )
+{
+	( (CSuperCPU *)context )->m_REU.noteFF00Write();
+}
+
+bool CSuperCPU::init( IC64Bus *bus, SCPUCoreType core, u32 simmMB,
+                      u8 reuSize )
 {
 	m_Bus = bus;
 
@@ -97,7 +105,17 @@ bool CSuperCPU::init( IC64Bus *bus, SCPUCoreType core, u32 simmMB )
 	m_Memory.enablePostedWriteTiming( false );
 	m_WriteBuffer.setDeliveryEnabled( true );
 	m_Memory.setMirrorSink( &m_WriteBuffer );
-	m_Memory.setIOInterceptor( &m_Registers );
+	// The REU shares the memory layer's single I/O interceptor with the
+	// accelerator registers. Attach the primary BEFORE installing the chain:
+	// setIOInterceptor() caches the primary's live DOS-extension state pointer.
+	m_REU.init( reuSize );
+	m_REUHost.attach( &m_Memory );
+	m_REU.attachHost( &m_REUHost );
+	m_REUInterceptor.attach( &m_REU );
+	m_IOChain.attach( &m_Registers, &m_REUInterceptor );
+	m_Memory.setIOInterceptor( &m_IOChain );
+	if ( m_REU.present() )
+		m_Memory.setFF00Hook( &CSuperCPU::reuFF00Trampoline, this );
 
 	m_WriteBuffer.attach( m_Bus, m_Memory.m_RAM );
 	m_WriteBuffer.attachHotShapeBlocks( m_Memory.m_HotShapeBlocks,
@@ -250,6 +268,13 @@ void CSuperCPU::reset()
 	m_DisplayScrubPhaseOn = m_DisplayScrubEnabled
 	                      && m_DisplayScrubPeriodSeconds == 0;
 	m_DisplayScrubBitmapSeen = false;
+	m_ResyncDiagnosticAwaitingDrain = false;
+	m_ResyncDiagnosticHolding = false;
+	m_ResyncDiagnosticPhase = SCPU_RESYNC_DIAG_IDLE;
+	m_ResyncDiagnosticFramesRemaining = 0;
+	m_ResyncDiagnosticStartHash = 0;
+	m_ResyncDiagnosticShadowChanged = false;
+	m_ResyncDiagnosticRepairCallsRemaining = 0;
 	m_Memory.reset();
 
 	// Bootmap, before the registers are reset -- CSuperCPURegisters::reset()
@@ -306,6 +331,112 @@ void CSuperCPU::reset()
 
 	if ( m_CPU )
 		m_CPU->reset();
+}
+
+u32 CSuperCPU::displayShadowHash() const
+{
+	// This is not guest-visible and never touches the physical bus. A change
+	// during the hold means ordinary guest writes could have repaired the
+	// physical picture and the visual A/B result is therefore confounded.
+	const u8 *ram = m_Memory.ramShadow();
+	u32 hash = 2166136261u;
+	const u32 bases[ 2 ] = {
+		m_Memory.activeScreenBase(), m_Memory.activeBitmapBase()
+	};
+	const u32 lengths[ 2 ] = { 1024, 8192 };
+	for ( u32 region = 0; region < 2; region++ )
+	{
+		if ( bases[ region ] >= 0x10000 ) continue;
+		for ( u32 i = 0; i < lengths[ region ]; i++ )
+			hash = ( hash ^ ram[ ( bases[ region ] + i ) & 0xFFFF ] )
+			     * 16777619u;
+	}
+	return hash;
+}
+
+void CSuperCPU::updateResyncDiagnostic( bool sawIEC, C64VideoStandard video )
+{
+	if ( sawIEC )
+	{
+		// A later serial burst restarts the observation window. Background resync
+		// is already gated while IEC is live, so no transition log is needed yet.
+		m_ResyncDiagnosticAwaitingDrain = true;
+		m_ResyncDiagnosticHolding = false;
+		m_ResyncDiagnosticPhase = SCPU_RESYNC_DIAG_IDLE;
+		m_ResyncDiagnosticFramesRemaining = 0;
+		m_ResyncDiagnosticShadowChanged = false;
+		m_ResyncDiagnosticRepairCallsRemaining = 0;
+		return;
+	}
+
+	if ( m_ResyncDiagnosticAwaitingDrain )
+	{
+		// Let ordinary dirty delivery finish first. The static picture under test
+		// must be fully settled before withholding only the unconditional sweep.
+		if ( !m_WriteBuffer.empty() ) return;
+		m_ResyncDiagnosticAwaitingDrain = false;
+		m_ResyncDiagnosticHolding = true;
+		m_ResyncDiagnosticPhase = SCPU_RESYNC_DIAG_HOLD;
+#ifdef SCPU_HOST_BUILD
+		m_ResyncDiagnosticFramesRemaining = 2;
+#else
+		m_ResyncDiagnosticFramesRemaining = video == VIDEO_PAL ? 500 : 600;
+#endif
+		m_ResyncDiagnosticStartHash = displayShadowHash();
+		m_ResyncDiagnosticShadowChanged = false;
+		m_ResyncDiagnosticRepairCallsRemaining = 0;
+		m_ResyncDiagnosticGeneration++;
+		return;
+	}
+
+	if ( m_ResyncDiagnosticHolding )
+	{
+		if ( m_ResyncDiagnosticFramesRemaining )
+			m_ResyncDiagnosticFramesRemaining--;
+		if ( m_ResyncDiagnosticFramesRemaining ) return;
+
+		m_ResyncDiagnosticHolding = false;
+		m_ResyncDiagnosticShadowChanged =
+			displayShadowHash() != m_ResyncDiagnosticStartHash;
+
+		const u32 bitmap = m_Memory.activeBitmapBase();
+		const bool bitmapActive = bitmap < 0x10000;
+		const u32 graphics = bitmapActive
+		                   ? bitmap : m_Memory.activeCharsetBase();
+		const u32 graphicsLength = graphics < 0x10000
+		                         ? ( bitmapActive ? 8192u : 2048u ) : 0u;
+		// resyncDisplayed() round-robins one 1K matrix slot and one slot
+		// per 1K of graphics. Sixteen 64-byte visits cover each slot.
+		m_ResyncDiagnosticRepairCallsRemaining =
+			16u * ( 1u + graphicsLength / 1024u );
+		m_ResyncDiagnosticPhase = SCPU_RESYNC_DIAG_REPAIRING;
+		m_ResyncDiagnosticGeneration++;
+	}
+}
+
+void CSuperCPU::runResyncDiagnosticRepair( const C64Signals &sig )
+{
+	if ( m_ResyncDiagnosticPhase != SCPU_RESYNC_DIAG_REPAIRING
+	     || !m_ResyncDiagnosticRepairCallsRemaining
+	     || m_MirrorHalted || m_Memory.iecBusActive()
+	     || !m_WriteBuffer.empty() )
+		return;
+
+	const u16 line = m_Bus->rasterLine();
+	if ( !c64RasterIsSafeForBulkTransfer( sig.video, line ) ) return;
+
+	const u32 bitmap = m_Memory.activeBitmapBase();
+	const bool bitmapActive = bitmap < 0x10000;
+	const u32 graphics = bitmapActive ? bitmap : m_Memory.activeCharsetBase();
+	const u32 graphicsLength = graphics < 0x10000
+	                         ? ( bitmapActive ? 8192u : 2048u ) : 0u;
+	m_WriteBuffer.resyncDisplayed( m_Memory.activeScreenBase(), graphics,
+	                               graphicsLength, 64, false, true, false );
+	if ( --m_ResyncDiagnosticRepairCallsRemaining == 0 )
+	{
+		m_ResyncDiagnosticPhase = SCPU_RESYNC_DIAG_COMPLETE;
+		m_ResyncDiagnosticGeneration++;
+	}
 }
 
 void CSuperCPU::updateDisplayScrubPhase( bool bitmapActive )
@@ -682,6 +813,7 @@ u64 CSuperCPU::runFrame()
 	u64 ticksUsed = repaid;
 	m_FrameTickDebt -= repaid;
 	u64 executed = 0;
+	bool sawIECThisFrame = m_Memory.iecBusActive();
 
 	// The frame is run in slices rather than one call, for two reasons. A
 	// speed change breaks run() so the remainder can be re-budgeted at the new
@@ -726,6 +858,7 @@ u64 CSuperCPU::runFrame()
 		const u64 ran = m_CPU->run( budget );
 		executed += ran;
 		ticksUsed += ran * ticksPerCycle;
+		if ( m_Memory.iecBusActive() ) sawIECThisFrame = true;
 
 		// Opportunistic flush: one raster read. Cold traffic may use its small
 		// display ration; the active screen matrix and hot sprite shapes wait
@@ -774,6 +907,13 @@ u64 CSuperCPU::runFrame()
 			}
 		}
 	}
+
+	// K381: once a serial transfer finishes and its ordinary dirty queue has
+	// drained, hold only the unconditional background rewrite for about ten
+	// seconds. If stored DRAM is corrupt, the VIC picture must remain corrupt
+	// until this hold expires and the unchanged sweep resumes. If the picture
+	// heals during the hold, the serial traffic disturbed fetches only.
+	updateResyncDiagnostic( sawIECThisFrame, sig.video );
 
 	// --- raster-scheduled mirroring ----------------------------------------
 	// Land in the border ON PURPOSE, once per frame.
@@ -833,6 +973,10 @@ u64 CSuperCPU::runFrame()
 			// 512-byte sweep was an otherwise unexplained half-millisecond CPU
 			// pause whenever the ordinary queue happened to empty.
 			if ( m_WriteBuffer.empty()
+			     && !m_ResyncDiagnosticAwaitingDrain
+			     && !m_ResyncDiagnosticHolding
+			     && ( m_ResyncDiagnosticPhase == SCPU_RESYNC_DIAG_IDLE
+			       || m_ResyncDiagnosticPhase == SCPU_RESYNC_DIAG_COMPLETE )
 			     && m_Bus->signals().machine != MACHINE_C128 )
 			{
 				// On a physical C128 the background sweep is not benign: once
@@ -855,6 +999,12 @@ u64 CSuperCPU::runFrame()
 			}
 		}
 	}
+
+	// At the end of the no-repair observation, deliberately rewrite exactly the
+	// active picture from authoritative shadow. This is independent of the old
+	// background sweep's queue-dependent trigger, so K381 always contains a
+	// real repair phase even when the loader leaves no dirty entries behind.
+	runResyncDiagnosticRepair( sig );
 
 	// Pacing is no longer done here. It happens after every instruction in
 	// CC64Memory::tick(), because frame granularity (~20ms) is far too coarse

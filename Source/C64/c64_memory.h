@@ -106,6 +106,13 @@ public:
 
 	void attachBus( IC64Bus *bus ) { m_C64 = bus; }
 	void setMirrorSink( IMirrorSink *sink ) { m_Mirror = sink; }
+	// Called on every write to $FF00, which is how an REU armed for the
+	// $FF00 trigger learns to start. A function pointer rather than an
+	// interface: this sits on the RAM write path, and the REU has no business
+	// appearing in the memory layer's type graph.
+	typedef void ( *FF00Hook )( void *context );
+	void setFF00Hook( FF00Hook hook, void *context )
+		{ m_FF00Hook = hook; m_FF00HookCtx = context; }
 	void enablePostedWriteTiming( bool on )
 	{
 		m_PostedWriteTimingEnable = on;
@@ -302,6 +309,26 @@ public:
 		appendVICLog( (u16)( VIC_LOG_REG_SPRPTR + ( a & 7 ) ), v );
 	}
 
+	// Everything a plain RAM store has to do BESIDES storing.
+	//
+	// Both write paths call this and neither carries its own copy. That is not
+	// tidiness: writeFast and write8 have already drifted apart once, over this
+	// very sprite-pointer handling, and the divergence was invisible until
+	// something multiplexed sprites. One copy, two callers.
+	inline void noteRAMWriteSideEffects( u16 a, u8 old, u8 v )
+	{
+		if ( ( (u32)a & ~7u ) == m_SpritePtrBase )
+			noteSpritePointerWrite( a, old, v );
+
+		// An REU can be armed to begin a transfer on the next write to $FF00.
+		// It triggers on the BUS CYCLE, not on a value change, so this fires
+		// even when the byte is unchanged -- same-value elimination upstream
+		// would otherwise swallow the trigger and the transfer would never
+		// start. The address compare is one predictable instruction and the
+		// hook is null unless a unit is actually fitted.
+		if ( a == 0xFF00 && m_FF00Hook ) m_FF00Hook( m_FF00HookCtx );
+	}
+
 	__attribute__((always_inline)) inline void writeFast( u16 a, u8 v )
 	{
 		if ( dosExtensionMapsBank1( a ) )
@@ -332,8 +359,7 @@ public:
 			// later; coalescing holds the latest value, so re-sending it is
 			// harmless. Same-value rewrites are a no-op on real hardware and
 			// are skipped.
-			if ( ( (u32)a & ~7u ) == m_SpritePtrBase )
-				noteSpritePointerWrite( a, old, v );
+			noteRAMWriteSideEffects( a, old, v );
 			return;
 		}
 		write8( a, v );
@@ -922,6 +948,8 @@ public:
 private:
 
 private:
+	FF00Hook        m_FF00Hook = 0;
+	void           *m_FF00HookCtx = 0;
 	IC64Bus        *m_C64;
 	IMirrorSink    *m_Mirror;
 	IIOInterceptor *m_IO;

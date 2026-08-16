@@ -76,6 +76,12 @@ public:
 		{ return m_Primary ? m_Primary->ioAccessUsesWriteBuffer( a, w ) : false; }
 	bool dosExtensionEnabled() const override
 		{ return m_Primary ? m_Primary->dosExtensionEnabled() : false; }
+	const bool *dosExtensionStatePtr() const override
+		{ return m_Primary ? m_Primary->dosExtensionStatePtr() : 0; }
+	bool simmWindowWritesEnabled() const override
+		{ return m_Primary ? m_Primary->simmWindowWritesEnabled() : true; }
+	bool interruptRerouteRequested() const override
+		{ return m_Primary ? m_Primary->interruptRerouteRequested() : false; }
 
 private:
 	IIOInterceptor *m_Primary;

@@ -34,6 +34,7 @@ OBJS = \
 	SuperCPU/write_buffer.o \
 	SuperCPU/fast_ram.o \
 	SuperCPU/memory_map.o \
+	REU/reu.o \
 	Bus/RAD/rad_bus.o \
 	Bus/RAD/c128_refresh.o \
 	Bus/RAD/cpu_hijack.o \
@@ -88,4 +89,4 @@ SuperCPU/supercpu.o:          CPPFLAGS += -O3
 EXTRACLEAN = App/*.o App/*.d CPU/M6502/*.o CPU/M6502/*.d \
              CPU/W65C816/*.o CPU/W65C816/*.d C64/*.o C64/*.d \
              SuperCPU/*.o SuperCPU/*.d Bus/RAD/*.o Bus/RAD/*.d \
-             Common/*.o Common/*.d Video/*.o Video/*.d
+	             Common/*.o Common/*.d Video/*.o Video/*.d REU/*.o REU/*.d

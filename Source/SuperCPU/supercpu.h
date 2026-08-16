@@ -38,6 +38,7 @@
 #include "../CPU/W65C816/w65c816.h"
 #include "write_buffer.h"
 #include "registers.h"
+#include "../REU/reu_wiring.h"
 #include "fast_ram.h"
 #include "memory_map.h"
 
@@ -58,6 +59,18 @@ enum SCPUC128Mode
 	SCPU_C128_MODE_AUTO = 0,
 	SCPU_C128_MODE_C64,
 	SCPU_C128_MODE_NATIVE
+};
+
+// K381 diagnostic phases. A completed IEC transaction first holds only the
+// unconditional background sweep, then performs a targeted active-display
+// rewrite so the physical VIC picture can distinguish transient fetch noise
+// from stored DRAM corruption in one run.
+enum SCPUResyncDiagnosticPhase
+{
+	SCPU_RESYNC_DIAG_IDLE = 0,
+	SCPU_RESYNC_DIAG_HOLD,
+	SCPU_RESYNC_DIAG_REPAIRING,
+	SCPU_RESYNC_DIAG_COMPLETE
 };
 
 // Mirrored bytes allowed per drain call while the beam is inside the picture.
@@ -81,8 +94,12 @@ public:
 	// simmMB: SuperRAM to fit, in megabytes. 0/1/4/8/16, as the real card
 	// accepts. Reachable only by the 65816 core -- a 6502 has no way to name an
 	// address above $FFFF, so with SCPU_CORE_6502 the SIMM is fitted but idle.
+	// reuSize is a REUSIZE_* selector, not a size. Defaulted so every
+	// existing caller compiles unchanged and gets a machine with no REU --
+	// exactly the behaviour that existed before the unit did.
 	bool init( IC64Bus *bus, SCPUCoreType core = SCPU_CORE_6502,
-	           u32 simmMB = SCPU_SIMM_16MB );
+	           u32 simmMB = SCPU_SIMM_16MB,
+	           u8 reuSize = REUSIZE_NONE );
 
 	// Supply ROM images explicitly. Call before init() to override the images
 	// that would otherwise be snapshotted off the live machine.
@@ -127,6 +144,26 @@ public:
 	bool displayScrubPhaseOn() const { return m_DisplayScrubPhaseOn; }
 	u32 displayScrubPhaseGeneration() const { return m_DisplayScrubPhaseGeneration; }
 	u32 displayScrubPeriodSeconds() const { return m_DisplayScrubPeriodSeconds; }
+	SCPUResyncDiagnosticPhase resyncDiagnosticPhase() const
+	{
+		return m_ResyncDiagnosticPhase;
+	}
+	u32 resyncDiagnosticGeneration() const
+	{
+		return m_ResyncDiagnosticGeneration;
+	}
+	u32 resyncDiagnosticFramesRemaining() const
+	{
+		return m_ResyncDiagnosticFramesRemaining;
+	}
+	bool resyncDiagnosticShadowChanged() const
+	{
+		return m_ResyncDiagnosticShadowChanged;
+	}
+	u32 resyncDiagnosticRepairCallsRemaining() const
+	{
+		return m_ResyncDiagnosticRepairCallsRemaining;
+	}
 
 	// Diagnostic kill switch: when set, runFrame stops ALL mirror bus traffic
 	// -- flushes and the resync sweep -- leaving real DRAM untouched so the
@@ -225,6 +262,7 @@ public:
 	CC64Memory         &memory()      { return m_Memory; }
 	CFastRAM           &fastRAM()     { return m_FastRAM; }
 	CSuperCPUMemoryMap &memoryMap()   { return m_MemoryMap; }
+	CREU               &reu()         { return m_REU; }
 	CWriteBuffer       &writeBuffer() { return m_WriteBuffer; }
 	CSuperCPURegisters &registers()   { return m_Registers; }
 	ICpu               *cpu()         { return m_CPU; }
@@ -243,6 +281,13 @@ private:
 	CC64Memory         m_Memory;
 	CWriteBuffer       m_WriteBuffer;
 	CSuperCPURegisters m_Registers;
+	// The REU and the three pieces that connect it. The chain exists because
+	// CC64Memory holds a single IIOInterceptor and m_Registers already has it.
+	static void reuFF00Trampoline( void *context );
+	CREU                m_REU;
+	CREUInterceptor     m_REUInterceptor;
+	CREUMemoryHost      m_REUHost;
+	CIOInterceptorChain m_IOChain;
 	CM6502             m_Core6502;
 	CW65C816           m_Core65816;
 	CFastRAM           m_FastRAM;
@@ -262,6 +307,14 @@ private:
 	u64      m_DisplayScrubPhaseStart = 0;
 	u32      m_DisplayScrubPhaseGeneration = 0;
 	bool     m_DisplayScrubBitmapSeen = false;
+	bool     m_ResyncDiagnosticAwaitingDrain = false;
+	bool     m_ResyncDiagnosticHolding = false;
+	SCPUResyncDiagnosticPhase m_ResyncDiagnosticPhase = SCPU_RESYNC_DIAG_IDLE;
+	u32      m_ResyncDiagnosticFramesRemaining = 0;
+	u32      m_ResyncDiagnosticGeneration = 0;
+	u32      m_ResyncDiagnosticStartHash = 0;
+	bool     m_ResyncDiagnosticShadowChanged = false;
+	u32      m_ResyncDiagnosticRepairCallsRemaining = 0;
 	// runFrame() may advance the CPU to reach the physical VIC border before
 	// draining mirrors. Those cycles belong to the following frame; carrying
 	// them here prevents the border phase from becoming a variable turbo boost.
@@ -270,6 +323,9 @@ private:
 
 	void benchmark65816();
 	void updateDisplayScrubPhase( bool bitmapActive );
+	void updateResyncDiagnostic( bool sawIEC, C64VideoStandard video );
+	void runResyncDiagnosticRepair( const C64Signals &sig );
+	u32 displayShadowHash() const;
 	FrameHook m_FrameHook;
 	void     *m_FrameHookCtx;
 };

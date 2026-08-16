@@ -1418,6 +1418,55 @@ TEST( integration_unknown_raster_never_authorizes_a_flush )
 	CHECK( !c64RasterIsSafeForBulkTransfer( VIDEO_NTSC_R56A, 511 ) );
 }
 
+TEST( integration_post_iec_diagnostic_holds_only_background_resync_then_resumes )
+{
+	struct BorderBus : CHostBus
+	{
+		u16 rasterLine() override { return 0; }
+	} bus;
+
+	CSuperCPU scpu;
+	u8 basic[ C64_BASIC_SIZE ];
+	u8 kernal[ C64_KERNAL_SIZE ];
+	std::memset( basic, 0xEA, sizeof basic );
+	std::memset( kernal, 0xEA, sizeof kernal );
+	kernal[ 0 ] = 0x4C;		// JMP $E000
+	kernal[ 1 ] = 0x00;
+	kernal[ 2 ] = 0xE0;
+	kernal[ 0x1FFC ] = 0x00;
+	kernal[ 0x1FFD ] = 0xE0;
+	scpu.setBasicROM( basic );
+	scpu.setKernalROM( kernal );
+	CHECK( scpu.init( &bus, SCPU_CORE_6502, 0 ) );
+	scpu.writeBuffer().setOptMode( SCPU_OPT_NONE );
+
+	// Any real CIA2 serial edge arms the observation. The first frame sees the
+	// activity; the next quiet frame begins the host build's two-frame hold.
+	scpu.memory().write8( 0xDD00, 0x08 );
+	CHECK( scpu.memory().iecBusActive() );
+	scpu.runFrame();
+	bus.resetStats();
+	scpu.runFrame();
+	CHECK_EQ( scpu.resyncDiagnosticPhase(), SCPU_RESYNC_DIAG_HOLD );
+	CHECK_EQ( scpu.resyncDiagnosticGeneration(), 1 );
+	CHECK_EQ( bus.m_BurstWrites, 0 );
+
+	// Ordinary dirty delivery is not part of the hold and must continue. Only
+	// the clean-background sweep is withheld.
+	scpu.memory().write8( 0x5000, 0x5A );
+	scpu.runFrame();
+	CHECK_EQ( bus.m_Memory[ 0x5000 ], 0x5A );
+	CHECK_EQ( scpu.resyncDiagnosticPhase(), SCPU_RESYNC_DIAG_HOLD );
+
+	// On the following frame the hold expires and targeted repair begins.
+	bus.resetStats();
+	scpu.runFrame();
+	CHECK_EQ( scpu.resyncDiagnosticPhase(), SCPU_RESYNC_DIAG_REPAIRING );
+	CHECK_EQ( scpu.resyncDiagnosticGeneration(), 2 );
+	CHECK( !scpu.resyncDiagnosticShadowChanged() );
+	CHECK( bus.m_BurstWrites > 0 );
+}
+
 TEST( integration_mirror_drain_rechecks_raster_before_each_small_chunk )
 {
 	struct OneSafeSampleBus : CHostBus
