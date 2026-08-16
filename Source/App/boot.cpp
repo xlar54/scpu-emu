@@ -1981,6 +1981,21 @@ void scpuBootRun( CLogger *logger )
 	               superCPU.fastRAM().present()
 	                   ? " (unreachable until the 65816 core lands)" : " -- none fitted" );
 
+	const u32 reuBytes = superCPU.reu().sizeBytes();
+	if ( reuBytes == 0 )
+		logger->Write( "SCPU", LogNotice, "REU: disabled" );
+	else if ( reuBytes < 1024u * 1024u )
+	{
+		const char *model = reuBytes == 128u * 1024u ? " (1700)"
+		                  : reuBytes == 256u * 1024u ? " (1764)"
+		                  : reuBytes == 512u * 1024u ? " (1750)" : "";
+		logger->Write( "SCPU", LogNotice, "REU: %u KB%s",
+		               (unsigned)( reuBytes / 1024u ), model );
+	}
+	else
+		logger->Write( "SCPU", LogNotice, "REU: %u MB (expanded)",
+		               (unsigned)( reuBytes / ( 1024u * 1024u ) ) );
+
 	logger->Write( "SCPU", LogNotice, "attached to %s, %s",
 	               sig.machine == MACHINE_C128 ? "C128" : "C64",
 	               sig.video == VIDEO_PAL ? "PAL" : "NTSC" );
