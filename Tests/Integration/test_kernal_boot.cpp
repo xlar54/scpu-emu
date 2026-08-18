@@ -999,6 +999,50 @@ TEST( integration_register_attach_applies_the_power_on_mirror_policy )
 	CHECK( wb.shouldMirror( 0x0200 ) );
 }
 
+TEST( integration_cia2_rescale_carries_the_subcycle_residue )
+{
+	// A $D07A/$D07B-bracketing program (SMB64 does this every frame)
+	// re-denominates its armed CIA2 frame timer TWICE per frame. The old
+	// floor division lost up to one C64 cycle per turbo->slow transition,
+	// SYSTEMATICALLY early -- so the polled frame anchor crept against the
+	// raster by roughly half a cycle per frame, hundreds of cycles per
+	// minute. The Q16 residue must make the round trip lossless.
+	CHostBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	// setPacing(0, hz) leaves real-time pacing off (host tests have no
+	// clock) while still selecting the factor the CIA model denominates in.
+	mem.setPacing( 0, 20000000 );		// turbo: factor 20
+
+	// Arm timer A with a PAL frame period, the way the guest would.
+	mem.write8( 0xDD04, 0xC7 );			// latch = $4CC7 + 1 = 19656
+	mem.write8( 0xDD05, 0x4C );
+	mem.write8( 0xDD0D, 0x81 );			// enable TA interrupt mask
+	mem.write8( 0xDD0E, 0x01 );			// start, continuous
+	mem.tick( 1 );						// finalise the arm
+
+	CHECK( mem.m_CIA2TADeadline != 0 );
+	const u64 before = mem.m_CIA2TADeadline - mem.m_EmuCycles;
+
+	// One hundred frames of handler-style speed bracketing, no time passing:
+	// the remaining count must survive exactly.
+	for ( u32 i = 0; i < 100; i++ )
+	{
+		mem.setPacing( 0, 1000000 );	// handler entry: 1MHz
+		mem.setPacing( 0, 20000000 );	// handler exit: turbo
+	}
+
+	CHECK( mem.m_CIA2TADeadline != 0 );
+	const u64 after = mem.m_CIA2TADeadline - mem.m_EmuCycles;
+
+	// The old arithmetic lost ~19/20 of a slow cycle per turbo->slow rescale:
+	// after 100 pairs the deadline had moved ~1,900 turbo cycles earlier.
+	// With the residue the drift over the whole run must be under one C64
+	// cycle in turbo units.
+	const u64 drift = before > after ? before - after : after - before;
+	CHECK( drift <= 20u );
+}
+
 TEST( integration_cia2_port_a_write_arms_the_iec_throttle )
 {
 	// The KERNAL times its serial-bus bits by counting cycles, and those counts
