@@ -987,6 +987,27 @@ TEST( nmi_retime_poll_hold_decays_quickly_without_polls )
 	CHECK( !mem.iecThrottleActive() );	// gone within ~a millisecond
 }
 
+TEST( explicit_1mhz_poll_remains_visible_as_iec_activity_evidence )
+{
+	// Test Drive explicitly selects 1MHz before its bit-timed loader. That
+	// makes an automatic speed hold redundant, but a tight BIT $DD00 loop is
+	// still positive evidence that a deferred 9K VIC-map replay must wait.
+	CHostBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	mem.setPacing( 0, 1000000 );
+	bus.m_Memory[ 0xDD00 ] = 0xFF;
+
+	mem.read8( 0xDD00 );
+	CHECK( mem.iecPollActive() );
+	CHECK( !mem.iecThrottleActive() );	// already slow; no fallback active
+
+	mem.tickFast( 1100 );
+	CHECK( !mem.iecPollActive() );
+	CHECK( !mem.iecThrottleActive() );
+}
+
 TEST( cia2_diagnostic_snapshot_does_not_rearm_the_1mhz_poll_hold )
 {
 	CHostBus bus;

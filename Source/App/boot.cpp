@@ -2411,8 +2411,22 @@ void scpuBootRun( CLogger *logger )
 	// validated independently.
 	if ( radBus.signals().machine == MACHINE_C64 )
 	{
-		const bool underIOReady = radBus.prepareRAMUnderIOAccess();
-		const u8 underIOFailure = radBus.ramUnderIOFailure();
+		// RAM_UNDER_IO selects whether to attempt that arrangement at all. It
+		// defaults to OFF, and the short-circuit matters: with OFF we never probe,
+		// so the second $01=$34 takeover never happens and no per-access /GAME is
+		// ever asserted. Displayed data under $D000-$DFFF is then delivered by
+		// backing-store relocation instead, which needs neither.
+		//
+		// The default is OFF for determinism rather than caution. Per-access /GAME
+		// is carried into VIC fetch state by at least one FPGA host, and a machine
+		// whose physical map depends on how a boot-time probe happened to go makes
+		// every field report ambiguous about which path was actually running.
+		const bool underIOAttempted =
+			cfgRAMUnderIO != SCPU_CFG_RAM_UNDER_IO_OFF;
+		const bool underIOReady =
+			underIOAttempted && radBus.prepareRAMUnderIOAccess();
+		const u8 underIOFailure =
+			underIOAttempted ? radBus.ramUnderIOFailure() : 0;
 		if ( !underIOReady )
 		{
 			// Some FPGA hosts accept the ordinary badline acquisition but not a
@@ -2434,11 +2448,20 @@ void scpuBootRun( CLogger *logger )
 			superCPU.setRAMUnderIOAccessible( false );
 			superCPU.setUnderIORelocate( cfgMirrorD000Relocate != 0 );
 			{
+				// Distinguish "declined by configuration" from "probed and failed".
+				// Reporting a failure code we never obtained would send anyone
+				// reading this log hunting a takeover fault that did not occur.
 				CScopedLoggingIRQs underIOFallbackIRQs;
-				logger->Write( "SCPU", LogWarning,
-				               "physical RAM under I/O unavailable (failure=$%02X); "
-				               "continuing with compatibility fallback",
-				               (unsigned)underIOFailure );
+				if ( !underIOAttempted )
+					logger->Write( "SCPU", LogNotice,
+					               "physical RAM under I/O: not attempted "
+					               "(RAM_UNDER_IO 0); displayed data under $D000-$DFFF "
+					               "is delivered by backing-store relocation" );
+				else
+					logger->Write( "SCPU", LogWarning,
+					               "physical RAM under I/O unavailable (failure=$%02X); "
+					               "continuing with compatibility fallback",
+					               (unsigned)underIOFailure );
 			}
 		}
 		else

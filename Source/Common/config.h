@@ -29,7 +29,7 @@
 #define _config_h
 
 
-#define TIMING_NAMES 43
+#define TIMING_NAMES 44
 const char timingNames[TIMING_NAMES][32] = {
 	"WAIT_FOR_SIGNALS", 
 	"WAIT_CYCLE_READ", 
@@ -140,7 +140,11 @@ const char timingNames[TIMING_NAMES][32] = {
 	// 1 none, 2 128K, 3 256K, 4 512K, 5 2MB, 6 4MB, 7 16MB. 1 rather than
 	// 0 means "no REU" so a missing or mistyped key is distinguishable
 	// from a deliberate off. See Source/REU/reu.h.
-	"REUSIZE"
+	"REUSIZE",
+	// Physical RAM-under-I/O policy. 0 always uses the conventional-map
+	// compatibility fallback, 1 forces the verified $01=$34 map, and 2 probes
+	// automatically. See cfgRAMUnderIO below.
+	"RAM_UNDER_IO"
 };
 
 // Which CPU core boot.cpp should install. Set from CPU_CORE in the config file;
@@ -212,6 +216,17 @@ extern int cfgVideoMode;
 // Defaults to "no REU fitted", so an unconfigured card behaves exactly as
 // it did before the unit existed.
 extern int cfgREUSize;
+
+// Physical RAM-under-I/O selection. The deterministic default is the clean
+// conventional-map fallback. AUTO remains available for diagnostics, but
+// takeover acceptance was proven not to predict whether a host's VIC tolerates
+// per-access /GAME selection (the tested 64U is a false-full result).
+extern int cfgRAMUnderIO;
+
+#define SCPU_CFG_RAM_UNDER_IO_OFF      0
+#define SCPU_CFG_RAM_UNDER_IO_FORCE    1
+#define SCPU_CFG_RAM_UNDER_IO_AUTO     2
+#define SCPU_CFG_RAM_UNDER_IO_DEFAULT  SCPU_CFG_RAM_UNDER_IO_OFF
 
 #define SCPU_CFG_VIDEO_CONSOLE  0
 #define SCPU_CFG_VIDEO_VICII    1

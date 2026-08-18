@@ -60,6 +60,32 @@ TEST( writebuf_coalesces_repeated_writes_to_one_address )
 	CHECK_EQ( f.wb.m_WritesCoalesced, 999 );
 }
 
+TEST( writebuf_counts_pending_and_writes_in_one_passive_range )
+{
+	WBFixture f;
+	f.wb.setOptMode( SCPU_OPT_NONE );
+	f.wb.beginRangeWriteCount( 0x0400, 1024 );
+
+	f.poke( 0x0400, 0x11 );
+	f.poke( 0x0401, 0x22 );
+	f.poke( 0x0400, 0x33 );	// accepted again, coalesced once
+	f.poke( 0x0800, 0x44 );	// outside the diagnostic matrix
+
+	u64 accepted = 0, coalesced = 0;
+	f.wb.endRangeWriteCount( accepted, coalesced );
+	CHECK_EQ( accepted, 3 );
+	CHECK_EQ( coalesced, 1 );
+	CHECK_EQ( f.wb.pending(), 3 );
+	CHECK_EQ( f.wb.pendingInRange( 0x0400, 1024 ), 2 );
+	CHECK( f.wb.hasPendingInRange( 0x0400, 1024 ) );
+
+	f.wb.flushRangeUpTo( 0x0400, 1024, 1 );
+	CHECK_EQ( f.wb.pendingInRange( 0x0400, 1024 ), 1 );
+	f.wb.flushRangeUpTo( 0x0400, 1024, 8 );
+	CHECK_EQ( f.wb.pendingInRange( 0x0400, 1024 ), 0 );
+	CHECK_EQ( f.wb.pending(), 1 );
+}
+
 TEST( writebuf_ordinary_coalescing_keeps_its_fifo_position )
 {
 	WBFixture f;
@@ -806,6 +832,7 @@ struct RelocFixture
 		mem.attachBus( &bus );
 		mem.setMirrorSink( &wb );
 		wb.attach( &bus, mem.m_RAM );
+		wb.attachDisplayTranslation( &mem );
 		wb.setOptMode( SCPU_OPT_NONE );
 		wb.attachRelocation( mem.m_PtrReloc, mem.m_RelocInUse,
 		                     &mem.m_RelocCount );
@@ -830,6 +857,71 @@ struct RelocFixture
 	}
 };
 
+TEST( relocation_shape_tail_identity_guard_covers_production_translation )
+{
+	RelocFixture f;
+
+	// CSuperCPU attaches CC64Memory as the display-translation authority, so
+	// deliverValue() takes vicPhysicalValue() rather than its legacy fallback.
+	// Reproduce stolen block 15 ($C3C0-$C3FF): its last eight bytes are shape
+	// data even when a value such as $41 resembles a sprite pointer.
+	f.mem.m_RelocCount = 1;
+	f.mem.m_RelocInUse[ 15 ] = 0x40;
+	f.mem.m_PtrReloc[ 1 ] = 7;
+	CHECK_EQ( f.wb.deliverValue( 0xC3F8, 0x41 ), (u8)0x41 );
+	CHECK_EQ( f.wb.deliverValue( 0xC7F8, 0x41 ), (u8)0x07 );
+}
+
+TEST( display_map_change_records_refresh_without_synchronous_walk )
+{
+	RelocFixture f;
+	f.wb.discard();
+	f.wb.resetStats();
+
+	// Test Drive's low bank-3 bitmap forces K402's conventional-map fallback.
+	// The guest I/O instruction must only record the work: the old hook called
+	// onRamWrite() 9216 times before issuing the physical $D018 write.
+	f.mem.write8( 0xD018, 0x81 );
+	CHECK( f.mem.m_DisplayRelocActive );
+	CHECK_EQ( f.wb.m_WritesAccepted, 0u );
+	CHECK_EQ( f.wb.pending(), 1024u + 8192u );
+
+	// The scheduler-facing hidden drain stages and delivers one bounded chunk.
+	f.bus.resetStats();
+	f.wb.flushRangeUpTo( 0xE000, 1024, 64 );
+	CHECK_EQ( f.bus.m_BurstWrites, 64u );
+	CHECK_EQ( f.wb.pending(), 1024u + 8192u - 64u );
+	CHECK_EQ( f.bus.m_Memory[ 0xCC00 ], f.mem.m_RAM[ 0xE000 ] );
+}
+
+TEST( iec_poll_pauses_only_deferred_map_staging_not_ordinary_writes )
+{
+	RelocFixture f;
+	f.wb.discard();
+	f.wb.resetStats();
+	f.mem.m_RAM[ 0xE000 ] = 0x41;
+
+	// Record Test Drive's complete matrix+bitmap relocation replay, then add
+	// one unrelated ordinary dirty byte behind it.
+	f.mem.write8( 0xD018, 0x81 );
+	f.mem.writeFast( 0x0800, 0x5A );
+	CHECK_EQ( f.wb.pending(), 1024u + 8192u + 1u );
+
+	// A sustained IEC poll tells the scheduler not to INTRODUCE map-replay
+	// bytes. It must still make progress on the already-ordinary queue.
+	f.wb.flushUpToPolicy( 64, false, 0xFFFFFFFF, 0xFFFFFFFF, false );
+	CHECK_EQ( f.bus.m_Memory[ 0x0800 ], (u8)0x5A );
+	CHECK_EQ( f.bus.m_Memory[ 0xCC00 ], (u8)0x00 );
+	CHECK_EQ( f.wb.pending(), 1024u + 8192u );
+
+	// Once polling stops, the same pending description resumes exactly where
+	// it was paused and the bounded hidden-window chunk reaches its translated
+	// physical destination.
+	f.wb.flushRangeUpTo( 0xE000, 1024, 64, true );
+	CHECK_EQ( f.bus.m_Memory[ 0xCC00 ], (u8)0x41 );
+	CHECK_EQ( f.wb.pending(), 1024u + 8192u - 64u );
+}
+
 TEST( reloc_pointer_into_under_io_block_delivers_translated_copy )
 {
 	RelocFixture f;
@@ -852,11 +944,10 @@ TEST( reloc_pointer_into_under_io_block_delivers_translated_copy )
 	CHECK_EQ( f.mem.m_PtrReloc[ 0x43 - 0x40 ], 0x00 );
 	CHECK_EQ( f.mem.m_RelocInUse[ 0 ], 0x43 );
 
-	// The hot-shape tracking follows the relocated block: bank 3, block 0.
-	const u32 blk = ( 3u << 8 ) + 0;
-	CHECK( ( f.mem.m_HotShapeBlocks[ blk >> 6 ] >> ( blk & 63 ) ) & 1 );
+	// The queue is keyed by guest address, so hot tracking follows the source
+	// block even though delivery is redirected to physical block 0.
 	const u32 raw = ( 3u << 8 ) + 0x43;
-	CHECK( !( ( f.mem.m_HotShapeBlocks[ raw >> 6 ] >> ( raw & 63 ) ) & 1 ) );
+	CHECK( ( f.mem.m_HotShapeBlocks[ raw >> 6 ] >> ( raw & 63 ) ) & 1 );
 
 	// Flushing delivers the shape bytes at the relocated address, and the
 	// QUEUED copy of the pointer byte goes out translated too.
@@ -969,16 +1060,81 @@ TEST( reloc_survives_the_double_buffer_bank_flip )
 	CHECK_EQ( f.bus.m_Memory[ 0xCFF8 ], 0x00 );
 }
 
-TEST( reloc_low_bitmap_leaves_no_pool_and_falls_back_to_raw )
+TEST( reloc_low_bitmap_uses_safe_graphics_matrix_and_sprite_backing )
 {
 	RelocFixture f;
-	// Bitmap in the LOW half of bank 3 ($D018 bit 3 clear): the 8K bitmap
-	// spans $C000-$DF3F, covering the whole relocation window. Allocation
-	// must refuse and the pointer goes out raw -- stale, but honest, and
-	// counted.
-	f.mem.write8( 0xD018, 0x30 );
-	f.mem.writeFast( 0xCFF8, 0x43 );
-	CHECK_EQ( f.bus.m_Memory[ 0xCFF8 ], 0x43 );
-	CHECK_EQ( f.mem.m_RelocExhausted, 1u );
-	CHECK_EQ( f.mem.m_RelocCount, 0 );
+	// Test Drive's real state: low bank-3 bitmap $C000-$DFFF and screen $E000.
+	// The fallback packs graphics at $E000, matrix at $CC00 and shapes in the
+	// existing $C000-$CBFF pool. The delivered D018 describes that physical
+	// layout while the guest continues to read $81.
+	f.mem.write8( 0xD018, 0x81 );
+	CHECK( f.mem.m_DisplayRelocActive );
+	CHECK_EQ( f.mem.activeBitmapBase(), 0xC000u );
+	CHECK_EQ( f.mem.activeVICScreenBase(), 0xE000u );
+	CHECK_EQ( f.bus.m_Memory[ 0xD018 ], (u8)0x39 );
+	CHECK_EQ( f.mem.read8( 0xD018 ), (u8)0x81 );
+	CHECK_EQ( f.mem.read8( 0xD058 ), (u8)0x81 );
+
+	// Both halves of the bitmap and its separate matrix reach safe DRAM.
+	f.pokeUnderIO( 0xD123, 0x5A );
+	f.mem.writeFast( 0xC234, 0xA5 );
+	f.mem.writeFast( 0xE010, 0x37 );
+	f.wb.flush();
+	CHECK_EQ( f.bus.m_Memory[ 0xF123 ], (u8)0x5A );
+	CHECK_EQ( f.bus.m_Memory[ 0xE234 ], (u8)0xA5 );
+	CHECK_EQ( f.bus.m_Memory[ 0xCC10 ], (u8)0x37 );
+
+	// Sprite pointers in the relocated matrix compose with shape relocation.
+	f.mem.writeFast( 0xE3F8, 0x43 );
+	CHECK_EQ( f.bus.m_Memory[ 0xCFF8 ], (u8)0x00 );
+	CHECK_EQ( f.mem.m_RelocExhausted, 0u );
+	CHECK_EQ( f.mem.m_RelocCount, 1 );
+}
+
+TEST( reloc_under_io_charset_and_matrix_share_one_translation_authority )
+{
+	RelocFixture f;
+	f.mem.write8( 0xD011, 0x1B );             // text mode
+	f.mem.write8( 0xD018, 0x84 );             // screen $E000, charset $D000
+	CHECK( f.mem.m_DisplayRelocActive );
+	CHECK_EQ( f.mem.activeCharsetBase(), 0xD000u );
+	CHECK_EQ( f.bus.m_Memory[ 0xD018 ], (u8)0x38 );
+
+	f.pokeUnderIO( 0xD055, 0xA6 );
+	f.mem.writeFast( 0xE123, 0x5C );
+	f.wb.flush();
+	CHECK_EQ( f.bus.m_Memory[ 0xE055 ], (u8)0xA6 );
+	CHECK_EQ( f.bus.m_Memory[ 0xCD23 ], (u8)0x5C );
+
+	// A guest byte which merely occupies the physical charset target must not
+	// overwrite it. Guest reads still see the write in Pi shadow RAM.
+	f.bus.m_Memory[ 0xE500 ] = 0x77;
+	f.mem.writeFast( 0xE500, 0x11 );
+	f.wb.flush();
+	CHECK_EQ( f.mem.m_RAM[ 0xE500 ], (u8)0x11 );
+	CHECK_EQ( f.bus.m_Memory[ 0xE500 ], (u8)0x77 );
+}
+
+TEST( reloc_resync_and_sample_use_the_translated_physical_address )
+{
+	RelocFixture f;
+	f.mem.write8( 0xD018, 0x81 );             // Test Drive layout
+	f.mem.writeFast( 0xC008, 0xA5 );
+	f.wb.flush();
+	CHECK_EQ( f.bus.m_Memory[ 0xE008 ], (u8)0xA5 );
+
+	// The targeted compare must sample $E008, not guest/source $C008, and its
+	// repair must return to the same translated address.
+	f.bus.m_Memory[ 0xE008 ] = 0x5A;
+	for ( u32 i = 0; i < 9; i++ )
+		f.wb.resyncDisplayed( 0xE000, 0xC000, 8192,
+		                       64, true, true, true );
+	CHECK( f.wb.m_DisplayScrubMismatches[ 1 ] >= 1u );
+	CHECK_EQ( f.bus.m_Memory[ 0xE008 ], (u8)0xA5 );
+
+	// The unconditional sweep is translated by the same function.
+	f.bus.m_Memory[ 0xE005 ] = 0x00;
+	for ( u32 i = 0; i < 0x10000 / 512; i++ )
+		f.wb.resyncSweep( 512 );
+	CHECK_EQ( f.bus.m_Memory[ 0xE005 ], f.mem.m_RAM[ 0xC005 ] );
 }

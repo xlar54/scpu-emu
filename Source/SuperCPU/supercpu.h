@@ -84,6 +84,44 @@ enum SCPUResyncDiagnosticPhase
 // turning every ordinary mirror drain into a 256-byte CPU pause.
 #define SCPU_MIRROR_SCREEN_BYTES_PER_OPPORTUNITY 256
 
+// Passive IEC/mirror diagnostic. The last few serial-active epochs are kept
+// entirely in RAM and copied to the reset-button dump only after emulation has
+// stopped. This is intentionally not a live logger: filesystem or console work
+// during IEC would change the timing being measured.
+#define SCPU_IEC_EPOCH_DIAG_CAPACITY 8
+struct SCPUIECEpochDiagnostic
+{
+	u32 sequence;
+	u8  valid;
+	u8  quietSeen;
+	u8  matrixDrained;
+	u8  allDrained;
+	u8  dd00Valid;
+	u8  bitmapMode;
+	u8  d011;
+	u8  d016;
+	u8  d018;
+	u8  dd00;
+	u32 screenBase;
+	u32 graphicsBase;
+	u32 pendingAtEntry;
+	u32 matrixPendingAtEntry;
+	u32 pendingAtQuiet;
+	u32 matrixPendingAtQuiet;
+	u64 matrixWritesAccepted;
+	u64 matrixWritesCoalesced;
+	u64 activeHostCycles;
+	u64 matrixDrainHostCycles;
+	u64 allDrainHostCycles;
+	u32 matrixDrainOpportunities;
+	u32 allDrainOpportunities;
+
+	// Internal timestamps/counter shared with the passive scheduler observer.
+	u64 activeStartedAt;
+	u64 quietStartedAt;
+	u32 opportunitiesSinceQuiet;
+};
+
 class CSuperCPU
 {
 public:
@@ -186,14 +224,15 @@ public:
 	// Under-I/O sprite-shape relocation (MIRROR_D000_RELOCATE); see
 	// CC64Memory's relocation section. On by default; the switch exists so a
 	// game that goes wrong with it can prove it with one config line.
-	void setUnderIORelocate( bool e ) { m_Memory.m_RelocEnable = e; }
+	void setUnderIORelocate( bool e ) { m_Memory.setUnderIORelocate( e ); }
 	void setRAMUnderIOAccessible( bool accessible )
 	{
 		m_WriteBuffer.setRAMUnderIOAccessible( accessible );
 		m_Memory.setRAMUnderIOAccessible( accessible );
 		// Native delivery supersedes the old compatibility workaround. Leaving
 		// relocation armed would redirect the very writes now able to reach RAM.
-		if ( accessible ) m_Memory.m_RelocEnable = false;
+		// CC64Memory::setRAMUnderIOAccessible() also retires relocation when
+		// native delivery is available.
 	}
 
 	// CIA2 timer NMI retiming (NMI_RETIME); see CC64Memory's retiming
@@ -269,6 +308,10 @@ public:
 	// Diagnostics sometimes need to paint a failure report directly into the
 	// host's VIC-visible RAM after the emulated CPU has been stopped.
 	IC64Bus            *hostBus()     { return m_Bus; }
+	// Copy an IEC epoch in chronological order (oldest first). False means the
+	// requested index is outside the retained fixed-size ring.
+	u32 iecEpochDiagnosticCount() const;
+	bool iecEpochDiagnostic( u32 index, SCPUIECEpochDiagnostic &out ) const;
 	// Null unless the 65816 core is driving. For diagnostics only.
 	CW65C816           *core65816()   { return ( m_CPU == &m_Core65816 ) ? &m_Core65816 : 0; }
 
@@ -320,8 +363,9 @@ private:
 	// them here prevents the border phase from becoming a variable turbo boost.
 	u64      m_FrameTickDebt = 0;
 	u32      m_BenchArmPerEmuCycle = 0;
-
 	void benchmark65816();
+	void updateIECEpochDiagnostic();
+	void noteIECEpochDrainOpportunity();
 	void updateDisplayScrubPhase( bool bitmapActive );
 	void updateResyncDiagnostic( bool sawIEC, C64VideoStandard video );
 	void runResyncDiagnosticRepair( const C64Signals &sig );
@@ -329,6 +373,15 @@ private:
 	FrameHook m_FrameHook;
 	void     *m_FrameHookCtx;
 };
+
+// Freeze the passive IEC ring outside the accelerator object before reset.
+// Keeping both the live and frozen rings out of CSuperCPU preserves the exact
+// hardware-validated data layout of the RAD bus object during acquisition.
+void scpuFreezeIECEpochDiagnostic( const CSuperCPU *scpu, u32 hostHz );
+u32 scpuFrozenIECEpochDiagnosticCount();
+u32 scpuFrozenIECEpochHostHz();
+bool scpuFrozenIECEpochDiagnostic( u32 index,
+	                               SCPUIECEpochDiagnostic &out );
 
 #define SCPU_TURBO_HZ   20000000u
 #define SCPU_NORMAL_HZ   1000000u

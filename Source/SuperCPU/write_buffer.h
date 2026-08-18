@@ -113,6 +113,8 @@ public:
 
 	// --- IMirrorSink ------------------------------------------------------
 	bool onRamWrite( u16 addr, u8 value ) override;
+	void onVICMapChanged( u32 screenBase, u32 graphicsBase,
+	                     u32 graphicsLength ) override;
 
 	// Flush everything, regardless of where the raster is. Correct but not
 	// polite: a large flush here will disturb the display.
@@ -187,14 +189,30 @@ public:
 	// The IMirrorSink flushUpTo() delegates here with both policies disabled.
 	u32 flushUpToPolicy( u32 maxBytes, bool deferHot,
 	                     u32 screenBase = 0xFFFFFFFF,
-	                     u32 bitmapBase = 0xFFFFFFFF );
+	                     u32 bitmapBase = 0xFFFFFFFF,
+	                     bool stageMapRefresh = true );
 
 	// Hidden-window priority path: deliver only dirty bytes in [base,base+len),
 	// retaining every other FIFO entry. This lets a screen matrix converge in
 	// short raster-safe installments before general border traffic consumes the
 	// opportunity.
-	u32 flushRangeUpTo( u32 base, u32 len, u32 maxBytes );
-	bool hasPendingInRange( u32 base, u32 len ) const;
+	u32 flushRangeUpTo( u32 base, u32 len, u32 maxBytes,
+	                    bool stageMapRefresh = true );
+	bool hasPendingInRange( u32 base, u32 len,
+	                       bool includeMapRefresh = true ) const;
+	bool hasDeferredMapRefresh() const { return pendingMapRefreshBytes() != 0; }
+	// Exact counterpart to hasPendingInRange(), used by passive queue
+	// diagnostics. This only examines the in-memory dirty bitmap; it never
+	// touches the C64 bus or changes queue order.
+	u32 pendingInRange( u32 base, u32 len ) const;
+
+	// Count policy-accepted writes to one diagnostic range without logging or
+	// touching the physical bus. The IEC epoch recorder arms this for the
+	// active 1K screen matrix at quiet->active and reads it at active->quiet.
+	// Keeping the counter here records the final delivery address after any
+	// relocation and distinguishes repeated (coalesced) writes exactly.
+	void beginRangeWriteCount( u32 base, u32 len );
+	void endRangeWriteCount( u64 &accepted, u64 &coalesced );
 
 	// Fallback under-I/O shape relocation wiring, used only when the physical
 	// RAM window could not be prepared. The tables are owned by CC64Memory.
@@ -210,6 +228,7 @@ public:
 		m_RelocInUse = inUse;
 		m_RelocCount = count;
 	}
+	void attachDisplayTranslation( const CC64Memory *memory );
 
 	// Deliver-time translation for pointer-row bytes: a bank-3 row byte
 	// selecting an under-I/O block goes out as its relocated block, the only
@@ -227,6 +246,7 @@ public:
 	// a pointer row, in which case translating it was correct.
 	inline u8 deliverValue( u16 a, u8 v ) const
 	{
+		if ( m_DisplayMemory ) return m_DisplayMemory->vicPhysicalValue( a, v );
 		// A relocated 64-byte block is shape data even when its final eight
 		// addresses happen to look like a bank-3 sprite-pointer row. Translating
 		// those data bytes corrupts blocks 15, 31 and 47 deterministically.
@@ -245,11 +265,11 @@ public:
 		return v;
 	}
 
-	u32 pending() const { return m_Count; }
-	u32 pendingBytes() override { return m_Count; }
+	u32 pending() const;
+	u32 pendingBytes() override { return pending(); }
 
 	// True when there is nothing outstanding.
-	bool empty() const { return m_Count == 0; }
+	bool empty() const;
 
 	// --- statistics -------------------------------------------------------
 	u64 m_WritesAccepted;	// writes that the policy said to mirror
@@ -286,6 +306,10 @@ private:
 	                        u32 displayLen, bool displayOnly,
 	                        u32 displayBase2 = 0xFFFFFFFF,
 	                        u32 displayLen2 = 0 );
+	void servicePendingMapRefresh( u32 maxBytes );
+	u32 pendingMapRefreshBytes() const;
+	bool pendingMapRefreshInRange( u32 base, u32 len, u32 *count = 0 ) const;
+	void clearPendingMapRefresh();
 
 	IC64Bus  *m_Bus;
 	const u8 *m_RAM;
@@ -320,8 +344,19 @@ private:
 	const u8  *m_PtrReloc = 0;
 	const u8  *m_RelocInUse = 0;
 	const u8  *m_RelocCount = 0;
+	const CC64Memory *m_DisplayMemory = 0;
+	u32 m_PhysicalMapGeneration = 0;
+	void syncPhysicalMapGeneration();
+	inline u16 physicalAddress( u16 guest, bool &deliver ) const
+	{
+		if ( m_DisplayMemory )
+			return m_DisplayMemory->vicPhysicalAddress( guest, deliver );
+		deliver = true;
+		return guest;
+	}
 	inline u8 authoritativeShadowValue( u16 a ) const
 	{
+		if ( m_DisplayMemory ) return m_RAM[ a ];
 		u8 v = m_RAM[ a ];
 		if ( m_RelocCount && *m_RelocCount && a >= 0xC000 && a < 0xCC00 )
 		{
@@ -361,7 +396,6 @@ private:
 	u32 m_NoProgressHotGeneration;
 	u32 m_NoProgressScreenBase;
 	u32 m_NoProgressBitmapBase;
-
 	bool canCacheNoProgress( bool deferHot ) const
 	{
 		return !deferHot || !m_HotBlocks || m_HotBlocksGeneration;

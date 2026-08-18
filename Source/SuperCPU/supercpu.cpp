@@ -19,6 +19,101 @@
 */
 #include "supercpu.h"
 
+// Diagnostic state deliberately lives outside CSuperCPU. The 64U takeover is
+// sensitive not only to the instruction path but also to where the live RAD
+// bus state lands in cache. Growing CSuperCPU moved the subsequently allocated
+// bus object and made the unchanged RAM-under-I/O probe fall back.
+static SCPUIECEpochDiagnostic s_IECEpochDiagnostics[
+	SCPU_IEC_EPOCH_DIAG_CAPACITY ];
+static u32  s_IECEpochDiagnosticCount = 0;
+static u32  s_IECEpochDiagnosticWrite = 0;
+static u32  s_IECEpochDiagnosticSequence = 0;
+static u32  s_IECEpochDiagnosticCurrent = 0;
+static bool s_IECEpochDiagnosticActive = false;
+
+static SCPUIECEpochDiagnostic s_FrozenIECEpochDiagnostics[
+	SCPU_IEC_EPOCH_DIAG_CAPACITY ];
+static u32 s_FrozenIECEpochDiagnosticCount = 0;
+static u32 s_FrozenIECEpochHostHz = 0;
+
+// A K411 VIC-map change leaves as much as 9KB of matrix/graphics replay for
+// the raster scheduler. A tight IEC poll is positive evidence that those
+// chunks must not be introduced yet, even after the edge-only transaction
+// window expires. Keep this policy outside CSuperCPU: growing the embedded
+// object has already changed 64U takeover behaviour by moving CRADBus.
+struct DeferredMapIECGuard
+{
+	const CWriteBuffer *owner;
+	bool started;
+	bool escaped;
+	u64 startedAt;
+};
+
+static DeferredMapIECGuard s_DeferredMapIECGuard = { 0, false, false, 0 };
+
+static bool mayStageDeferredMapRefresh( CWriteBuffer &buffer,
+	                                    const CC64Memory &memory,
+	                                    IC64Bus &bus )
+{
+	if ( s_DeferredMapIECGuard.owner != &buffer )
+	{
+		s_DeferredMapIECGuard.owner = &buffer;
+		s_DeferredMapIECGuard.started = false;
+		s_DeferredMapIECGuard.escaped = false;
+		s_DeferredMapIECGuard.startedAt = 0;
+	}
+
+	if ( !buffer.hasDeferredMapRefresh() )
+	{
+		s_DeferredMapIECGuard.started = false;
+		s_DeferredMapIECGuard.escaped = false;
+		s_DeferredMapIECGuard.startedAt = 0;
+		return true;
+	}
+
+	const bool edgeActive = memory.iecBusActive();
+	const bool pollActive = memory.iecPollActive();
+	if ( !edgeActive && !pollActive )
+	{
+		s_DeferredMapIECGuard.started = false;
+		s_DeferredMapIECGuard.escaped = false;
+		s_DeferredMapIECGuard.startedAt = 0;
+		return true;
+	}
+
+	const u64 now = bus.hostCycles();
+	if ( edgeActive )
+	{
+		// A fresh physical line event proves a healthy transfer is still making
+		// progress. Restart the liveness interval; a long file transfer must not
+		// age out merely because its many short handshakes add up to seconds.
+		s_DeferredMapIECGuard.started = true;
+		s_DeferredMapIECGuard.escaped = false;
+		s_DeferredMapIECGuard.startedAt = now;
+		return false;
+	}
+
+	if ( s_DeferredMapIECGuard.escaped )
+		return true;
+	if ( !s_DeferredMapIECGuard.started )
+	{
+		s_DeferredMapIECGuard.started = true;
+		s_DeferredMapIECGuard.startedAt = now;
+	}
+
+	// This is a liveness escape, not a protocol-timing guess. A valid IEC
+	// handshake cannot spend two wall-clock seconds in one unchanged poll;
+	// after that the guest is already stuck and a stale physical display is
+	// less useful than allowing it to converge for diagnosis.
+	const u64 rate = bus.hostCyclesPerSec();
+	if ( rate && now - s_DeferredMapIECGuard.startedAt >= rate * 2ULL )
+	{
+		s_DeferredMapIECGuard.escaped = true;
+		return true;
+	}
+	return false;
+}
+
 CSuperCPU::CSuperCPU()
 	: m_CPU( 0 ), m_Bus( 0 ), m_Running( false ), m_BootmapEnabled( false ),
 	  m_C128Mode( SCPU_C128_MODE_AUTO ),
@@ -118,6 +213,7 @@ bool CSuperCPU::init( IC64Bus *bus, SCPUCoreType core, u32 simmMB,
 		m_Memory.setFF00Hook( &CSuperCPU::reuFF00Trampoline, this );
 
 	m_WriteBuffer.attach( m_Bus, m_Memory.m_RAM );
+	m_WriteBuffer.attachDisplayTranslation( &m_Memory );
 	m_WriteBuffer.attachHotShapeBlocks( m_Memory.m_HotShapeBlocks,
 	                                    &m_Memory.m_HotShapeGeneration );
 	m_WriteBuffer.attachRelocation( m_Memory.m_PtrReloc, m_Memory.m_RelocInUse,
@@ -275,6 +371,17 @@ void CSuperCPU::reset()
 	m_ResyncDiagnosticStartHash = 0;
 	m_ResyncDiagnosticShadowChanged = false;
 	m_ResyncDiagnosticRepairCallsRemaining = 0;
+	s_IECEpochDiagnosticCount = 0;
+	s_IECEpochDiagnosticWrite = 0;
+	s_IECEpochDiagnosticSequence = 0;
+	s_IECEpochDiagnosticCurrent = 0;
+	s_IECEpochDiagnosticActive = false;
+	for ( u32 i = 0; i < SCPU_IEC_EPOCH_DIAG_CAPACITY; i++ )
+	{
+		SCPUIECEpochDiagnostic empty = {};
+		s_IECEpochDiagnostics[ i ] = empty;
+	}
+	m_WriteBuffer.beginRangeWriteCount( 0xFFFFFFFF, 0 );
 	m_Memory.reset();
 
 	// Bootmap, before the registers are reset -- CSuperCPURegisters::reset()
@@ -331,6 +438,140 @@ void CSuperCPU::reset()
 
 	if ( m_CPU )
 		m_CPU->reset();
+}
+
+u32 CSuperCPU::iecEpochDiagnosticCount() const
+{
+	return s_IECEpochDiagnosticCount;
+}
+
+bool CSuperCPU::iecEpochDiagnostic( u32 index,
+	                                SCPUIECEpochDiagnostic &out ) const
+{
+	if ( index >= s_IECEpochDiagnosticCount )
+		return false;
+	const u32 oldest = s_IECEpochDiagnosticCount == SCPU_IEC_EPOCH_DIAG_CAPACITY
+	                 ? s_IECEpochDiagnosticWrite : 0;
+	out = s_IECEpochDiagnostics[
+		( oldest + index ) % SCPU_IEC_EPOCH_DIAG_CAPACITY ];
+	return true;
+}
+
+void scpuFreezeIECEpochDiagnostic( const CSuperCPU *scpu, u32 hostHz )
+{
+	s_FrozenIECEpochDiagnosticCount = 0;
+	s_FrozenIECEpochHostHz = hostHz;
+	if ( !scpu ) return;
+
+	u32 count = scpu->iecEpochDiagnosticCount();
+	if ( count > SCPU_IEC_EPOCH_DIAG_CAPACITY )
+		count = SCPU_IEC_EPOCH_DIAG_CAPACITY;
+	for ( u32 i = 0; i < count; i++ )
+		if ( scpu->iecEpochDiagnostic( i,
+		                               s_FrozenIECEpochDiagnostics[ i ] ) )
+			s_FrozenIECEpochDiagnosticCount++;
+}
+
+u32 scpuFrozenIECEpochDiagnosticCount()
+{
+	return s_FrozenIECEpochDiagnosticCount;
+}
+
+u32 scpuFrozenIECEpochHostHz()
+{
+	return s_FrozenIECEpochHostHz;
+}
+
+bool scpuFrozenIECEpochDiagnostic( u32 index,
+	                               SCPUIECEpochDiagnostic &out )
+{
+	if ( index >= s_FrozenIECEpochDiagnosticCount ) return false;
+	out = s_FrozenIECEpochDiagnostics[ index ];
+	return true;
+}
+
+void CSuperCPU::updateIECEpochDiagnostic()
+{
+	if ( !m_Bus ) return;
+	const bool active = m_Memory.iecBusActive();
+	if ( active == s_IECEpochDiagnosticActive ) return;
+
+	const u64 now = m_Bus->hostCycles();
+	if ( active )
+	{
+		const u32 slot = s_IECEpochDiagnosticWrite;
+		s_IECEpochDiagnosticWrite =
+			( s_IECEpochDiagnosticWrite + 1 ) % SCPU_IEC_EPOCH_DIAG_CAPACITY;
+		if ( s_IECEpochDiagnosticCount < SCPU_IEC_EPOCH_DIAG_CAPACITY )
+			s_IECEpochDiagnosticCount++;
+
+		SCPUIECEpochDiagnostic empty = {};
+		SCPUIECEpochDiagnostic &d = s_IECEpochDiagnostics[ slot ];
+		d = empty;
+		d.valid = 1;
+		d.sequence = ++s_IECEpochDiagnosticSequence;
+		d.d011 = m_Memory.vicRegister( 0x11 );
+		d.d016 = m_Memory.vicRegister( 0x16 );
+		d.d018 = m_Memory.vicRegister( 0x18 );
+		u8 ddra = 0;
+		d.dd00Valid = m_Memory.trackedCIA2Snapshot( d.dd00, ddra ) ? 1 : 0;
+		d.bitmapMode = ( d.d011 & 0x20 ) ? 1 : 0;
+		d.screenBase = m_Memory.activeVICScreenBase();
+		d.graphicsBase = d.bitmapMode ? m_Memory.activeBitmapBase()
+		                                : m_Memory.activeCharsetBase();
+		d.pendingAtEntry = m_WriteBuffer.pending();
+		d.matrixPendingAtEntry =
+			m_WriteBuffer.pendingInRange( d.screenBase, 1024 );
+		d.activeStartedAt = now;
+
+		m_WriteBuffer.beginRangeWriteCount( d.screenBase, 1024 );
+		s_IECEpochDiagnosticCurrent = slot;
+		s_IECEpochDiagnosticActive = true;
+		return;
+	}
+
+	SCPUIECEpochDiagnostic &d =
+		s_IECEpochDiagnostics[ s_IECEpochDiagnosticCurrent ];
+	m_WriteBuffer.endRangeWriteCount( d.matrixWritesAccepted,
+	                                 d.matrixWritesCoalesced );
+	d.quietSeen = 1;
+	d.activeHostCycles = now - d.activeStartedAt;
+	d.quietStartedAt = now;
+	d.pendingAtQuiet = m_WriteBuffer.pending();
+	d.matrixPendingAtQuiet =
+		m_WriteBuffer.pendingInRange( d.screenBase, 1024 );
+	if ( d.matrixPendingAtQuiet == 0 ) d.matrixDrained = 1;
+	if ( d.pendingAtQuiet == 0 ) d.allDrained = 1;
+	s_IECEpochDiagnosticActive = false;
+}
+
+void CSuperCPU::noteIECEpochDrainOpportunity()
+{
+	if ( !m_Bus || m_Memory.iecBusActive() ) return;
+	for ( u32 i = 0; i < s_IECEpochDiagnosticCount; i++ )
+	{
+		const u32 oldest =
+			s_IECEpochDiagnosticCount == SCPU_IEC_EPOCH_DIAG_CAPACITY
+			? s_IECEpochDiagnosticWrite : 0;
+		SCPUIECEpochDiagnostic &d = s_IECEpochDiagnostics[
+			( oldest + i ) % SCPU_IEC_EPOCH_DIAG_CAPACITY ];
+		if ( !d.valid || !d.quietSeen || d.allDrained ) continue;
+
+		d.opportunitiesSinceQuiet++;
+		if ( !d.matrixDrained
+		     && m_WriteBuffer.pendingInRange( d.screenBase, 1024 ) == 0 )
+		{
+			d.matrixDrained = 1;
+			d.matrixDrainOpportunities = d.opportunitiesSinceQuiet;
+			d.matrixDrainHostCycles = m_Bus->hostCycles() - d.quietStartedAt;
+		}
+		if ( m_WriteBuffer.empty() )
+		{
+			d.allDrained = 1;
+			d.allDrainOpportunities = d.opportunitiesSinceQuiet;
+			d.allDrainHostCycles = m_Bus->hostCycles() - d.quietStartedAt;
+		}
+	}
 }
 
 u32 CSuperCPU::displayShadowHash() const
@@ -676,7 +917,8 @@ static void flushMirrorsRasterAware( CWriteBuffer &buffer, IC64Bus &bus,
                                      const C64Signals &sig, u32 displayBudget,
                                      u32 transferBudget, u32 screenBudget,
 	                                 const u8 *vicShadow, u32 screenBase,
-	                                 u32 bitmapBase )
+	                                 u32 bitmapBase,
+	                                 bool stageMapRefresh )
 {
 	const u32 perLine  = c64CyclesPerLine( sig.video );
 	const u32 lines    = c64RasterLines( sig.video );
@@ -702,9 +944,11 @@ static void flushMirrorsRasterAware( CWriteBuffer &buffer, IC64Bus &bus,
 			                    : c64DisplayFirstLine( sig.video ) - line;
 			budgetBytes = ( linesLeft * perLine * 3 ) / 4;
 			const bool screenPending = screenBase < 0x10000
-			                        && buffer.hasPendingInRange( screenBase, 1000 );
+			                        && buffer.hasPendingInRange(
+			                             screenBase, 1000, stageMapRefresh );
 			const bool bitmapPending = bitmapBase < 0x10000
-			                        && buffer.hasPendingInRange( bitmapBase, 8000 );
+			                        && buffer.hasPendingInRange(
+			                             bitmapBase, 8000, stageMapRefresh );
 			if ( screenPending || bitmapPending )
 			{
 				// Do not spend this opportunity on general FIFO traffic while a
@@ -757,7 +1001,8 @@ static void flushMirrorsRasterAware( CWriteBuffer &buffer, IC64Bus &bus,
 			// picture a partially updated matrix is invisible, and completing
 			// it before general traffic prevents an old/new one-character
 			// composite from appearing on the next frame.
-			buffer.flushRangeUpTo( priorityBase, priorityLen, chunk );
+			buffer.flushRangeUpTo( priorityBase, priorityLen, chunk,
+			                       stageMapRefresh );
 		}
 		else
 		{
@@ -766,7 +1011,8 @@ static void flushMirrorsRasterAware( CWriteBuffer &buffer, IC64Bus &bus,
 			// it, any leftover installment is ordinary FIFO delivery.
 			buffer.flushUpToPolicy( chunk, inDisplay,
 			                        inDisplay ? screenBase : 0xFFFFFFFF,
-			                        inDisplay ? bitmapBase : 0xFFFFFFFF );
+			                        inDisplay ? bitmapBase : 0xFFFFFFFF,
+			                        stageMapRefresh );
 		}
 		const u32 after = buffer.pending();
 
@@ -813,7 +1059,7 @@ u64 CSuperCPU::runFrame()
 	u64 ticksUsed = repaid;
 	m_FrameTickDebt -= repaid;
 	u64 executed = 0;
-	bool sawIECThisFrame = m_Memory.iecBusActive();
+	updateIECEpochDiagnostic();
 
 	// The frame is run in slices rather than one call, for two reasons. A
 	// speed change breaks run() so the remainder can be re-budgeted at the new
@@ -858,7 +1104,12 @@ u64 CSuperCPU::runFrame()
 		const u64 ran = m_CPU->run( budget );
 		executed += ran;
 		ticksUsed += ran * ticksPerCycle;
-		if ( m_Memory.iecBusActive() ) sawIECThisFrame = true;
+		// The first serial edge requests a run break, so this observes the
+		// quiet->active edge before later loader writes. Expiry is observed here
+		// before the first newly-eligible mirror drain below.
+		updateIECEpochDiagnostic();
+		const bool stageMapRefresh = mayStageDeferredMapRefresh(
+			m_WriteBuffer, m_Memory, *m_Bus );
 
 		// Opportunistic flush: one raster read. Cold traffic may use its small
 		// display ration; the active screen matrix and hot sprite shapes wait
@@ -881,7 +1132,8 @@ u64 CSuperCPU::runFrame()
 			                         SCPU_MIRROR_SCREEN_BYTES_PER_OPPORTUNITY,
 			                         m_Memory.m_VICRegShadow,
 			                         m_Memory.activeScreenBase(),
-			                         m_Memory.activeBitmapBase() );
+			                         m_Memory.activeBitmapBase(),
+			                         stageMapRefresh );
 
 		// Physical-C64 display DRAM can acquire sparse stored single-bit errors
 		// while the VIC is actively fetching. Repair the measured vulnerable
@@ -906,14 +1158,8 @@ u64 CSuperCPU::runFrame()
 					32, m_DisplayScrubMasked, m_DisplayScrubPhaseOn, false );
 			}
 		}
+		noteIECEpochDrainOpportunity();
 	}
-
-	// K381: once a serial transfer finishes and its ordinary dirty queue has
-	// drained, hold only the unconditional background rewrite for about ten
-	// seconds. If stored DRAM is corrupt, the VIC picture must remain corrupt
-	// until this hold expires and the unchanged sweep resumes. If the picture
-	// heals during the hold, the serial traffic disturbed fetches only.
-	updateResyncDiagnostic( sawIECThisFrame, sig.video );
 
 	// --- raster-scheduled mirroring ----------------------------------------
 	// Land in the border ON PURPOSE, once per frame.
@@ -953,18 +1199,22 @@ u64 CSuperCPU::runFrame()
 			const u64 ran = m_CPU->run( approachTicks / ticksPerCycle );
 			executed += ran;
 			m_FrameTickDebt += ran * ticksPerCycle;
+			updateIECEpochDiagnostic();
 		}
 
 		// Re-check the serial bus: the approach run may have started one.
 		if ( !m_MirrorHalted && !m_Memory.iecBusActive() )
 		{
+			const bool stageMapRefresh = mayStageDeferredMapRefresh(
+				m_WriteBuffer, m_Memory, *m_Bus );
 			flushMirrorsRasterAware( m_WriteBuffer, *m_Bus, sig,
 			                         displayPerOpportunity,
 			                         transferPerOpportunity,
 			                         SCPU_MIRROR_SCREEN_BYTES_PER_OPPORTUNITY,
 			                         m_Memory.m_VICRegShadow,
 			                         m_Memory.activeScreenBase(),
-			                         m_Memory.activeBitmapBase() );
+			                         m_Memory.activeBitmapBase(),
+			                         stageMapRefresh );
 
 			// Spare border time goes to convergence: re-deliver a slice of
 			// clean shadow so real DRAM provably approaches shadow no matter
@@ -973,10 +1223,6 @@ u64 CSuperCPU::runFrame()
 			// 512-byte sweep was an otherwise unexplained half-millisecond CPU
 			// pause whenever the ordinary queue happened to empty.
 			if ( m_WriteBuffer.empty()
-			     && !m_ResyncDiagnosticAwaitingDrain
-			     && !m_ResyncDiagnosticHolding
-			     && ( m_ResyncDiagnosticPhase == SCPU_RESYNC_DIAG_IDLE
-			       || m_ResyncDiagnosticPhase == SCPU_RESYNC_DIAG_COMPLETE )
 			     && m_Bus->signals().machine != MACHINE_C128 )
 			{
 				// On a physical C128 the background sweep is not benign: once
@@ -999,12 +1245,7 @@ u64 CSuperCPU::runFrame()
 			}
 		}
 	}
-
-	// At the end of the no-repair observation, deliberately rewrite exactly the
-	// active picture from authoritative shadow. This is independent of the old
-	// background sweep's queue-dependent trigger, so K381 always contains a
-	// real repair phase even when the loader leaves no dirty entries behind.
-	runResyncDiagnosticRepair( sig );
+	noteIECEpochDrainOpportunity();
 
 	// Pacing is no longer done here. It happens after every instruction in
 	// CC64Memory::tick(), because frame granularity (~20ms) is far too coarse

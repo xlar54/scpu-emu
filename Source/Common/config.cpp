@@ -102,6 +102,7 @@ int cfgDisplayScrubMask = 1;
 int cfgDisplayScrubPeriodS = 0;
 int cfgVideoMode = SCPU_CFG_VIDEO_DEFAULT;
 int cfgREUSize = REUSIZE_NONE;
+int cfgRAMUnderIO = SCPU_CFG_RAM_UNDER_IO_DEFAULT;
 
 char cfg[ 65536 ];
 
@@ -135,6 +136,7 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	cfgDisplayScrubMask = 1;
 	cfgDisplayScrubPeriodS = 0;
 	cfgVideoMode = SCPU_CFG_VIDEO_DEFAULT;
+	cfgRAMUnderIO = SCPU_CFG_RAM_UNDER_IO_DEFAULT;
 
 	// Leave a byte spare so cfg is always NUL-terminated for the line scanner.
 	if ( !readFile( logger, DRIVE, FILENAME, (u8*)cfg, &cfgBytes, sizeof( cfg ) - 1 ) )
@@ -162,6 +164,7 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	bool displayScrubPeriodSeen = false;
 	bool videoModeSeen = false;
 	bool reuSizeSeen = false;
+	bool ramUnderIOSeen = false;
 
 	while ( *cfgPos != 0 )
 	{
@@ -201,6 +204,7 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 						if ( i == 40 ) displayScrubPeriodSeen = true;
 						if ( i == 41 ) videoModeSeen = true;
 						if ( i == 42 ) reuSizeSeen = true;
+						if ( i == 43 ) ramUnderIOSeen = true;
 						while ( *ptr == '\t' || *ptr == ' ' ) ptr++;
 					#ifdef DEBUG_OUT
 						logger->Write( "RaspiMenu", LogNotice, "  %s >%d< (%s)", timingNames[ i ], timingValues[ i ], ptr );
@@ -332,6 +336,14 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 		cfgREUSize = timingValues[ 42 ];
 		if ( cfgREUSize < REUSIZE_NONE || cfgREUSize > REUSIZE_16MB )
 			cfgREUSize = REUSIZE_NONE;
+	}
+
+	if ( ramUnderIOSeen )
+	{
+		cfgRAMUnderIO = timingValues[ 43 ];
+		if ( cfgRAMUnderIO < SCPU_CFG_RAM_UNDER_IO_OFF
+		     || cfgRAMUnderIO > SCPU_CFG_RAM_UNDER_IO_AUTO )
+			cfgRAMUnderIO = SCPU_CFG_RAM_UNDER_IO_DEFAULT;
 	}
 
 	return 1;

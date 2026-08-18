@@ -84,14 +84,19 @@ void CC64Memory::notePollHold()
 	// handler), which is the lesson the mirror-blackout latch-up taught.
 	const bool explicitlySlow = m_SelectedEmulatedHz != 0
 	                         && m_SelectedEmulatedHz <= 1000000u;
-	if ( !m_IECThrottleEnabled || explicitlySlow )
+	if ( !m_IECThrottleEnabled )
 		return;
 	if ( m_IECPollHoldCycles < 1000 )
 	{
 		const bool wasInactive = ( m_IECPollHoldCycles == 0
 		                        && m_IECHoldCycles == 0 );
 		m_IECPollHoldCycles = 1000;
-		if ( wasInactive )
+		// At an explicitly selected 1MHz the SPEED effect is redundant, but
+		// the sustained-poll evidence is not: a loader can be in a tight
+		// BIT $DD00 wait while the edge-only transaction window expires. Keep
+		// recording the short poll top-up, without announcing a rate change
+		// that did not actually occur.
+		if ( wasInactive && !explicitlySlow )
 		{
 			cia2OnRateChange();		// effective speed just changed
 			if ( m_TimingHook )
@@ -327,7 +332,8 @@ u8 CC64Memory::allocRelocBlock( u8 v )
 	// bitmap mode on; $D018 bit 3 picks the half. 8K starting at $C000 covers
 	// the whole window -- in that configuration there is nothing to allocate.
 	const bool lowBitmap = ( m_VICRegShadow[ 0x11 ] & 0x20 )
-	                    && !( m_LastD018 & 0x08 );
+	                    && !( m_LastD018 & 0x08 )
+	                    && !m_DisplayRelocActive;
 
 	for ( u8 r = 0; r < 0x30; r++ )
 	{
@@ -346,6 +352,7 @@ u8 CC64Memory::allocRelocBlock( u8 v )
 		m_RelocInUse[ r ] = v;
 		m_RelocCount++;
 		m_RelocAllocs++;
+		m_DisplayRelocGeneration++;
 
 		// Re-issue the shape's current shadow bytes at their under-I/O source
 		// addresses, with the tables already armed: the write buffer's
@@ -364,6 +371,46 @@ u8 CC64Memory::allocRelocBlock( u8 v )
 	return 0xFF;
 }
 
+void CC64Memory::recomputeVICPhysicalMap()
+{
+	const bool oldActive = m_DisplayRelocActive;
+	const u16 oldScreen = m_DisplayRelocScreenSource;
+	const u16 oldGraphics = m_DisplayRelocGraphicsSource;
+	const u16 oldLength = m_DisplayRelocGraphicsLength;
+
+	const u32 bank = activeVICBankBase();
+	const u32 screen = activeVICScreenBase();
+	u32 graphics = activeBitmapBase();
+	u32 graphicsLength = 8192;
+	if ( graphics >= 0x10000 )
+	{
+		graphics = activeCharsetBase();
+		graphicsLength = graphics < 0x10000 ? 2048 : 0;
+	}
+
+	const bool screenUnderIO = screen < 0xE000 && screen + 1024 > 0xD000;
+	const bool graphicsUnderIO = graphics < 0xE000
+	                          && graphics + graphicsLength > 0xD000;
+	m_DisplayRelocActive = m_RelocEnable && !m_RAMUnderIOAccessible
+	                    && bank == 0xC000
+	                    && ( screenUnderIO || graphicsUnderIO );
+	m_DisplayRelocScreenSource = (u16)screen;
+	m_DisplayRelocGraphicsSource = graphics < 0x10000 ? (u16)graphics : 0;
+	m_DisplayRelocGraphicsLength = (u16)graphicsLength;
+
+	const bool physicalMapChanged = oldActive != m_DisplayRelocActive
+	                             || ( m_DisplayRelocActive
+	                                  && ( oldScreen != m_DisplayRelocScreenSource
+	                                    || oldGraphics != m_DisplayRelocGraphicsSource
+	                                    || oldLength != m_DisplayRelocGraphicsLength ) );
+	if ( !physicalMapChanged )
+		return;
+
+	m_DisplayRelocGeneration++;
+	if ( m_Mirror )
+		m_Mirror->onVICMapChanged( screen, graphics, graphicsLength );
+}
+
 void CC64Memory::reset()
 {
 	m_Port00 = 0x2F;
@@ -380,6 +427,11 @@ void CC64Memory::reset()
 	m_LastCIA2PortARead = 0;
 	m_LastD018 = 0x14;			// the KERNAL default: screen $0400, charset $1000
 	m_SpritePtrBase = m_PreviousSpritePtrBase = 0xFFFFFFFF;
+	for ( u32 i = 0; i < 0x40; i++ ) m_VICRegShadow[ i ] = 0;
+	m_CIA2DDRA = 0;
+	m_HaveCIA2PortALatch = false;
+	m_HaveCIA2PortARead = false;
+	m_HaveCIA2DDRA = false;
 	// Relocation tables before updateHotShapeBlocks, which consults them.
 	// Cleared on reset: the game that allocated them is gone, and stale
 	// mappings would translate a NEW program's pointers to blocks holding the
@@ -387,13 +439,9 @@ void CC64Memory::reset()
 	for ( u32 i = 0; i < 0x40; i++ ) m_PtrReloc[ i ] = 0xFF;
 	for ( u32 i = 0; i < 0x30; i++ ) m_RelocInUse[ i ] = 0xFF;
 	m_RelocCount = 0;
+	recomputeVICPhysicalMap();
 	updateSpritePtrBase();
 	updateHotShapeBlocks();
-	for ( u32 i = 0; i < 0x40; i++ ) m_VICRegShadow[ i ] = 0;
-	m_CIA2DDRA = 0;
-	m_HaveCIA2PortALatch = false;
-	m_HaveCIA2PortARead = false;
-	m_HaveCIA2DDRA = false;
 	m_IOLogPos = 0;
 	m_CIALogPos = 0;
 	m_CIALastRead = 0xFFFFFFFF;
@@ -708,6 +756,13 @@ u8 CC64Memory::read8( scpu_addr_t addr )
 			// through write8(), so the shadow is authoritative for the low bits.
 			if ( a == 0xD011 )
 				v = (u8)( ( v & 0x80 ) | ( m_VICRegShadow[ 0x11 ] & 0x7F ) );
+			// In fallback relocation mode the physical VIC receives a private
+			// backing-store selector (for example $39 while Test Drive's guest
+			// value remains $81).  That translated value is implementation state,
+			// not a guest-visible register change.  VIC registers mirror every $40
+			// bytes through $D3FF, so preserve the guest latch on every $D018 mirror.
+			if ( a >= 0xD000 && a < 0xD400 && vicReadRegister == 0x18 )
+				v = m_LastD018;
 			// PRA reads combine live input pins with the hidden output latch. Once
 			// both pieces of state are known, reconstruct that split explicitly:
 			// output bits come from our authoritative latch, input bits remain the
@@ -830,6 +885,7 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 
 	if ( c64WriteIsIO( a, m_BankMode ) )
 	{
+		const u32 physicalMapBefore = m_DisplayRelocGeneration;
 		if ( m_IO && m_IO->ioWrite( a, value ) )
 		{
 			if ( m_IO->ioAccessUsesWriteBuffer( a, true ) )
@@ -890,27 +946,49 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 		// corresponding DDRA bit makes that pin an output.
 		if ( a == 0xDD00 )
 		{
+			const u32 vicBankBefore = activeVICBankBase();
+			const bool vicBankWasKnown = m_HaveCIA2PortALatch && m_HaveCIA2DDRA;
 			m_CIA2PortALatch = value;
 			m_HaveCIA2PortALatch = true;
-			updateSpritePtrBase();		// VIC bank lives in bits 0-1
-			updateHotShapeBlocks();
-			logVICBank();
+			// Bits 3-5 are the IEC outputs and toggle for every serial bit.
+			// They cannot alter the VIC map, sprite pointers or hot blocks.
+			// Keep that timing-critical path out of display bookkeeping entirely.
+			if ( !vicBankWasKnown || activeVICBankBase() != vicBankBefore )
+			{
+				recomputeVICPhysicalMap();
+				updateSpritePtrBase();		// VIC bank lives in bits 0-1
+				updateHotShapeBlocks();
+				logVICBank();
+			}
 			if ( cia2IECChanged )
 				noteIECActivity();
 		}
 		else if ( vicWrite && vicReg == 0x18 )
 		{
+			const u8 oldD018 = m_LastD018;
 			m_LastD018 = value;
-			updateSpritePtrBase();
-			updateHotShapeBlocks();
+			// Bit 0 is unused by the VIC memory selectors. Preserve it in the
+			// physical write below, but avoid rebuilding an unchanged map.
+			if ( ( oldD018 ^ value ) & 0xFE )
+			{
+				recomputeVICPhysicalMap();
+				updateSpritePtrBase();
+				updateHotShapeBlocks();
+			}
 		}
 		else if ( a == 0xDD02 )
 		{
+			const u32 vicBankBefore = activeVICBankBase();
+			const bool vicBankWasKnown = m_HaveCIA2PortALatch && m_HaveCIA2DDRA;
 			m_CIA2DDRA = value;
 			m_HaveCIA2DDRA = true;
-			updateSpritePtrBase();		// input pins float high; direction can move the VIC bank
-			updateHotShapeBlocks();
-			logVICBank();
+			if ( !vicBankWasKnown || activeVICBankBase() != vicBankBefore )
+			{
+				recomputeVICPhysicalMap();
+				updateSpritePtrBase();		// input pins float high; direction can move the VIC bank
+				updateHotShapeBlocks();
+				logVICBank();
+			}
 			if ( cia2IECChanged )
 				noteIECActivity();
 		}
@@ -944,7 +1022,19 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 					noteRasterPrecise( m_RasterCompare );
 			}
 
+			const u8 oldVICValue = m_VICRegShadow[ vicReg ];
 			m_VICRegShadow[ vicReg ] = value;
+			if ( vicReg == 0x11 )
+			{
+				// Only BMM selects between charset and bitmap backing. DEN,
+				// scrolling and raster-MSB changes remain immediate but map-neutral.
+				if ( ( oldVICValue ^ value ) & 0x20 )
+				{
+					recomputeVICPhysicalMap();
+					updateSpritePtrBase();
+					updateHotShapeBlocks();
+				}
+			}
 			// Maintain both halves even while capture is disabled, so enabling
 			// VIDEO_MODE 1 never begins with a stale compare line.
 			if ( vicReg == 0x11 || vicReg == 0x12 )
@@ -971,7 +1061,18 @@ void CC64Memory::write8( scpu_addr_t addr, u8 value )
 			noteMirrorWrite();
 		else
 			noteBusAccess( a, true );
-		if ( m_C64 ) m_C64->write( a, value );
+		if ( m_C64 )
+		{
+			const u8 physicalValue = vicWrite && vicReg == 0x18
+			                       ? vicPhysicalD018( value ) : value;
+			m_C64->write( a, physicalValue );
+			// $D011, $DD00 and $DD02 can activate/deactivate relocation
+			// without a guest $D018 write. Keep the physical selector paired
+			// with the new backing map while guest-visible state stays intact.
+			if ( physicalMapBefore != m_DisplayRelocGeneration
+			     && !( vicWrite && vicReg == 0x18 ) )
+				m_C64->write( 0xD018, vicPhysicalD018( m_LastD018 ) );
+		}
 		return;
 	}
 

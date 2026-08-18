@@ -56,6 +56,12 @@ public:
 	virtual bool onRamWrite( u16 addr, u8 value ) = 0;
 	virtual void flush() = 0;
 	virtual u32  pendingBytes() { return 0; }
+	// The physical VIC backing map changed after a $D011/$D018/$DD00 write.
+	// Implementations may re-queue the newly selected guest-shadow regions;
+	// timing-only or test sinks can ignore it.
+	virtual void onVICMapChanged( u32 screenBase, u32 graphicsBase,
+	                              u32 graphicsLength )
+		{ (void)screenBase; (void)graphicsBase; (void)graphicsLength; }
 
 	// Drain at most maxBytes, oldest first; returns bytes still pending. The
 	// default drains everything -- only budgeted implementations can promise
@@ -288,10 +294,16 @@ public:
 		if ( m_C64 )
 		{
 			const u8 delivered = relocPointerValue( v );
-			if ( m_RAMUnderIOAccessible && a >= 0xD000 && a <= 0xDFFF )
-				m_C64->writeRAM( a, delivered );
-			else
-				m_C64->write( a, delivered );
+			bool physical = true;
+			const u16 target = vicPhysicalAddress( a, physical );
+			if ( physical )
+			{
+				if ( m_RAMUnderIOAccessible
+				     && target >= 0xD000 && target <= 0xDFFF )
+					m_C64->writeRAM( target, delivered );
+				else
+					m_C64->write( target, delivered );
+			}
 		}
 		updateHotShapeBlocks();
 
@@ -685,13 +697,17 @@ public:
 			m_IECActivityCycles = ( m_IECActivityCycles > nCycles )
 			                    ? ( m_IECActivityCycles - nCycles ) : 0;
 
-		// The poll-sustained SPEED hold decays the same way; its expiry is a
-		// rate transition for armed CIA2 deadlines.
+		// Poll evidence decays the same way. In turbo its expiry is also a rate
+		// transition; at an explicitly selected 1MHz it is activity evidence
+		// only, so no effective-rate notification is needed.
+		const bool explicitlySlow = m_SelectedEmulatedHz != 0
+		                         && m_SelectedEmulatedHz <= 1000000u;
 		if ( m_IECPollHoldCycles )
 		{
 			m_IECPollHoldCycles = ( m_IECPollHoldCycles > nCycles )
 			                    ? ( m_IECPollHoldCycles - nCycles ) : 0;
-			if ( m_IECPollHoldCycles == 0 && m_IECHoldCycles == 0 )
+			if ( m_IECPollHoldCycles == 0 && m_IECHoldCycles == 0
+			     && !explicitlySlow )
 			{
 				cia2OnRateChange();
 				if ( m_TimingHook )
@@ -700,7 +716,7 @@ public:
 		}
 
 		const bool iecActive = ( m_IECHoldCycles != 0 )
-		                    || ( m_IECPollHoldCycles != 0 );
+		                    || ( m_IECPollHoldCycles != 0 && !explicitlySlow );
 		if ( iecActive )
 			m_IECThrottledCycles += nCycles;
 		if ( iecActive || ( m_SelectedEmulatedHz != 0
@@ -791,8 +807,15 @@ public:
 	void setIECThrottle( bool enabled ) { m_IECThrottleEnabled = enabled; }
 	bool iecThrottleActive() const
 	{
-		return m_IECHoldCycles > 0 || m_IECPollHoldCycles > 0;
+		const bool explicitlySlow = m_SelectedEmulatedHz != 0
+		                         && m_SelectedEmulatedHz <= 1000000u;
+		return m_IECHoldCycles > 0
+		    || ( m_IECPollHoldCycles > 0 && !explicitlySlow );
 	}
+	// Positive guest-activity evidence, distinct from the automatic-speed
+	// fallback above. This remains meaningful when software explicitly chose
+	// 1MHz, which is exactly when cycle-timed IEC loaders do their polling.
+	bool iecPollActive() const { return m_IECPollHoldCycles != 0; }
 
 	// The 65816 normally batches several instructions before ticking the C64
 	// bus. That is safe at turbo speed, but not at an effective/selected 1MHz:
@@ -1010,10 +1033,11 @@ private:
 	bool m_IECThrottleEnabled;
 	u32  m_IECHoldCycles;		// emulated cycles left at forced 1MHz
 	u32  m_IECActivityCycles = 0;	// edge-rearmed transaction window (countdown)
-	// SPEED-only hold sustained by serial-port READS (mere polls included):
+	// Poll activity sustained by serial-port READS (mere polls included):
 	// the real SuperCPU's auto-slow re-arms on every access. Kept apart from
 	// m_IECHoldCycles because iecBusActive() -- the MIRROR gate -- must never
-	// see it: polls suppressing mirroring is the blackout latch-up.
+	// see it globally: polls suppressing all mirroring is the blackout latch-up.
+	// The large deferred VIC-map replay may consult it through iecPollActive().
 	u32  m_IECPollHoldCycles = 0;
 public:
 	// Largest single tickFast() chunk seen. The 65816 run() loop batches bus
@@ -1041,13 +1065,121 @@ private:
 	u8   m_LastD018;
 	bool m_RAMUnderIOAccessible = false;
 public:
+	// Physical DRAM is a VIC backing store, not guest-owned memory: programs
+	// always read the Pi shadow. On hosts which cannot expose RAM under I/O
+	// without disturbing the VIC (notably the 64U), pack the active bank-3
+	// display into the three safe physical spans instead:
+	//
+	//   sprite pool  $C000-$CBFF
+	//   matrix       $CC00-$CFFF
+	//   graphics     $E000-$FFFF  (2K charset or 8K bitmap)
+	//
+	// Guest-visible $D011/$D018/$DD00 and RAM remain untouched. Only physical
+	// delivery addresses and the value written to the real VIC's $D018 differ.
+	bool m_DisplayRelocActive = false;
+	u16  m_DisplayRelocScreenSource = 0;
+	u16  m_DisplayRelocGraphicsSource = 0;
+	u16  m_DisplayRelocGraphicsLength = 0;
+	u32  m_DisplayRelocGeneration = 1;
+	static const u16 DISPLAY_RELOC_SCREEN_TARGET = 0xCC00;
+	static const u16 DISPLAY_RELOC_GRAPHICS_TARGET = 0xE000;
+
+	void setUnderIORelocate( bool enabled )
+	{
+		m_RelocEnable = enabled;
+		recomputeVICPhysicalMap();
+		updateSpritePtrBase();
+		updateHotShapeBlocks();
+	}
 	void setRAMUnderIOAccessible( bool accessible )
 	{
 		m_RAMUnderIOAccessible = accessible;
 		if ( accessible ) m_RelocEnable = false;
+		recomputeVICPhysicalMap();
 		updateSpritePtrBase();
 		updateHotShapeBlocks();
 	}
+
+	// Translate one guest-shadow byte to the DRAM address the physical VIC
+	// consumes. `deliver=false` means the guest address currently aliases a
+	// reserved physical target and must not overwrite it. This is the single
+	// authority used by queued flushes, sweeps, scrubs and immediate pointers.
+	inline u16 vicPhysicalAddress( u16 guest, bool &deliver ) const
+	{
+		deliver = true;
+		if ( m_DisplayRelocActive )
+		{
+			if ( (u16)( guest - m_DisplayRelocScreenSource ) < 1024 )
+				return (u16)( DISPLAY_RELOC_SCREEN_TARGET
+				              + (u16)( guest - m_DisplayRelocScreenSource ) );
+			if ( (u16)( guest - m_DisplayRelocGraphicsSource )
+			     < m_DisplayRelocGraphicsLength )
+				return (u16)( DISPLAY_RELOC_GRAPHICS_TARGET
+				              + (u16)( guest - m_DisplayRelocGraphicsSource ) );
+		}
+
+		// Existing under-I/O sprite relocation composes after the display map.
+		// A byte shared by an active bitmap and a sprite is delivered to the
+		// graphics copy here; the pointer allocation still protects the common
+		// real-world case where shapes are outside the active graphics span.
+		if ( m_RelocCount && guest >= 0xD000 && guest <= 0xDFFF )
+		{
+			const u8 r = m_PtrReloc[ ( guest >> 6 ) & 0x3F ];
+			if ( r != 0xFF )
+				return (u16)( 0xC000 + ( (u16)r << 6 ) + ( guest & 63 ) );
+		}
+
+		if ( m_DisplayRelocActive )
+		{
+			if ( (u16)( guest - DISPLAY_RELOC_SCREEN_TARGET ) < 1024
+			     || (u16)( guest - DISPLAY_RELOC_GRAPHICS_TARGET )
+			        < m_DisplayRelocGraphicsLength )
+			{
+				deliver = false;
+				return guest;
+			}
+		}
+		if ( m_RelocCount && guest >= 0xC000 && guest < 0xCC00
+		     && m_RelocInUse[ ( guest - 0xC000 ) >> 6 ] != 0xFF )
+		{
+			deliver = false;
+			return guest;
+		}
+		return guest;
+	}
+
+	inline u8 vicPhysicalValue( u16 guest, u8 value ) const
+	{
+		// Relocated shape bytes can themselves fall in the last eight bytes of a
+		// possible matrix slot. They are data, never pointers.
+		if ( m_RelocCount && guest >= 0xD000 && guest <= 0xDFFF
+		     && m_PtrReloc[ ( guest >> 6 ) & 0x3F ] != 0xFF )
+			return value;
+		// The production write-buffer path comes through this function. A stolen
+		// $C000-$CBFF block contains relocated shape DATA, even when its final
+		// eight bytes happen to have the address shape of a sprite-pointer row.
+		// The legacy deliverValue() path already had this guard; omitting it here
+		// corrupted blocks 15, 31 and 47 whenever a tail byte was $40-$7F.
+		if ( m_RelocCount && guest >= 0xC000 && guest < 0xCC00
+		     && m_RelocInUse[ ( guest - 0xC000 ) >> 6 ] != 0xFF )
+			return value;
+		if ( m_RelocCount && guest >= 0xC000
+		     && ( guest & 0x03FF ) >= 0x03F8
+		     && value >= 0x40 && value < 0x80 )
+		{
+			const u8 r = m_PtrReloc[ value - 0x40 ];
+			if ( r != 0xFF ) return r;
+		}
+		return value;
+	}
+
+	inline u8 vicPhysicalD018( u8 guestValue ) const
+	{
+		return m_DisplayRelocActive ? (u8)( 0x38 | ( guestValue & 1 ) )
+		                            : guestValue;
+	}
+	u32 vicPhysicalMapGeneration() const { return m_DisplayRelocGeneration; }
+	void recomputeVICPhysicalMap();
 	// First byte of the active VIC screen matrix, or 0xFFFFFFFF when that
 	// matrix lies under an I/O window the physical bus cannot yet reach as RAM.
 	// The sprite-pointer tracker already follows both $D018 and CIA2's VIC-bank
@@ -1326,9 +1458,9 @@ public:
 			if ( !( enabled & ( 1u << n ) ) )
 				continue;
 			u32 v = m_RAM[ (u16)( m_SpritePtrBase + n ) ];
-			if ( m_RelocEnable && bank == 3 && v >= 0x40 && v < 0x80
-			     && m_PtrReloc[ v - 0x40 ] != 0xFF )
-				v = m_PtrReloc[ v - 0x40 ];
+			// The write queue is keyed by guest-shadow address. Deferral must
+			// therefore mark the SOURCE block even when physical delivery is
+			// redirected to a relocated copy.
 			const u32 blk = ( bank << 8 ) + v;
 			m_HotShapeBlocks[ blk >> 6 ] |= 1ULL << ( blk & 63 );
 		}
@@ -1353,7 +1485,7 @@ private:
 		               + ( (u32)( m_LastD018 >> 4 ) << 10 ) + 0x3F8;
 		// Before native delivery is armed, a pointer row under I/O is unreachable
 		// and its urgent write path must not touch the overlaid chip registers.
-		const u32 next = !m_RAMUnderIOAccessible
+		const u32 next = !m_RAMUnderIOAccessible && !m_DisplayRelocActive
 		              && ( ( base & 0xF000 ) == 0xD000 )
 		               ? 0xFFFFFFFF : base;
 		if ( next != m_SpritePtrBase )

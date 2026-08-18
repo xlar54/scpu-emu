@@ -320,6 +320,16 @@ This is required for a bank-3 bitmap at `$C000`, whose lower 3904 bytes occupy
 `$D000-$DF3F`. The old blanket suppression remains the fail-safe until that
 physical map verifies, and on host types where it is not yet enabled.
 
+`RAM_UNDER_IO` controls this physical mechanism. Its deterministic default `0`
+uses the conventional-map fallback and relocates the active bank-3 matrix plus
+bitmap or charset into safe VIC backing RAM. Guest addresses and register reads
+remain unchanged. `1` forces the native all-RAM map with per-access `/GAME`.
+`2` retains the takeover-based automatic probe for diagnostics, but is not
+recommended: the tested 64U accepts the standard takeover while its synchronous
+cartridge logic still carries per-access `/GAME` selection into VIC fetch state,
+visibly sparkling during even isolated I/O reads and writes. Takeover acceptance
+therefore does not prove display compatibility.
+
 **Note for the C128:** the memory-locations reference describes `$D07A` as
 selecting *"Normal (1 MHz or 2 MHz in 128 Fast mode)"*. So on a SuperCPU 128 the
 non-turbo speed follows the C128's own 2 MHz state rather than being forced to

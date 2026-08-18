@@ -19,6 +19,51 @@
 */
 #include "write_buffer.h"
 
+// Passive instrumentation is intentionally outside CWriteBuffer. The buffer
+// is embedded in CSuperCPU, and enlarging it moved the live CRADBus object in
+// the bare-metal image enough to upset the 64U's acquisition probe.
+static bool s_RangeWriteCountEnabled = false;
+static u32  s_RangeWriteCountBase = 0;
+static u32  s_RangeWriteCountLength = 0;
+static u64  s_RangeWriteCountAccepted = 0;
+static u64  s_RangeWriteCountCoalesced = 0;
+// Source addresses paired with m_Burst. Kept outside CWriteBuffer so adding
+// translation does not move the large live SuperCPU/RAD objects in the
+// bare-metal image (an earlier diagnostic enlargement changed acquisition).
+static u16  s_BurstGuest[ SCPU_WRITEBUF_CHUNK ];
+
+// A VIC-map change is initiated by a guest I/O instruction. K402 used to
+// invalidate the complete matrix plus bitmap/charset synchronously from that
+// instruction -- as much as 9KB of queue work BEFORE the physical $D011,
+// $D018 or $DD00 edge. Keep only the description here and let the established
+// raster scheduler feed it into the queue in bounded installments.
+//
+// This deliberately remains outside CWriteBuffer. Enlarging the embedded live
+// object has already been shown to move CRADBus enough to alter 64U takeover.
+struct PendingVICMapRefresh
+{
+	const CWriteBuffer *owner;
+	u32 base[ 2 ];
+	u32 length[ 2 ];
+	u32 offset[ 2 ];
+	u32 syncedClearWord;
+	bool syncedClearPending;
+};
+
+static PendingVICMapRefresh s_MapRefresh = {
+	0, { 0xFFFFFFFF, 0xFFFFFFFF }, { 0, 0 }, { 0, 0 }, 0, false
+};
+
+static inline void resetMapRefresh( const CWriteBuffer *owner )
+{
+	s_MapRefresh.owner = owner;
+	s_MapRefresh.base[ 0 ] = s_MapRefresh.base[ 1 ] = 0xFFFFFFFF;
+	s_MapRefresh.length[ 0 ] = s_MapRefresh.length[ 1 ] = 0;
+	s_MapRefresh.offset[ 0 ] = s_MapRefresh.offset[ 1 ] = 0;
+	s_MapRefresh.syncedClearWord = 0;
+	s_MapRefresh.syncedClearPending = false;
+}
+
 CWriteBuffer::CWriteBuffer()
 	: m_WritesAccepted( 0 ), m_WritesEliminated( 0 ),
 	  m_RelocForwarded( 0 ), m_RelocShielded( 0 ), m_BytesResynced( 0 ),
@@ -40,6 +85,11 @@ CWriteBuffer::CWriteBuffer()
 	  m_NoProgressScreenBase( 0xFFFFFFFF ),
 	  m_NoProgressBitmapBase( 0xFFFFFFFF )
 {
+	s_RangeWriteCountEnabled = false;
+	s_RangeWriteCountBase = 0xFFFFFFFF;
+	s_RangeWriteCountLength = 0;
+	s_RangeWriteCountAccepted = 0;
+	s_RangeWriteCountCoalesced = 0;
 	m_DisplayScrubSampled[ 0 ] = m_DisplayScrubSampled[ 1 ] = 0;
 	m_DisplayScrubMismatches[ 0 ] = m_DisplayScrubMismatches[ 1 ] = 0;
 	clearDirty();
@@ -58,6 +108,116 @@ void CWriteBuffer::attach( IC64Bus *bus, const u8 *ram )
 	m_DisplayScrubTurn = 0;
 	m_QueueGeneration++;
 	m_NoProgressValid = false;
+}
+
+void CWriteBuffer::attachDisplayTranslation( const CC64Memory *memory )
+{
+	m_DisplayMemory = memory;
+	m_PhysicalMapGeneration = memory
+	                        ? memory->vicPhysicalMapGeneration() : 0;
+	resetMapRefresh( this );
+}
+
+void CWriteBuffer::clearPendingMapRefresh()
+{
+	if ( s_MapRefresh.owner == this )
+		resetMapRefresh( this );
+}
+
+u32 CWriteBuffer::pendingMapRefreshBytes() const
+{
+	if ( s_MapRefresh.owner != this ) return 0;
+	u32 pending = 0;
+	for ( u32 region = 0; region < 2; region++ )
+		pending += s_MapRefresh.length[ region ] - s_MapRefresh.offset[ region ];
+	return pending;
+}
+
+u32 CWriteBuffer::pending() const
+{
+	return m_Count + pendingMapRefreshBytes();
+}
+
+bool CWriteBuffer::empty() const
+{
+	return m_Count == 0 && pendingMapRefreshBytes() == 0
+	    && !( s_MapRefresh.owner == this && s_MapRefresh.syncedClearPending );
+}
+
+bool CWriteBuffer::pendingMapRefreshInRange( u32 base, u32 len,
+	                                          u32 *count ) const
+{
+	if ( count ) *count = 0;
+	if ( s_MapRefresh.owner != this || base >= 0x10000 || len == 0 )
+		return false;
+	u32 end = base + len;
+	if ( end > 0x10000 || end < base ) end = 0x10000;
+	u32 total = 0;
+	for ( u32 region = 0; region < 2; region++ )
+	{
+		const u32 first = s_MapRefresh.base[ region ]
+		                + s_MapRefresh.offset[ region ];
+		const u32 last = s_MapRefresh.base[ region ]
+		               + s_MapRefresh.length[ region ];
+		const u32 lo = first > base ? first : base;
+		const u32 hi = last < end ? last : end;
+		if ( hi > lo ) total += hi - lo;
+	}
+	if ( count ) *count = total;
+	return total != 0;
+}
+
+void CWriteBuffer::syncPhysicalMapGeneration()
+{
+	if ( !m_DisplayMemory ) return;
+	const u32 generation = m_DisplayMemory->vicPhysicalMapGeneration();
+	if ( generation == m_PhysicalMapGeneration ) return;
+
+	// Sprite-block allocation changes the delivery translation generation too,
+	// without changing the active matrix/graphics ranges. Disarm same-value
+	// elimination lazily; the allocation's own 64-byte replay supplies its
+	// translated data, while this bitset clear is scheduler-sized.
+	if ( s_MapRefresh.owner != this ) resetMapRefresh( this );
+	m_PhysicalMapGeneration = generation;
+	s_MapRefresh.syncedClearWord = 0;
+	s_MapRefresh.syncedClearPending = true;
+	m_NoProgressValid = false;
+}
+
+void CWriteBuffer::servicePendingMapRefresh( u32 maxBytes )
+{
+	syncPhysicalMapGeneration();
+	if ( s_MapRefresh.owner != this ) return;
+
+	// Clear at most 64 words (4KB of address coverage) per scheduler call.
+	// A guest write arriving before its word is reached explicitly disarms its
+	// own bit in onRamWrite(), so the deferred clear cannot eliminate a required
+	// write in the meantime.
+	if ( s_MapRefresh.syncedClearPending )
+	{
+		u32 words = 64;
+		while ( words-- && s_MapRefresh.syncedClearWord < 0x10000 / 64 )
+			m_Synced[ s_MapRefresh.syncedClearWord++ ] = 0;
+		if ( s_MapRefresh.syncedClearWord == 0x10000 / 64 )
+			s_MapRefresh.syncedClearPending = false;
+		m_NoProgressValid = false;
+	}
+
+	if ( !m_DeliveryEnabled || !m_RAM || maxBytes == 0 ) return;
+	u32 staged = 0;
+	for ( u32 region = 0; region < 2 && staged < maxBytes; region++ )
+	{
+		while ( s_MapRefresh.offset[ region ] < s_MapRefresh.length[ region ]
+		        && staged < maxBytes )
+		{
+			const u16 a = (u16)( s_MapRefresh.base[ region ]
+			                         + s_MapRefresh.offset[ region ]++ );
+			m_Synced[ a >> 6 ] &= ~( 1ULL << ( a & 63 ) );
+			onRamWrite( a, m_RAM[ a ] );
+			staged++;
+		}
+	}
+	if ( staged ) m_NoProgressValid = false;
 }
 
 void CWriteBuffer::clearDirty()
@@ -156,8 +316,13 @@ bool CWriteBuffer::shouldMirror( u16 addr ) const
 	// or rolling picture -- which is precisely the fault this was hunting.
 	if ( !m_RAMUnderIOAccessible && addr >= 0xD000 && addr <= 0xDFFF )
 	{
-		m_IOWindowSuppressed++;
-		return false;
+		bool deliver = true;
+		const u16 physical = physicalAddress( addr, deliver );
+		if ( !deliver || physical == addr )
+		{
+			m_IOWindowSuppressed++;
+			return false;
+		}
 	}
 
 	return ( addr >= m_RangeLo && addr <= m_RangeHi );
@@ -165,6 +330,9 @@ bool CWriteBuffer::shouldMirror( u16 addr ) const
 
 bool CWriteBuffer::onRamWrite( u16 addr, u8 value )
 {
+	syncPhysicalMapGeneration();
+	if ( s_MapRefresh.owner == this && s_MapRefresh.syncedClearPending )
+		m_Synced[ addr >> 6 ] &= ~( 1ULL << ( addr & 63 ) );
 	// VIDEO_MODE 1 owns presentation from Pi shadow RAM. Keep only the real
 	// card's optimisation decision for posted-write timing; do not relocate,
 	// eliminate, dirty or enqueue a byte that can never be delivered. A real
@@ -181,34 +349,6 @@ bool CWriteBuffer::onRamWrite( u16 addr, u8 value )
 		return false;
 	}
 
-	// Under-I/O shape relocation, when armed. A write into a relocated
-	// $D000-$DFFF block is forwarded to the block's deliverable copy; a
-	// program write into the copy's own underlying address is suppressed,
-	// because that DRAM now belongs to the relocated shape and is only ever
-	// fetched by the VIC through the translated pointer. Both directions
-	// disarm same-value elimination: the shadow at the delivery address holds
-	// the program's data, not what was last put on the bus.
-	if ( m_RelocCount && *m_RelocCount )
-	{
-		if ( addr >= 0xD000 )
-		{
-			const u8 r = m_PtrReloc[ ( addr >> 6 ) & 0x3F ];
-			if ( addr <= 0xDFFF && r != 0xFF )
-			{
-				addr = (u16)( 0xC000 + ( (u16)r << 6 ) + ( addr & 63 ) );
-				m_RelocForwarded++;
-				m_Synced[ addr >> 6 ] &= ~( 1ULL << ( addr & 63 ) );
-			}
-		}
-		else if ( addr >= 0xC000 && addr < 0xCC00
-		          && m_RelocInUse[ ( (u32)addr - 0xC000 ) >> 6 ] != 0xFF )
-		{
-			m_RelocShielded++;
-			m_Synced[ addr >> 6 ] &= ~( 1ULL << ( addr & 63 ) );
-			return false;
-		}
-	}
-
 	if ( !shouldMirror( addr ) )
 	{
 		m_WritesSkipped++;
@@ -222,6 +362,24 @@ bool CWriteBuffer::onRamWrite( u16 addr, u8 value )
 		// stayed garbage on the real screen while the shadow was perfect.
 		m_Synced[ addr >> 6 ] &= ~( 1ULL << ( addr & 63 ) );
 		return false;
+	}
+
+	bool physicalDelivery = true;
+	const u16 physical = physicalAddress( addr, physicalDelivery );
+	if ( !physicalDelivery )
+	{
+		// The shadow remains guest-faithful, but this physical byte belongs to
+		// an active relocated display region. Charge the posted-write slot just
+		// like real C64 RAM while preventing it from corrupting the VIC copy.
+		m_RelocShielded++;
+		m_WritesAccepted++;
+		m_Synced[ addr >> 6 ] &= ~( 1ULL << ( addr & 63 ) );
+		return true;
+	}
+	if ( physical != addr )
+	{
+		m_RelocForwarded++;
+		m_Synced[ addr >> 6 ] &= ~( 1ULL << ( addr & 63 ) );
 	}
 
 	// The caller stores AFTER this sink runs, so m_RAM still holds what real
@@ -243,6 +401,10 @@ bool CWriteBuffer::onRamWrite( u16 addr, u8 value )
 	}
 
 	m_WritesAccepted++;
+	if ( s_RangeWriteCountEnabled
+	     && (u32)addr >= s_RangeWriteCountBase
+	     && (u32)addr - s_RangeWriteCountBase < s_RangeWriteCountLength )
+		s_RangeWriteCountAccepted++;
 	m_PendingValue[ addr ] = value;
 
 	if ( isDirty( addr ) )
@@ -256,6 +418,10 @@ bool CWriteBuffer::onRamWrite( u16 addr, u8 value )
 		if ( isPotentialVICSpritePointer( addr ) )
 			moveDirtyToTail( addr );
 		m_WritesCoalesced++;
+		if ( s_RangeWriteCountEnabled
+		     && (u32)addr >= s_RangeWriteCountBase
+		     && (u32)addr - s_RangeWriteCountBase < s_RangeWriteCountLength )
+			s_RangeWriteCountCoalesced++;
 		return true;
 	}
 
@@ -270,6 +436,31 @@ bool CWriteBuffer::onRamWrite( u16 addr, u8 value )
 		m_QueueGeneration++;
 	}
 	return true;
+}
+
+void CWriteBuffer::onVICMapChanged( u32 screenBase, u32 graphicsBase,
+	                                u32 graphicsLength )
+{
+	if ( s_MapRefresh.owner != this ) resetMapRefresh( this );
+	if ( m_DisplayMemory )
+		m_PhysicalMapGeneration = m_DisplayMemory->vicPhysicalMapGeneration();
+	s_MapRefresh.syncedClearWord = 0;
+	s_MapRefresh.syncedClearPending = true;
+	s_MapRefresh.base[ 0 ] = screenBase < 0x10000
+	                     ? screenBase : 0xFFFFFFFF;
+	s_MapRefresh.length[ 0 ] = screenBase < 0x10000 ? 1024 : 0;
+	s_MapRefresh.offset[ 0 ] = 0;
+	s_MapRefresh.base[ 1 ] = graphicsBase < 0x10000 && graphicsLength
+	                     ? graphicsBase : 0xFFFFFFFF;
+	s_MapRefresh.length[ 1 ] = graphicsBase < 0x10000
+	                       ? graphicsLength : 0;
+	s_MapRefresh.offset[ 1 ] = 0;
+	if ( !m_DeliveryEnabled || !m_RAM )
+	{
+		s_MapRefresh.length[ 0 ] = s_MapRefresh.length[ 1 ] = 0;
+		s_MapRefresh.syncedClearPending = false;
+	}
+	m_NoProgressValid = false;
 }
 
 void CWriteBuffer::invalidateRange( u16 addr, u32 length )
@@ -292,10 +483,13 @@ static inline bool addressInRange( u16 addr, u32 base, u32 len )
 	    && (u32)addr >= base && (u32)addr - base < len;
 }
 
-bool CWriteBuffer::hasPendingInRange( u32 base, u32 len ) const
+bool CWriteBuffer::hasPendingInRange( u32 base, u32 len,
+	                                  bool includeMapRefresh ) const
 {
 	if ( base >= 0x10000 || len == 0 )
 		return false;
+	if ( includeMapRefresh && pendingMapRefreshInRange( base, len ) )
+		return true;
 	u32 end = base + len;
 	if ( end > 0x10000 ) end = 0x10000;
 
@@ -312,11 +506,54 @@ bool CWriteBuffer::hasPendingInRange( u32 base, u32 len ) const
 	return false;
 }
 
+u32 CWriteBuffer::pendingInRange( u32 base, u32 len ) const
+{
+	if ( base >= 0x10000 || len == 0 )
+		return 0;
+	u32 count = 0;
+	pendingMapRefreshInRange( base, len, &count );
+	u32 end = base + len;
+	if ( end > 0x10000 || end < base ) end = 0x10000;
+
+	const u32 first = base >> 6;
+	const u32 last = ( end - 1 ) >> 6;
+	for ( u32 w = first; w <= last; w++ )
+	{
+		u64 bits = m_Dirty[ w ];
+		if ( w == first ) bits &= ~0ULL << ( base & 63 );
+		if ( w == last && ( end & 63 ) )
+			bits &= ( 1ULL << ( end & 63 ) ) - 1;
+		while ( bits )
+		{
+			bits &= bits - 1;
+			count++;
+		}
+	}
+	return count;
+}
+
+void CWriteBuffer::beginRangeWriteCount( u32 base, u32 len )
+{
+	s_RangeWriteCountBase = base;
+	s_RangeWriteCountLength = len;
+	s_RangeWriteCountAccepted = 0;
+	s_RangeWriteCountCoalesced = 0;
+	s_RangeWriteCountEnabled = base < 0x10000 && len != 0;
+}
+
+void CWriteBuffer::endRangeWriteCount( u64 &accepted, u64 &coalesced )
+{
+	accepted = s_RangeWriteCountAccepted;
+	coalesced = s_RangeWriteCountCoalesced;
+	s_RangeWriteCountEnabled = false;
+}
+
 u32 CWriteBuffer::flushSelectedChunk( u32 maxBytes, bool deferHot,
 	                                  u32 displayBase, u32 displayLen,
 	                                  bool displayOnly,
 	                                  u32 displayBase2, u32 displayLen2 )
 {
+	syncPhysicalMapGeneration();
 	if ( m_Count == 0 || maxBytes == 0 || !m_Bus )
 		return 0;
 	if ( maxBytes > SCPU_WRITEBUF_CHUNK ) maxBytes = SCPU_WRITEBUF_CHUNK;
@@ -353,11 +590,23 @@ u32 CWriteBuffer::flushSelectedChunk( u32 maxBytes, bool deferHot,
 			continue;
 		}
 
-		m_Burst[ selected ].addr = a;
-		m_Burst[ selected ].value = deliverValue( a, m_PendingValue[ a ] );
-		selected++;
 		m_Head = ( m_Head + 1 ) & mask;
 		m_Count--;
+
+		bool deliver = true;
+		const u16 physical = physicalAddress( a, deliver );
+		if ( !deliver )
+		{
+			m_Dirty[ a >> 6 ] &= ~( 1ULL << ( a & 63 ) );
+			m_Synced[ a >> 6 ] &= ~( 1ULL << ( a & 63 ) );
+			m_QueueGeneration++;
+			m_NoProgressValid = false;
+			continue;
+		}
+		m_Burst[ selected ].addr = physical;
+		m_Burst[ selected ].value = deliverValue( a, m_PendingValue[ a ] );
+		s_BurstGuest[ selected ] = a;
+		selected++;
 	}
 	m_PolicyEntriesExamined += examined;
 
@@ -367,7 +616,7 @@ u32 CWriteBuffer::flushSelectedChunk( u32 maxBytes, bool deferHot,
 	m_Bus->writeBurst( m_Burst, selected );
 	for ( u32 i = 0; i < selected; i++ )
 	{
-		const u16 a = m_Burst[ i ].addr;
+		const u16 a = s_BurstGuest[ i ];
 		m_Dirty[ a >> 6 ] &= ~( 1ULL << ( a & 63 ) );
 		m_Synced[ a >> 6 ] |= 1ULL << ( a & 63 );
 	}
@@ -377,14 +626,19 @@ u32 CWriteBuffer::flushSelectedChunk( u32 maxBytes, bool deferHot,
 }
 
 u32 CWriteBuffer::flushUpToPolicy( u32 maxBytes, bool deferHot,
-	                               u32 screenBase, u32 bitmapBase )
+	                               u32 screenBase, u32 bitmapBase,
+	                               bool stageMapRefresh )
 {
-	if ( m_Count == 0 || maxBytes == 0 )
-		return m_Count;
+	if ( maxBytes == 0 )
+		return pending();
+	if ( stageMapRefresh )
+		servicePendingMapRefresh( maxBytes );
+	if ( m_Count == 0 )
+		return pending();
 	if ( noProgressCacheMatches( deferHot, screenBase, bitmapBase ) )
 	{
 		m_PolicyNoProgressCacheHits++;
-		return m_Count;
+		return pending();
 	}
 
 	if ( !m_Bus )
@@ -395,6 +649,7 @@ u32 CWriteBuffer::flushUpToPolicy( u32 maxBytes, bool deferHot,
 		m_Head = 0;
 		m_QueueGeneration++;
 		m_NoProgressValid = false;
+		clearPendingMapRefresh();
 		return 0;
 	}
 
@@ -416,16 +671,22 @@ u32 CWriteBuffer::flushUpToPolicy( u32 maxBytes, bool deferHot,
 	m_BytesFlushed += sent;
 	if ( sent ) m_Flushes++;
 
-	return m_Count;
+	return pending();
 }
 
-u32 CWriteBuffer::flushRangeUpTo( u32 base, u32 len, u32 maxBytes )
+u32 CWriteBuffer::flushRangeUpTo( u32 base, u32 len, u32 maxBytes,
+	                              bool stageMapRefresh )
 {
-	if ( m_Count == 0 || maxBytes == 0 || !hasPendingInRange( base, len ) )
-		return m_Count;
+	if ( maxBytes == 0 )
+		return pending();
+	if ( stageMapRefresh )
+		servicePendingMapRefresh( maxBytes );
+	if ( m_Count == 0 || !hasPendingInRange( base, len, stageMapRefresh ) )
+		return pending();
 
 	u32 sent = 0;
-	while ( m_Count > 0 && sent < maxBytes && hasPendingInRange( base, len ) )
+	while ( m_Count > 0 && sent < maxBytes
+	        && hasPendingInRange( base, len, stageMapRefresh ) )
 	{
 		const u32 n = flushSelectedChunk( maxBytes - sent, false,
 		                                  base, len, true );
@@ -435,11 +696,12 @@ u32 CWriteBuffer::flushRangeUpTo( u32 base, u32 len, u32 maxBytes )
 	m_BytesFlushed += sent;
 	if ( sent ) m_Flushes++;
 
-	return m_Count;
+	return pending();
 }
 
 void CWriteBuffer::resyncSweep( u32 maxBytes )
 {
+	syncPhysicalMapGeneration();
 	if ( !m_Bus || !m_RAM || maxBytes == 0 )
 		return;
 
@@ -455,12 +717,16 @@ void CWriteBuffer::resyncSweep( u32 maxBytes )
 			continue;				// honours the I/O window and exclusions
 		if ( isDirty( a ) )
 			continue;				// pending value owns this address
+		bool deliver = true;
+		const u16 physical = physicalAddress( a, deliver );
+		if ( !deliver )
+			continue;
 
 		// A stolen block heals from its under-I/O SOURCE, not from the
 		// shadow underneath it -- the shadow there is program data whose
 		// DRAM copy is deliberately dead.
 		const u8 v = authoritativeShadowValue( a );
-		m_Burst[ n ].addr  = a;
+		m_Burst[ n ].addr  = physical;
 		m_Burst[ n ].value = deliverValue( a, v );
 		m_Synced[ a >> 6 ] |= 1ULL << ( a & 63 );
 		if ( ++n == SCPU_WRITEBUF_CHUNK )
@@ -477,6 +743,7 @@ u32 CWriteBuffer::resyncDisplayed( u32 screenBase, u32 graphicsBase,
 	                                u32 graphicsLength, u32 maxBytes,
 	                                bool masked, bool repair, bool sample )
 {
+	syncPhysicalMapGeneration();
 	if ( !m_Bus || !m_RAM || maxBytes == 0 )
 		return 0;
 	if ( maxBytes > SCPU_WRITEBUF_CHUNK )
@@ -564,6 +831,10 @@ u32 CWriteBuffer::resyncDisplayed( u32 screenBase, u32 graphicsBase,
 			continue;
 		if ( !shouldMirror( a ) || isDirty( a ) )
 			continue;
+		bool deliver = true;
+		const u16 physical = physicalAddress( a, deliver );
+		if ( !deliver )
+			continue;
 		const u8 expected = deliverValue( a, authoritativeShadowValue( a ) );
 		candidates++;
 		if ( sample )
@@ -571,7 +842,7 @@ u32 CWriteBuffer::resyncDisplayed( u32 screenBase, u32 graphicsBase,
 			// The region may be physical DRAM underneath the I/O window. Sampling
 			// through an ordinary read would select the VIC/SID/CIA overlay and can
 			// even clear a CIA ICR. Ask the bus explicitly for RAM instead.
-			const u8 actual = m_Bus->readRAM( a );
+			const u8 actual = m_Bus->readRAM( physical );
 			m_DisplayScrubSampled[ mode ]++;
 			if ( actual != expected ) m_DisplayScrubMismatches[ mode ]++;
 		}
@@ -583,7 +854,7 @@ u32 CWriteBuffer::resyncDisplayed( u32 screenBase, u32 graphicsBase,
 		// stale scrub value overtake a newer dirty value.
 		if ( isDirty( a ) )
 			continue;
-		m_Burst[ written ].addr = a;
+		m_Burst[ written ].addr = physical;
 		m_Burst[ written ].value = expected;
 		m_Synced[ a >> 6 ] |= 1ULL << ( a & 63 );
 		written++;
@@ -608,8 +879,8 @@ void CWriteBuffer::flush()
 	// Unbounded: reserve this for callers which explicitly know that bus traffic
 	// is safe. Policy changes retain their already-accepted values in the queue;
 	// reset discards obsolete entries. Normal display work uses flushUpTo().
-	while ( flushUpTo( SCPU_WRITEBUF_CHUNK * 8 ) > 0 )
-		;
+	while ( !empty() )
+		flushUpTo( SCPU_WRITEBUF_CHUNK * 8 );
 }
 
 void CWriteBuffer::discard()
@@ -623,4 +894,5 @@ void CWriteBuffer::discard()
 	m_Count = 0;
 	m_QueueGeneration++;
 	m_NoProgressValid = false;
+	clearPendingMapRefresh();
 }

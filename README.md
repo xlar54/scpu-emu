@@ -80,6 +80,7 @@ bus timing itself.
 | `BOOTMAP` | `1` on, `0` off | Runs the SuperCPU ROM at reset. Firmware startup requires the 128KB SuperCPU DOS 2.04 image at `SCPU/scpu.rom`. **If the machine does not boot, set this to 0.** |
 | `C128_MODE` | `0` auto, `1` force C64 path, `2` force native C128 | `2` is experimental. On a C128 the physical machine type and the operating mode are different things, and `$0001` is internal to the 8502 so a DMA master cannot read it. |
 | `BOOT_ANIMATION` | `1` on, `0` faithful | `1` runs the C64 startup animation that SuperCPU DOS 2.04 carries but skips. A deliberate one-byte deviation from strict fidelity. |
+| `RAM_UNDER_IO` | `0` fallback (default), `1` force, `2` experimental auto | Controls the physical `$D000-$DFFF` map. The deterministic fallback relocates active bank-3 matrix/charset/bitmap data into safe VIC backing RAM. Force mode uses per-access `/GAME`; auto is retained for diagnostics but is not a reliable host detector. |
 
 ### Video
 
