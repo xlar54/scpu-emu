@@ -1794,6 +1794,10 @@ void scpuBootRun( CLogger *logger )
 	// chooses which KERNAL to install. A later $D0B5 POKE remains in effect until
 	// the Pi is rebooted and this configuration is read again.
 	superCPU.registers().setJiffyDOSSwitch( cfgJiffyDOS != 0 );
+	// Diagnostic VSP placement aims; zero unless scpu.cfg says otherwise. The
+	// value that zeroes a VSP screen's horizontal shift IS the machine's
+	// measured end-to-end placement constant -- see Config/default.cfg.
+	superCPU.memory().setVSPAim( cfgVSPAimRead, cfgVSPAimWrite );
 	// A deliberate $D0BA knock may request runtime VIC/HDMI selection, but only
 	// when this boot actually creates the passive HDMI renderer. Track the live
 	// handoff flag so its unlocked read reports completed hardware state.

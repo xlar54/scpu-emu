@@ -336,10 +336,11 @@ TEST( integration_run_ticks_per_instruction_while_iec_active )
 	CHECK( m.mem.m_MaxTickChunk > 8 );
 	m.cpu.m_PC = 0x1000;
 
-	// Ordinary VIC I/O is synchronous physical traffic, but its deferred
-	// accounting can settle with the rest of an eight-instruction batch. The
-	// bus access itself already preserves ordering; breaking after every access
-	// multiplied GPIO/cycle-counter overhead in I/O-heavy code.
+	// A canonical VIC access is the exception to ordinary batched I/O timing:
+	// VSP and raster RMW code observes the cycle INSIDE the instruction. The
+	// core therefore settles the cycles preceding STA before the physical write
+	// and pays the final cycle afterward. CPU-level tests pin the exact 3+1
+	// sequence; this integration check makes sure the fast memory map opts in.
 	m.mem.m_RAM[ 0x1040 ] = 0x8D; // STA $D020
 	m.mem.m_RAM[ 0x1041 ] = 0x20;
 	m.mem.m_RAM[ 0x1042 ] = 0xD0;
@@ -349,7 +350,7 @@ TEST( integration_run_ticks_per_instruction_while_iec_active )
 	m.cpu.m_PC = 0x1040;
 	m.mem.m_MaxTickChunk = 0;
 	m.cpu.run( 400 );
-	CHECK( m.mem.m_MaxTickChunk > 8 );
+	CHECK( m.mem.m_MaxTickChunk <= 8 );
 
 	// SuperRAM page-mode penalties likewise accumulate numerically and settle
 	// after the batch. Merely fetching code there must not force a host clock

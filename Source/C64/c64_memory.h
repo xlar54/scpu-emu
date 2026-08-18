@@ -266,6 +266,45 @@ public:
 		return read8( a );
 	}
 
+	// Settle lag for the canonical VIC-II register page when it is physically
+	// visible; 0 otherwise. This deliberately excludes the SuperCPU registers
+	// in the VIC mirrors and all CIA/IEC traffic: exact intra-opcode placement
+	// is being introduced for raster/VSP writes without perturbing the serial
+	// timing that hardware testing already validated. HDMI-exclusive mode has
+	// no physical VIC access to place.
+	//
+	// A write reports lag 2 when the bus has a read->write turnaround pending:
+	// its write primitive will spend one whole C64 cycle idling the bus before
+	// it drives (K243 measured a real C64 losing the write without that pass),
+	// so placement must enter one cycle early for the drive to land on the
+	// intended cycle. Reads never pay the turnaround and always report 1.
+	// Returned value is BIAS-8 ENCODED: 0 means "not precise"; any other value
+	// decodes to settle lag = value - 8, which may be zero or negative when a
+	// diagnostic aim shifts placement later. See ICpuBus::preciseCycleAccess.
+	__attribute__((always_inline)) inline u32 preciseVICCycleAccess( u16 a,
+	                                                               bool write ) const
+	{
+		if ( ( a & 0xFFC0 ) != 0xD000 ) return 0;
+		if ( m_HDMIActive && *m_HDMIActive ) return 0;
+		if ( write )
+		{
+			if ( !c64WriteIsIO( a, m_BankMode ) ) return 0;
+			const s32 base = ( m_C64 && m_C64->writeTurnaroundPending() ) ? 2 : 1;
+			return (u32)( 8 + base - m_VSPAimWrite );
+		}
+		if ( c64MapRead( a, m_BankMode ) != REG_IO ) return 0;
+		return (u32)( 8 + 1 - m_VSPAimRead );
+	}
+
+	// Diagnostic placement calibration, cycles. Positive lands the access
+	// LATER. The observable is the horizontal offset of a VSP screen; the
+	// value that zeroes it is the machine's measured end-to-end constant.
+	void setVSPAim( int readCycles, int writeCycles )
+	{
+		m_VSPAimRead  = (s8)readCycles;
+		m_VSPAimWrite = (s8)writeCycles;
+	}
+
 	// A write landed on the active screen's sprite pointers.
 	//
 	// There are TWO write paths -- writeFast here and CC64Memory::write8 out of
@@ -992,6 +1031,17 @@ private:
 	u64 m_HostPerEmuQ16;		// host cycles per emulated cycle, 16.16
 	u64 m_HostPerEmuQ16Slow;	// the same at 1MHz, for IEC hold-off
 	u64 m_PacingAnchor;
+	// PHI phase lock, at explicit 1MHz only. The anchor's phase against the
+	// physical PHI grid decides which side of a cycle edge every settled
+	// moment lands on; without a lock that phase is a lottery re-rolled at
+	// each re-anchor, and cycle-exact intra-opcode settlement upstream is
+	// nullified downstream. Renewed on a cadence because the Pi and C64
+	// crystals drift relative to each other and the conversion rate is
+	// nominal, not measured.
+	u64 m_LastPhiLockHost;
+	u64 m_PhiRelockHostCycles;
+	s8  m_VSPAimRead = 0;
+	s8  m_VSPAimWrite = 0;
 	u32 m_SelectedEmulatedHz;
 	bool m_BusKeepalive = false;
 	u64 m_NextKeepalive = 0;

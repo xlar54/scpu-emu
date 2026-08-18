@@ -23,13 +23,20 @@ static u8 s_Mem[ 1 << 24 ];
 class CW65Bus : public ICpuBus
 {
 public:
-	struct Access { u32 addr; u8 value; bool write; };
+	struct Access { u32 addr; u8 value; bool write; u64 ticksBefore; };
 	Access m_Log[ W65T_LOG ];
 	u32    m_LogCount;
 	bool   m_IRQ, m_NMI;
 	u64    m_Ticks;
+	u32    m_TickLog[ W65T_LOG ];
+	u32    m_TickLogCount;
+	bool   m_PreciseVICCycles;
+	bool   m_TurnaroundLag;
 
-	CW65Bus() : m_LogCount( 0 ), m_IRQ( false ), m_NMI( false ), m_Ticks( 0 ) {}
+	CW65Bus()
+		: m_LogCount( 0 ), m_IRQ( false ), m_NMI( false ), m_Ticks( 0 ),
+		  m_TickLogCount( 0 ), m_PreciseVICCycles( false ),
+		  m_TurnaroundLag( false ) {}
 
 	u8 read8( scpu_addr_t a ) override
 	{
@@ -46,7 +53,21 @@ public:
 
 	bool irqAsserted() override { return m_IRQ; }
 	bool nmiAsserted() override { return m_NMI; }
-	void tick( u32 n ) override { m_Ticks += n; }
+	u32 preciseCycleAccess( scpu_addr_t a, bool write ) const override
+	{
+		// The whole canonical VIC page, like the production gate: stabiliser
+		// code touches $D012 as much as $D011, and a fixture claiming a single
+		// register turns every new test into an address-matching puzzle.
+		// m_TurnaroundLag mimics the bus reporting a pending read->write
+		// turnaround: writes then ask for entry one cycle early (lag 2).
+		if ( !m_PreciseVICCycles || ( a & 0xFFFFC0 ) != 0x00D000 ) return 0;
+		return ( write && m_TurnaroundLag ) ? 10u : 9u;	// bias-8: lag 2 / lag 1
+	}
+	void tick( u32 n ) override
+	{
+		m_Ticks += n;
+		if ( m_TickLogCount < W65T_LOG ) m_TickLog[ m_TickLogCount++ ] = n;
+	}
 
 	void clearLog() { m_LogCount = 0; }
 
@@ -70,6 +91,19 @@ public:
 		return n;
 	}
 
+	bool nthAccessAt( u32 address, bool write, u32 n, u64 &ticksBefore ) const
+	{
+		u32 seen = 0;
+		for ( u32 i = 0; i < m_LogCount; i++ )
+			if ( m_Log[ i ].addr == address && m_Log[ i ].write == write
+			     && seen++ == n )
+			{
+				ticksBefore = m_Log[ i ].ticksBefore;
+				return true;
+			}
+		return false;
+	}
+
 	// True if any read touched exactly this address.
 	bool readAddress( u32 addr ) const
 	{
@@ -86,6 +120,7 @@ private:
 			m_Log[ m_LogCount ].addr  = a & 0xFFFFFF;
 			m_Log[ m_LogCount ].value = v;
 			m_Log[ m_LogCount ].write = w;
+			m_Log[ m_LogCount ].ticksBefore = m_Ticks;
 			m_LogCount++;
 		}
 	}
@@ -633,6 +668,156 @@ TEST( w65c816_emulation_rmw_emits_the_dummy_write )
 	CHECK_EQ( value, 0x81 );		// the original, which acknowledges
 	CHECK( f.bus.nthWrite( 1, addr, value ) );
 	CHECK_EQ( value, 0x82 );
+}
+
+TEST( w65c816_precise_vic_sta_settles_before_final_bus_cycle_once )
+{
+	const u8 code[] = { 0x8D, 0x11, 0xD0 };		// STA $D011
+	W65Fixture f( code, sizeof( code ) );
+	f.cpu.setA( 0x1B );
+	f.bus.m_PreciseVICCycles = true;
+	f.cpu.step();
+
+	u64 at = 0;
+	CHECK( f.bus.nthAccessAt( 0x00D011, true, 0, at ) );
+	CHECK_EQ( at, 3u );			// opcode + low + high precede the write
+	CHECK_EQ( f.bus.m_Ticks, 4u );	// final access cycle paid exactly once
+	CHECK_EQ( f.bus.m_TickLogCount, 2u );
+	CHECK_EQ( f.bus.m_TickLog[ 0 ], 3u );
+	CHECK_EQ( f.bus.m_TickLog[ 1 ], 1u );
+}
+
+TEST( w65c816_precise_vic_rmw_places_read_and_both_writes_on_distinct_cycles )
+{
+	const u8 code[] = { 0xCE, 0x11, 0xD0 };		// DEC $D011
+	W65Fixture f( code, sizeof( code ) );
+	s_Mem[ 0x00D011 ] = 0x1B;
+	f.bus.m_PreciseVICCycles = true;
+	f.cpu.step();
+
+	u64 at = 0;
+	CHECK( f.bus.nthAccessAt( 0x00D011, false, 0, at ) );
+	CHECK_EQ( at, 3u );			// read is bus cycle 4
+	// The NMOS dummy write (old value back, bus cycle 5) is NOT driven to a
+	// precise VIC target: on the physical bus its slot is occupied by the
+	// read->write turnaround idle, and driving it as well would displace the
+	// semantic new-value edge one cycle late. Register state is identical.
+	CHECK_EQ( f.bus.writeCount(), 1u );
+	CHECK( f.bus.nthAccessAt( 0x00D011, true, 0, at ) );
+	CHECK_EQ( at, 5u );			// write-new keeps its true cycle-6 placement
+	CHECK_EQ( f.bus.m_Ticks, 6u );
+	CHECK_EQ( f.bus.m_TickLog[ 0 ], 3u );
+}
+
+TEST( w65c816_precise_vic_d019_rmw_keeps_the_acknowledge_write )
+{
+	// $D019's old-value write IS the VIC interrupt acknowledge -- INC/LSR
+	// $D019 clears the latch through it -- so the dummy suppression must
+	// exempt it even though it sits inside the precise VIC page.
+	const u8 code[] = { 0xCE, 0x19, 0xD0 };		// DEC $D019
+	W65Fixture f( code, sizeof( code ) );
+	s_Mem[ 0x00D019 ] = 0x81;
+	f.bus.m_PreciseVICCycles = true;
+	f.cpu.step();
+
+	CHECK_EQ( f.bus.writeCount(), 2u );
+	u64 at = 0;
+	CHECK( f.bus.nthAccessAt( 0x00D019, true, 0, at ) );	// acknowledge
+	CHECK( f.bus.nthAccessAt( 0x00D019, true, 1, at ) );	// new value
+}
+
+TEST( w65c816_precise_vic_store_with_turnaround_enters_one_cycle_early )
+{
+	// With a read->write turnaround pending, the bus asks for lag 2: the
+	// settle before the store retires one cycle FEWER, because the write
+	// primitive will spend that cycle idling the bus before it drives. The
+	// instruction still pays its full four cycles overall.
+	const u8 code[] = { 0x8D, 0x11, 0xD0 };		// STA $D011
+	W65Fixture f( code, sizeof( code ) );
+	f.cpu.setA( 0x1B );
+	f.bus.m_PreciseVICCycles = true;
+	f.bus.m_TurnaroundLag = true;
+	f.cpu.step();
+
+	u64 at = 99;
+	CHECK( f.bus.nthAccessAt( 0x00D011, true, 0, at ) );
+	CHECK_EQ( at, 2u );			// entry after TWO retired cycles, not three
+	CHECK_EQ( f.bus.m_Ticks, 4u );
+	CHECK_EQ( f.bus.m_TickLogCount, 2u );
+	CHECK_EQ( f.bus.m_TickLog[ 0 ], 2u );
+	CHECK_EQ( f.bus.m_TickLog[ 1 ], 2u );
+}
+
+TEST( w65c816_non_vic_store_keeps_end_of_instruction_tick )
+{
+	const u8 code[] = { 0x8D, 0x00, 0x04 };		// STA $0400
+	W65Fixture f( code, sizeof( code ) );
+	f.bus.m_PreciseVICCycles = true;
+	f.cpu.step();
+
+	u64 at = 99;
+	CHECK( f.bus.nthAccessAt( 0x000400, true, 0, at ) );
+	CHECK_EQ( at, 0u );
+	CHECK_EQ( f.bus.m_Ticks, 4u );
+	CHECK_EQ( f.bus.m_TickLogCount, 1u );
+	CHECK_EQ( f.bus.m_TickLog[ 0 ], 4u );
+}
+
+TEST( w65c816_precise_vic_read_settles_before_the_data_cycle )
+{
+	// The READS are as timing-critical as the stores: a stabilised raster
+	// handler derives "now" from LDA/CMP/BIT $D012, and if that read's real
+	// placement is end-of-instruction the guest's own synchronisation is
+	// poisoned before any store happens. Same shape as STA: three cycles
+	// retired before the access, the epilogue pays the fourth.
+	const u8 code[] = { 0xAD, 0x11, 0xD0 };		// LDA $D011
+	W65Fixture f( code, sizeof( code ) );
+	s_Mem[ 0x00D011 ] = 0x1B;
+	f.bus.m_PreciseVICCycles = true;
+	f.cpu.step();
+
+	u64 at = 99;
+	CHECK( f.bus.nthAccessAt( 0x00D011, false, 0, at ) );
+	CHECK_EQ( at, 3u );
+	CHECK_EQ( f.bus.m_Ticks, 4u );
+	CHECK_EQ( f.bus.m_TickLogCount, 2u );
+	CHECK_EQ( f.bus.m_TickLog[ 0 ], 3u );
+	CHECK_EQ( f.bus.m_TickLog[ 1 ], 1u );
+}
+
+TEST( w65c816_precise_vic_compare_settles_before_the_data_cycle )
+{
+	// CMP $D012 -- the classic last step of a double-IRQ stabiliser.
+	const u8 code[] = { 0xCD, 0x12, 0xD0 };		// CMP $D012
+	W65Fixture f( code, sizeof( code ) );
+	s_Mem[ 0x00D012 ] = 0x36;
+	f.bus.m_PreciseVICCycles = true;
+	f.cpu.setA( 0x36 );
+	f.cpu.step();
+
+	u64 at = 99;
+	CHECK( f.bus.nthAccessAt( 0x00D012, false, 0, at ) );
+	CHECK_EQ( at, 3u );
+	CHECK_EQ( f.bus.m_Ticks, 4u );
+}
+
+TEST( w65c816_precise_vic_indexed_form_stays_end_of_instruction )
+{
+	// Indexed absolute can carry internal cycles the access counter cannot
+	// see (crossing reads, all indexed stores and RMWs), so the family must
+	// NOT claim the precise timeline: a wrong claim would place an access a
+	// cycle early, which for VSP is worse than the coarse timing it replaces.
+	const u8 code[] = { 0xBD, 0x10, 0xD0 };		// LDA $D010,X
+	W65Fixture f( code, sizeof( code ) );
+	s_Mem[ 0x00D011 ] = 0x1B;
+	f.bus.m_PreciseVICCycles = true;
+	f.cpu.m_X = 0x01;
+	f.cpu.step();
+
+	u64 at = 99;
+	CHECK( f.bus.nthAccessAt( 0x00D011, false, 0, at ) );
+	CHECK_EQ( at, 0u );			// end-of-instruction: nothing retired early
+	CHECK_EQ( f.bus.m_TickLogCount, 1u );
 }
 
 TEST( w65c816_native_rmw_has_no_dummy_write )

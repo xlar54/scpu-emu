@@ -41,6 +41,7 @@ CC64Memory::CC64Memory()
 	  m_BootmapROMLength( 0 ), m_ROMShadow( 0 ), m_SCPU128Mode( false ),
 	  m_HasBasic( false ), m_HasKernal( false ), m_HasChar( false ),
 	  m_HostPerEmuQ16( 0 ), m_HostPerEmuQ16Slow( 0 ), m_PacingAnchor( 0 ),
+	  m_LastPhiLockHost( 0 ), m_PhiRelockHostCycles( 0 ),
 	  m_SelectedEmulatedHz( 0 ),
 	  m_IECThrottleEnabled( true ), m_IECHoldCycles( 0 ), m_IECActivityCycles( 0 ),
 	  m_MaxTickChunk( 0 ),
@@ -1131,6 +1132,14 @@ void CC64Memory::setPacing( u64 hostCyclesPerSecond, u32 emulatedHz )
 	// The rate to fall back to while the serial bus is busy.
 	m_HostPerEmuQ16Slow = ( hostCyclesPerSecond << 16 ) / 1000000ULL;
 
+	// PHI relock cadence, about 2ms. The conversion rate above is NOMINAL --
+	// hostCyclesPerSec() is a compile-time constant, not a measurement -- so
+	// the Pi and C64 crystals drift apart by up to ~100ppm. At 100ppm the
+	// quarter-cycle phase margin erodes in roughly 2.5ms, hence this cadence:
+	// the lock is renewed before drift can carry a settled moment across a
+	// PHI edge.
+	m_PhiRelockHostCycles = hostCyclesPerSecond / 512;
+
 	resyncPacing();
 }
 
@@ -1138,6 +1147,7 @@ void CC64Memory::resyncPacing()
 {
 	m_PacingDebtCycles = 0;
 	m_PacingAnchor = m_C64 ? m_C64->hostCycles() : 0;
+	m_LastPhiLockHost = 0;	// stale on purpose: first settle relocks at once
 }
 
 void CC64Memory::tick( u32 nCycles )
@@ -1177,11 +1187,67 @@ void CC64Memory::tickSettle( bool iecActive )
 	// How much real time those emulated cycles were supposed to take.
 	const u64 owed = ( m_PacingDebtCycles * rate ) >> 16;
 
+	// --- PHI phase maintenance, explicit 1MHz only -------------------------
+	// Cycle-exact guest code (VSP, FLI, any stabilised raster handler) needs
+	// two properties from this pacer that plain rate-keeping does not give:
+	//
+	//   EXACTNESS   the spin below must exit on an absolute grid, so the
+	//               overshoot of one settle is absorbed by the next instead of
+	//               accumulating -- hence "anchor += owed", never "= now";
+	//   PHASE       that grid must sit at a KNOWN offset inside the physical
+	//               PHI cycle. The bus primitive lands an access in cycle N
+	//               exactly when it is entered during the CPU half of N-1, a
+	//               fixed half-microsecond window. An unlocked anchor puts the
+	//               grid at a random phase, re-rolled at every re-anchor, and
+	//               when it straddles an edge the same instruction lands in
+	//               adjacent cycles on different frames. That is precisely the
+	//               VSP failure mode.
+	//
+	// The bus primitive's half-cycle waits capture an arrival anywhere inside
+	// one full PHI cycle into the same target slot; the discontinuity sits at
+	// the PHI FALLING edge. The lock therefore aims settle exits a quarter
+	// cycle BEFORE a CPU-half start: after the few hundred nanoseconds of
+	// call-path between the settle and the primitive's first level read, the
+	// read lands centred in that window with maximum margin both ways. IEC
+	// keeps its long-validated unlocked behaviour untouched.
+	const bool lockable = !iecActive
+	                   && m_SelectedEmulatedHz != 0
+	                   && m_SelectedEmulatedHz <= 1000000u;
+	const u64 perC64 = m_HostPerEmuQ16Slow >> 16;
+	if ( lockable && perC64
+	     && ( now - m_LastPhiLockHost ) > m_PhiRelockHostCycles
+	     && (s64)( ( m_PacingAnchor + owed ) - now ) > (s64)( 3 * perC64 ) )
+	{
+		// Renew only when the pending spin leaves comfortable slack: the edge
+		// measurement below can busy-wait up to two C64 cycles, and a lock
+		// must never be the thing that makes us late.
+		const u64 edge = m_C64->phiCpuHalfStartHostCycles();
+		now = m_C64->hostCycles();
+		m_LastPhiLockHost = now;
+		if ( edge )
+		{
+			// Nudge the anchor's phase class onto (edge - quarter cycle) by
+			// the smallest signed amount. Sub-cycle by construction, so the
+			// guest sees at most one cycle stretched by half a microsecond --
+			// invisible at 1MHz, and it happens between instructions.
+			const u64 want = ( edge + 3 * perC64 / 4 ) % perC64;
+			const u64 have = m_PacingAnchor % perC64;
+			s64 adj = (s64)want - (s64)have;
+			if ( adj > (s64)( perC64 / 2 ) )       adj -= (s64)perC64;
+			else if ( adj < -(s64)( perC64 / 2 ) ) adj += (s64)perC64;
+			m_PacingAnchor = (u64)( (s64)m_PacingAnchor + adj );
+		}
+	}
+
 	// One reading in the common case. hostCycles() is a virtual call wrapping a
 	// system-register read, and this runs after every instruction -- the
 	// previous version called it four times, which at 20MHz was a serious
 	// fraction of the whole per-instruction budget.
-	if ( ( now - m_PacingAnchor ) >= owed )
+	//
+	// Signed comparison: a freshly phase-snapped anchor may sit slightly in
+	// the future, which an unsigned difference would misread as "behind by
+	// half an epoch".
+	if ( (s64)( now - m_PacingAnchor ) >= (s64)owed )
 	{
 		// Behind, or exactly on time. Settle up and carry on rather than
 		// accumulating a debt that can never be repaid: a burst of I/O easily
@@ -1189,6 +1255,25 @@ void CC64Memory::tickSettle( bool iecActive )
 		// the following stretch run too slowly.
 		m_PacingAnchor = now;
 		m_PacingDebtCycles = 0;
+		if ( lockable && perC64 )
+		{
+			// A re-anchor is exactly the moment the phase lottery used to be
+			// re-rolled; roll it deliberately instead. Snapping FORWARD onto
+			// the wanted phase class keeps the anchor <= one cycle ahead --
+			// a backward snap here would immediately re-trigger this branch.
+			const u64 edge = m_C64->phiCpuHalfStartHostCycles();
+			const u64 after = m_C64->hostCycles();
+			m_LastPhiLockHost = after;
+			m_PacingAnchor = after;
+			if ( edge )
+			{
+				const u64 want = ( edge + 3 * perC64 / 4 ) % perC64;
+				const u64 have = after % perC64;
+				m_PacingAnchor = after + ( ( want >= have )
+				                 ? ( want - have )
+				                 : ( perC64 - ( have - want ) ) );
+			}
+		}
 		return;
 	}
 
@@ -1197,9 +1282,15 @@ void CC64Memory::tickSettle( bool iecActive )
 	const u64 waitStart = now;
 	do {
 		now = m_C64->hostCycles();
-	} while ( ( now - m_PacingAnchor ) < owed );
+	} while ( (s64)( now - m_PacingAnchor ) < (s64)owed );
 	m_PacerWaitHostCycles += now - waitStart;
 
-	m_PacingAnchor = now;
+	// Advance by exactly what was owed, NOT to "now": the spin exits a few
+	// tens of nanoseconds late, and re-anchoring to the exit time would let
+	// that overshoot accumulate one settle at a time -- a slow forward slide
+	// of the whole grid that is invisible everywhere except cycle-exact
+	// raster code, where it is fatal. On the absolute grid the next spin
+	// simply absorbs this one's overshoot.
+	m_PacingAnchor += owed;
 	m_PacingDebtCycles = 0;
 }

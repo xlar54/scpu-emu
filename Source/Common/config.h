@@ -29,7 +29,7 @@
 #define _config_h
 
 
-#define TIMING_NAMES 44
+#define TIMING_NAMES 46
 const char timingNames[TIMING_NAMES][32] = {
 	"WAIT_FOR_SIGNALS", 
 	"WAIT_CYCLE_READ", 
@@ -145,6 +145,13 @@ const char timingNames[TIMING_NAMES][32] = {
 	// compatibility fallback, 1 forces the verified $01=$34 map, and 2 probes
 	// automatically. See cfgRAMUnderIO below.
 	"RAM_UNDER_IO"
+	// Diagnostic calibration, cycle-exact VSP work: shift the settle aim of
+	// precise VIC reads/writes by this many C64 cycles (-6..+6, default 0).
+	// Positive lands the access LATER. The horizontal shift of a VSP screen is
+	// the readout: sweep VSP_AIM_WRITE until the shift is zero, and that value
+	// is the machine's measured end-to-end placement constant.
+	"VSP_AIM_READ",
+	"VSP_AIM_WRITE",
 };
 
 // Which CPU core boot.cpp should install. Set from CPU_CORE in the config file;
@@ -222,6 +229,10 @@ extern int cfgREUSize;
 // takeover acceptance was proven not to predict whether a host's VIC tolerates
 // per-access /GAME selection (the tested 64U is a false-full result).
 extern int cfgRAMUnderIO;
+
+// Diagnostic VSP placement calibration, cycles, -6..+6, default 0.
+extern int cfgVSPAimRead;
+extern int cfgVSPAimWrite;
 
 #define SCPU_CFG_RAM_UNDER_IO_OFF      0
 #define SCPU_CFG_RAM_UNDER_IO_FORCE    1

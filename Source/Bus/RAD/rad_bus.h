@@ -63,6 +63,8 @@ public:
 
 	u64  hostCycles() override;
 	u32  hostCyclesPerSec() override { return SCPU_ARM_CLOCK_HZ; }
+	u64  phiCpuHalfStartHostCycles() override;
+	bool writeTurnaroundPending() override;
 
 	const char *name() const override { return "RAD expansion unit"; }
 

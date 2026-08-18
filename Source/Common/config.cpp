@@ -103,6 +103,8 @@ int cfgDisplayScrubPeriodS = 0;
 int cfgVideoMode = SCPU_CFG_VIDEO_DEFAULT;
 int cfgREUSize = REUSIZE_NONE;
 int cfgRAMUnderIO = SCPU_CFG_RAM_UNDER_IO_DEFAULT;
+int cfgVSPAimRead = 0;
+int cfgVSPAimWrite = 0;
 
 char cfg[ 65536 ];
 
@@ -137,6 +139,8 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	cfgDisplayScrubPeriodS = 0;
 	cfgVideoMode = SCPU_CFG_VIDEO_DEFAULT;
 	cfgRAMUnderIO = SCPU_CFG_RAM_UNDER_IO_DEFAULT;
+	cfgVSPAimRead = 0;
+	cfgVSPAimWrite = 0;
 
 	// Leave a byte spare so cfg is always NUL-terminated for the line scanner.
 	if ( !readFile( logger, DRIVE, FILENAME, (u8*)cfg, &cfgBytes, sizeof( cfg ) - 1 ) )
@@ -165,6 +169,8 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	bool videoModeSeen = false;
 	bool reuSizeSeen = false;
 	bool ramUnderIOSeen = false;
+	bool vspAimReadSeen = false;
+	bool vspAimWriteSeen = false;
 
 	while ( *cfgPos != 0 )
 	{
@@ -205,6 +211,8 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 						if ( i == 41 ) videoModeSeen = true;
 						if ( i == 42 ) reuSizeSeen = true;
 						if ( i == 43 ) ramUnderIOSeen = true;
+						if ( i == 44 ) vspAimReadSeen = true;
+						if ( i == 45 ) vspAimWriteSeen = true;
 						while ( *ptr == '\t' || *ptr == ' ' ) ptr++;
 					#ifdef DEBUG_OUT
 						logger->Write( "RaspiMenu", LogNotice, "  %s >%d< (%s)", timingNames[ i ], timingValues[ i ], ptr );
@@ -344,6 +352,20 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 		if ( cfgRAMUnderIO < SCPU_CFG_RAM_UNDER_IO_OFF
 		     || cfgRAMUnderIO > SCPU_CFG_RAM_UNDER_IO_AUTO )
 			cfgRAMUnderIO = SCPU_CFG_RAM_UNDER_IO_DEFAULT;
+	}
+
+	// Out-of-range aims clamp to ZERO rather than the nearest bound: a wild
+	// value in a diagnostic knob should behave like the knob absent, not like
+	// its extreme.
+	if ( vspAimReadSeen )
+	{
+		cfgVSPAimRead = timingValues[ 44 ];
+		if ( cfgVSPAimRead < -6 || cfgVSPAimRead > 6 ) cfgVSPAimRead = 0;
+	}
+	if ( vspAimWriteSeen )
+	{
+		cfgVSPAimWrite = timingValues[ 45 ];
+		if ( cfgVSPAimWrite < -6 || cfgVSPAimWrite > 6 ) cfgVSPAimWrite = 0;
 	}
 
 	return 1;

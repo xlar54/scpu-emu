@@ -34,10 +34,13 @@ CW65C816::CW65C816()
 	  m_P( W65_M | W65_X | W65_I ), m_E( true ),
 	  m_Stopped( false ), m_Waiting( false ),
 	  m_NativeInstructions( 0 ),
-	  m_Bus( 0 ), m_FastBus( 0 ), m_Cycles( 0 ), m_RunBreak( false ),
+	  m_Bus( 0 ), m_FastBus( 0 ), m_Cycles( 0 ), m_BusSettledCycles( 0 ),
+	  m_RunBreak( false ),
 	  m_NMIPrevLevel( false ), m_NMIPending( false ),
+	  m_M8( true ), m_X8( true ), m_CycKey( 0 ),
+	  m_PreciseAccessCycle( 0 ), m_PreciseAccessTimeline( false ),
+	  m_Pending( W65_PEND_SAMPLE ),
 	  m_PageCross( false ), m_BranchTaken( false ), m_EABank0( false )
-	  , m_M8( true ), m_X8( true ), m_CycKey( 0 )
 {
 
 	// One-time build of the packed cycle table; bare-metal single-threaded
@@ -69,6 +72,9 @@ void CW65C816::reset()
 	m_NMIPending = false;
 	m_RunBreak = false;
 	m_Cycles = 0;
+	m_BusSettledCycles = 0;
+	m_PreciseAccessCycle = 0;
+	m_PreciseAccessTimeline = false;
 	m_NativeInstructions = 0;
 	m_PageCross = false;
 	m_BranchTaken = false;
@@ -251,7 +257,7 @@ void CW65C816::serviceInterrupt( u32 vectorNative, u32 vectorEmu, bool isBRKorCO
 u32 CW65C816::step()
 {
 	const u32 used = stepNoTick();
-	busTick( used );
+	settleBusThrough( m_Cycles );
 	return used;
 }
 
@@ -268,12 +274,14 @@ u32 CW65C816::step()
 __attribute__((always_inline)) inline u8 CW65C816::rd8E( u32 addr )
 {
 	addr &= SCPU_ADDR_MASK;
+	preciseTimelineBeforeAccess( addr, false );
 	return m_FastBus ? m_FastBus->read8( addr ) : m_Bus->read8( addr );
 }
 
 __attribute__((always_inline)) inline void CW65C816::wr8E( u32 addr, u8 v )
 {
 	addr &= SCPU_ADDR_MASK;
+	preciseTimelineBeforeAccess( addr, true );
 	if ( m_FastBus ) m_FastBus->write8( addr, v ); else m_Bus->write8( addr, v );
 }
 
@@ -321,6 +329,11 @@ u32 CW65C816::stepNoTick()
 
 u32 CW65C816::stepInner()
 {
+	// The opcode fetch itself is cycle 1. Exact access sequencing is enabled
+	// only after that fetch identifies a supported bus-only form.
+	m_PreciseAccessTimeline = false;
+	m_PreciseAccessCycle = 0;
+
 	if ( m_Pending )
 	{
 	// Cold prologue. Ordering is load-bearing and kept verbatim from the
@@ -398,6 +411,30 @@ u32 CW65C816::stepInner()
 	// state they started in -- so the epilogue indexes the table with this
 	// LOCAL, never the live member.
 	const u8 opcode = fetch8();
+
+	// Non-indexed absolute forms have no hidden internal cycle before their
+	// data access: the interpreter's fetch/read/write order is the literal
+	// bus-cycle order, so counting accesses IS counting cycles. Three column
+	// families cover them:
+	//
+	//   x0C  TSB BIT JMP STY LDY CPY CPX   (JMP performs no 4th access and is
+	//                                       therefore gated but inert)
+	//   x0D  ORA AND EOR ADC STA LDA CMP SBC
+	//   x0E  ASL ROL LSR ROR STX LDX DEC INC
+	//
+	// The READS matter as much as the stores: cycle-exact guest code derives
+	// its notion of "now" from LDA/CMP/BIT $D012, and a raster poll whose real
+	// placement is end-of-instruction poisons every access that follows it.
+	// Indexed and indirect forms carry internal cycles the access counter
+	// cannot see and stay on end-of-instruction timing.
+	{
+		const u8 lowFive = (u8)( opcode & 0x1F );
+		m_PreciseAccessTimeline =
+		       opcode == 0x8C || opcode == 0x8D || opcode == 0x9C
+		    || ( m_E && ( lowFive == 0x0C || lowFive == 0x0D
+		               || lowFive == 0x0E || opcode == 0x1C ) );
+	}
+	m_PreciseAccessCycle = 1;
 
 	// --- emulation-mode fast path ---------------------------------------
 	// The statically hottest opcodes of 6502-era code, flattened: fetch,
@@ -1150,7 +1187,6 @@ u64 CW65C816::run( u64 nCycles )
 
 	while ( m_Cycles - start < nCycles && !m_RunBreak )
 	{
-		const u64 tickBase = m_Cycles;
 		if ( nCycles - ( m_Cycles - start ) > 80 )
 		{
 			for ( u32 i = 0; i < 8; i++ )
@@ -1169,7 +1205,7 @@ u64 CW65C816::run( u64 nCycles )
 			stepInner();
 		}
 
-		busTick( (u32)( m_Cycles - tickBase ) );
+		settleBusThrough( m_Cycles );
 		m_Pending |= W65_PEND_SAMPLE;
 		if ( m_Stopped )
 			break;

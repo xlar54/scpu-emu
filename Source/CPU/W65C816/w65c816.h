@@ -234,13 +234,27 @@ private:
 	inline bool busNMI();
 	inline void busInterrupts( bool &irq, bool &nmi );
 	inline bool busFineTicks();
+	inline u32  busPreciseCycleAccess( u32 addr, bool write );
 	inline void busTick( u32 n );
+	inline void settleBusThrough( u64 logicalCycle );
+	inline void preciseTimelineBeforeAccess( u32 addr, bool write );
 	u64      m_Cycles;
+	// Logical cycle through which ICpuBus::tick has already been paid. A
+	// physical VIC access can settle part of the CURRENT instruction; the
+	// ordinary instruction/batch epilogue then pays only the remainder.
+	u64      m_BusSettledCycles;
 	bool     m_RunBreak;
 	bool     m_NMIPrevLevel;
 	bool     m_NMIPending;
 	bool     m_M8, m_X8;	// cached widths; see memory8()/index8()
 	u8       m_CycKey;		// cached index into w65c816CycleLUT
+
+	// Exact access sequence for the bus-only absolute forms used by VSP code.
+	// Cycle 1 is the opcode fetch; fetch8/read8/write8 advance the remaining
+	// accesses. Other forms stay on end-of-instruction timing until their
+	// internal cycles have an explicit schedule.
+	u8       m_PreciseAccessCycle;
+	bool     m_PreciseAccessTimeline;
 
 	// Pending-work byte: nonzero when the NEXT instruction needs the cold
 	// prologue -- interrupt sample, NMI/IRQ dispatch, WAI, STP. Zero is the

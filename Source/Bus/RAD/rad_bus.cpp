@@ -8450,6 +8450,40 @@ u64 CRADBus::hostCycles()
 	return c;
 }
 
+u64 CRADBus::phiCpuHalfStartHostCycles()
+{
+	// Purely observational: GPLEV0 reads only, no latch or transceiver is
+	// touched, so this is safe from any core-0 context between bus accesses.
+	//
+	// Wait for a VIC half, then for the CPU half that follows it -- the
+	// transition we time is therefore a genuine rising edge, not "PHI already
+	// happened to be high". Bounded so a dead clock (machine off, /DMA lost)
+	// degrades to "no lock" instead of a hang; the pacer treats 0 as
+	// unsupported and simply keeps its unlocked behaviour.
+	if ( m_TrafficHalted ) return 0;
+	u32 spins = 0;
+	u32 g2 = read32( ARM_GPIO_GPLEV0 );
+	while ( CPU_HALF_CYCLE && ++spins < RAD_PHI_WAIT_LIMIT )
+		g2 = read32( ARM_GPIO_GPLEV0 );
+	if ( spins >= RAD_PHI_WAIT_LIMIT ) return 0;
+	spins = 0;
+	while ( VIC_HALF_CYCLE && ++spins < RAD_PHI_WAIT_LIMIT )
+		g2 = read32( ARM_GPIO_GPLEV0 );
+	if ( spins >= RAD_PHI_WAIT_LIMIT ) return 0;
+	u64 c;
+	READ_CYCLE_COUNTER( c );
+	return c ? c : 1;	// 0 is the "unsupported" sentinel; never return it late
+}
+
+bool CRADBus::writeTurnaroundPending()
+{
+	// The flag is file-scope state in lowlevel_dma.h, maintained by the same
+	// primitives this translation unit instantiates; exposing it here keeps
+	// the memory layer able to aim turnaround-compensated placement without
+	// reaching into the low-level header.
+	return busWriteTurnaroundNeeded != 0;
+}
+
 u16 CRADBus::rasterLine()
 {
 	if ( m_TrafficHalted ) return 0xFFFF;

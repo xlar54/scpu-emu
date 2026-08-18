@@ -107,11 +107,13 @@ inline void CW65C816::attachFastBus( CSuperCPUMemoryMap *map )
 
 inline u8 CW65C816::busRead8( u32 addr )
 {
+	preciseTimelineBeforeAccess( addr, false );
 	return m_FastBus ? m_FastBus->read8( addr ) : m_Bus->read8( addr );
 }
 
 inline void CW65C816::busWrite8( u32 addr, u8 v )
 {
+	preciseTimelineBeforeAccess( addr, true );
 	if ( m_FastBus ) m_FastBus->write8( addr, v ); else m_Bus->write8( addr, v );
 }
 
@@ -136,9 +138,50 @@ inline bool CW65C816::busFineTicks()
 	return m_FastBus ? m_FastBus->fineTicksRequired() : false;
 }
 
+inline u32 CW65C816::busPreciseCycleAccess( u32 addr, bool write )
+{
+	return m_FastBus ? m_FastBus->preciseCycleAccess( addr, write )
+	                 : m_Bus->preciseCycleAccess( addr, write );
+}
+
 inline void CW65C816::busTick( u32 n )
 {
 	if ( m_FastBus ) m_FastBus->tick( n ); else m_Bus->tick( n );
+}
+
+inline void CW65C816::settleBusThrough( u64 logicalCycle )
+{
+	if ( logicalCycle <= m_BusSettledCycles ) return;
+	busTick( (u32)( logicalCycle - m_BusSettledCycles ) );
+	m_BusSettledCycles = logicalCycle;
+}
+
+inline void CW65C816::preciseTimelineBeforeAccess( u32 addr, bool write )
+{
+	if ( !__builtin_expect( m_PreciseAccessTimeline, false ) ) return;
+	const u8 cycle = ++m_PreciseAccessCycle;
+	// Cycles 2 and 3 are the absolute operand fetches. They cannot be the
+	// physical VIC data access and skipping the capability query here keeps the
+	// very common STA-absolute-to-RAM path to one extra virtual call, not three.
+	if ( cycle < 4 ) return;
+	const u32 enc = busPreciseCycleAccess( addr & SCPU_ADDR_MASK, write );
+	if ( enc )
+	{
+		// Bias-8 encoded settle lag; see ICpuBus::preciseCycleAccess. An
+		// access on cycle N starts only after cycles 1..N-lag have retired,
+		// and m_Cycles still denotes this instruction's starting boundary
+		// here. Lag 1 is plain placement; lag 2 pre-pays the bus's
+		// read->write turnaround idle so the drive still lands on cycle N;
+		// lag <= 0 comes from the diagnostic calibration aims and lands the
+		// access deliberately later. When the aimed point has already passed
+		// -- the RMW's write directly after its own read -- settleBusThrough's
+		// monotonic guard makes the settle a no-op and the turnaround pass
+		// supplies the spacing on its own.
+		const s32 lag = (s32)enc - 8;
+		const s64 target = (s64)m_Cycles + (s64)cycle - (s64)lag;
+		if ( target > 0 )
+			settleBusThrough( (u64)target );
+	}
 }
 
 // UNRESOLVED (U1 in Docs/SuperCPU64/65816-reference.md). With E=1 and DL=$00,
@@ -246,6 +289,26 @@ inline void CW65C816::rmwWrite( u32 addr, u16 original, u16 v )
 {
 	if ( m_E )
 	{
+		// The NMOS-style dummy write puts the ORIGINAL value back -- for shadow
+		// and for every register without write-triggered latch semantics it is
+		// a no-op. On the physical bus, though, a write directly after the RMW's
+		// own read pays the transceiver-turnaround idle cycle (K243: a real C64
+		// loses the write without it), which would displace the SEMANTIC edge
+		// -- the new-value write -- one cycle late. For precise-timeline VIC
+		// targets the dummy is therefore not driven at all: the turnaround idle
+		// then occupies exactly the bus cycle the 6510 spends on the dummy, and
+		// the new value lands on its true cycle. Register-visible state is
+		// identical either way. $D019 is the exception -- there the old-value
+		// write IS the interrupt acknowledge -- so it keeps both writes and
+		// accepts the one-cycle-late ack it has always had here.
+		if ( m_PreciseAccessTimeline
+		     && ( addr & 0x3F ) != 0x19
+		     && busPreciseCycleAccess( addr & SCPU_ADDR_MASK, true ) )
+		{
+			m_PreciseAccessCycle++;		// the phantom access still owns its cycle
+			write8( addr, (u8)v );
+			return;
+		}
 		write8( addr, (u8)original );
 		write8( addr, (u8)v );
 		return;

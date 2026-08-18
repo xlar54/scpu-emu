@@ -43,6 +43,26 @@ public:
 	virtual u8   read8( scpu_addr_t addr ) = 0;
 	virtual void write8( scpu_addr_t addr, u8 value ) = 0;
 
+	// Some physical C64 devices observe the exact cycle INSIDE an instruction,
+	// not merely the instruction's final cycle count. The default keeps ordinary
+	// memory/test buses on the historical end-of-instruction timing path. The
+	// RAD bank-0 map opts in only for accesses that really reach the VIC-II.
+	//
+	// The return value is a BIAS-8 ENCODED SETTLE LAG, not a plain flag:
+	//   0        not a precise access; end-of-instruction timing as always
+	//   nonzero  settle lag = value - 8, in cycles before the access's own
+	//            cycle. Lag 1 (encoded 9) is plain precise placement: settle
+	//            through the preceding cycle, then perform the access. Lag 2
+	//            (encoded 10) enters one cycle earlier -- the bus reports this
+	//            when its write primitive will first burn a read->write
+	//            turnaround idle cycle, so the drive still lands on the
+	//            intended cycle. Lags of zero or below (encoded <= 8) land the
+	//            access deliberately LATER; they exist for the diagnostic
+	//            calibration aims. Unreachable aims settle as no-ops --
+	//            harmless by construction.
+	virtual u32 preciseCycleAccess( scpu_addr_t addr, bool write ) const
+		{ (void)addr; (void)write; return 0; }
+
 	// Interrupt lines, sampled by the core at instruction boundaries.
 	// Both are active-high here (i.e. "an interrupt is being requested"),
 	// unlike the active-low physical /IRQ and /NMI signals.

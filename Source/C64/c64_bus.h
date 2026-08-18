@@ -119,6 +119,23 @@ public:
 	virtual u64 hostCycles() { return 0; }
 	virtual u32 hostCyclesPerSec() { return 0; }
 
+	// Timestamp (in hostCycles units) of a PHI2 rising edge observed JUST NOW
+	// -- the start of a CPU half-cycle -- or 0 when the backend cannot see
+	// PHI. The pacer uses this to phase-lock its cycle grid to the physical
+	// bus: exact intra-opcode settlement is worthless if the settled moment
+	// can land on either side of a PHI edge at random. Implementations only
+	// observe the line; they must not drive anything. May busy-wait up to
+	// about two C64 cycles.
+	virtual u64 phiCpuHalfStartHostCycles() { return 0; }
+
+	// True when the backend's NEXT single write will first spend a whole C64
+	// cycle idling the bus -- the read->write transceiver turnaround (K243:
+	// a real C64 measurably lost the write without it). Cycle-exact placement
+	// asks this to aim such a write's entry one cycle early, so the idle pass
+	// is absorbed into the timeline instead of displacing the drive. State
+	// changes with every physical access; query at the access, never cache.
+	virtual bool writeTurnaroundPending() { return false; }
+
 	virtual const char *name() const = 0;
 };
 

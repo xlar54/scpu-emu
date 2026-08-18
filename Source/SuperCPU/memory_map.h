@@ -141,6 +141,14 @@ public:
 		writeAbove( addr, value );
 	}
 
+	__attribute__((always_inline)) u32 preciseCycleAccess( scpu_addr_t addr,
+	                                                      bool write ) const override
+	{
+		addr &= SCPU_ADDR_MASK;
+		return ( addr < 0x010000 && m_Bank0 )
+		     ? m_Bank0->preciseVICCycleAccess( (u16)addr, write ) : 0;
+	}
+
 	u8   readAbove( scpu_addr_t addr );
 	void writeAbove( scpu_addr_t addr, u8 value );
 
