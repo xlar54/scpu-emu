@@ -51,6 +51,17 @@ LIBS = $(CIRCLEHOME)/addon/linux/liblinuxemu.a
 # level and changing it will move them.
 CFLAGS += -fno-threadsafe-statics
 CFLAGS += -Wno-comment -Ofast -g0
+# Start every function on its own cache line. The armstub disables L1 data
+# prefetching, so the calibrated WAIT_* constants embed the execution latency
+# of the code itself -- and that latency changes when a timed loop straddles a
+# different I-cache line boundary. K420 (448,904 bytes) rendered a clean
+# picture; K421/K422 (448,968) corrupted the same static screen with the same
+# logic, twice, because 64 more bytes re-rolled every downstream function's
+# line phase. With 64-byte function alignment the intra-function geometry is
+# identical no matter how the image grows: layout stops being a per-build
+# lottery. At most ONE recalibration of the WAIT_* family against the aligned
+# layout, and then it is frozen.
+CFLAGS += -falign-functions=64
 
 LIBS += $(CIRCLEHOME)/addon/SDCard/libsdcard.a \
 	    $(CIRCLEHOME)/lib/fs/libfs.a \
