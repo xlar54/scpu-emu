@@ -122,11 +122,18 @@ void CC64Memory::cia2OnRateChange()
 	// Re-denominate the REMAINING count of every armed deadline. A deadline
 	// already reached stays reached (remaining clamps at zero: fires on the
 	// next check).
+	// Q16 residue makes back-to-back rescales lossless: the old floor division
+	// lost up to (factor-1) subunits per turbo->slow transition, SYSTEMATICALLY
+	// early, so a $D07A/$D07B-bracketing program's frame timer crept against
+	// the raster by about half a C64 cycle every frame.
 	if ( m_CIA2TADeadline )
 	{
 		const u64 rem = ( m_CIA2TADeadline > m_EmuCycles )
 		              ? ( m_CIA2TADeadline - m_EmuCycles ) : 0;
-		m_CIA2TADeadline = m_EmuCycles + rem * f / m_CIA2FactorInUse;
+		const u64 tot = ( ( rem << 16 ) | m_CIA2TAFracQ16 ) * f
+		              / m_CIA2FactorInUse;
+		m_CIA2TAFracQ16 = (u32)( tot & 0xFFFF );
+		m_CIA2TADeadline = m_EmuCycles + ( tot >> 16 );
 		if ( m_CIA2TADeadline == m_EmuCycles ) m_CIA2TADeadline = m_EmuCycles + 1;
 		m_CIA2Rescales++;
 	}
@@ -134,7 +141,10 @@ void CC64Memory::cia2OnRateChange()
 	{
 		const u64 rem = ( m_CIA2TBDeadline > m_EmuCycles )
 		              ? ( m_CIA2TBDeadline - m_EmuCycles ) : 0;
-		m_CIA2TBDeadline = m_EmuCycles + rem * f / m_CIA2FactorInUse;
+		const u64 tot = ( ( rem << 16 ) | m_CIA2TBFracQ16 ) * f
+		              / m_CIA2FactorInUse;
+		m_CIA2TBFracQ16 = (u32)( tot & 0xFFFF );
+		m_CIA2TBDeadline = m_EmuCycles + ( tot >> 16 );
 		if ( m_CIA2TBDeadline == m_EmuCycles ) m_CIA2TBDeadline = m_EmuCycles + 1;
 		m_CIA2Rescales++;
 	}
@@ -243,11 +253,18 @@ void CC64Memory::cia2FinishArm()
 	if ( m_CIA2ArmPending & 0x01 )
 	{
 		m_CIA2TADeadline = now + ciaSpan( (u64)m_CIA2TALatch + 1 );
+		m_CIA2TAFracQ16 = 0;
 		m_NMITraceArmAt = now;
 		m_NMITraceGen++;
 	}
 	if ( m_CIA2ArmPending & 0x02 )
+	{
+		// BRACES LOAD-BEARING: the first landing of this fix appended the
+		// residue clear after the unbraced assignment above, so arming timer A
+		// erased timer B's carried rescale fraction (CODEX review, 2026-08-18).
 		m_CIA2TBDeadline = now + ciaSpan( (u64)m_CIA2TBLatch + 1 );
+		m_CIA2TBFracQ16 = 0;
+	}
 	m_CIA2ArmPending = 0;
 	cia2RecomputeNMIState();
 }

@@ -920,6 +920,14 @@ public:
 	u8   m_CIA2ArmPending = 0;
 	u16  m_CIA2TALatch = 0xFFFF, m_CIA2TBLatch = 0xFFFF;
 	u64  m_CIA2TADeadline = 0, m_CIA2TBDeadline = 0;	// emu-cycle underflow, 0=off
+	// Q16 sub-cycle residue carried across speed-change re-denominations. The
+	// rescale divides by the outgoing factor, and its floor loses up to one
+	// C64 cycle per turbo->slow transition -- a loss that is SYSTEMATIC, so a
+	// program that brackets its raster handler with $D07A/$D07B pays it every
+	// frame and its CIA-timer frame anchor creeps against the raster (SMB64
+	// polls exactly such a timer; the crash dump showed 880 rescales). The
+	// residue makes consecutive rescales lossless to within 2^-16 cycles.
+	u32  m_CIA2TAFracQ16 = 0, m_CIA2TBFracQ16 = 0;
 	u64  m_CIA2NMIDeadline = 0;			// min armed deadline: the hot-path fast-out
 	u64  m_CIA2FactorInUse = 1;			// emu-cycles-per-C64-cycle the deadlines are in
 	// CIA deadlines live in EMULATED cycles. C64Tests/16-NMITIMING proved why:
