@@ -278,22 +278,20 @@ public:
 	// it drives (K243 measured a real C64 losing the write without that pass),
 	// so placement must enter one cycle early for the drive to land on the
 	// intended cycle. Reads never pay the turnaround and always report 1.
-	// Returned value is BIAS-8 ENCODED: 0 means "not precise"; any other value
-	// decodes to settle lag = value - 8, which may be zero or negative when a
-	// diagnostic aim shifts placement later. See ICpuBus::preciseCycleAccess.
+	// K425 BISECT: plain {0,1,2} settle lag, the exact K420 form. The bias-8
+	// aim encoding is suspended -- four environmental theories died against
+	// the K420-clean/K421-corrupt boundary, which leaves the K421 delta itself
+	// under test. The aim members stay but are disconnected.
 	__attribute__((always_inline)) inline u32 preciseVICCycleAccess( u16 a,
 	                                                               bool write ) const
 	{
 		if ( ( a & 0xFFC0 ) != 0xD000 ) return 0;
 		if ( m_HDMIActive && *m_HDMIActive ) return 0;
 		if ( write )
-		{
-			if ( !c64WriteIsIO( a, m_BankMode ) ) return 0;
-			const s32 base = ( m_C64 && m_C64->writeTurnaroundPending() ) ? 2 : 1;
-			return (u32)( 8 + base - m_VSPAimWrite );
-		}
-		if ( c64MapRead( a, m_BankMode ) != REG_IO ) return 0;
-		return (u32)( 8 + 1 - m_VSPAimRead );
+			return c64WriteIsIO( a, m_BankMode )
+			     ? ( ( m_C64 && m_C64->writeTurnaroundPending() ) ? 2u : 1u )
+			     : 0;
+		return c64MapRead( a, m_BankMode ) == REG_IO ? 1u : 0;
 	}
 
 	// Diagnostic placement calibration, cycles. Positive lands the access

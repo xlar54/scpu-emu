@@ -164,23 +164,18 @@ inline void CW65C816::preciseTimelineBeforeAccess( u32 addr, bool write )
 	// physical VIC data access and skipping the capability query here keeps the
 	// very common STA-absolute-to-RAM path to one extra virtual call, not three.
 	if ( cycle < 4 ) return;
-	const u32 enc = busPreciseCycleAccess( addr & SCPU_ADDR_MASK, write );
-	if ( enc )
+	const u32 lag = busPreciseCycleAccess( addr & SCPU_ADDR_MASK, write );
+	if ( lag && cycle > lag )
 	{
-		// Bias-8 encoded settle lag; see ICpuBus::preciseCycleAccess. An
-		// access on cycle N starts only after cycles 1..N-lag have retired,
-		// and m_Cycles still denotes this instruction's starting boundary
-		// here. Lag 1 is plain placement; lag 2 pre-pays the bus's
-		// read->write turnaround idle so the drive still lands on cycle N;
-		// lag <= 0 comes from the diagnostic calibration aims and lands the
-		// access deliberately later. When the aimed point has already passed
-		// -- the RMW's write directly after its own read -- settleBusThrough's
-		// monotonic guard makes the settle a no-op and the turnaround pass
-		// supplies the spacing on its own.
-		const s32 lag = (s32)enc - 8;
-		const s64 target = (s64)m_Cycles + (s64)cycle - (s64)lag;
-		if ( target > 0 )
-			settleBusThrough( (u64)target );
+		// An access on cycle N starts only after cycles 1..N-lag have retired.
+		// m_Cycles still denotes this instruction's starting boundary here.
+		// Lag 1 is the plain case; lag 2 pre-pays the bus's read->write
+		// turnaround idle so the drive still lands on cycle N. When the aimed
+		// point has already passed -- the RMW's write directly after its own
+		// read -- the settle is a no-op and the turnaround pass supplies the
+		// spacing on its own. (K425 bisect: the bias-8 aim encoding is
+		// suspended; this is the exact K420 decode.)
+		settleBusThrough( m_Cycles + cycle - lag );
 	}
 }
 

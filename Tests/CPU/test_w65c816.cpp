@@ -61,7 +61,7 @@ public:
 		// m_TurnaroundLag mimics the bus reporting a pending read->write
 		// turnaround: writes then ask for entry one cycle early (lag 2).
 		if ( !m_PreciseVICCycles || ( a & 0xFFFFC0 ) != 0x00D000 ) return 0;
-		return ( write && m_TurnaroundLag ) ? 10u : 9u;	// bias-8: lag 2 / lag 1
+		return ( write && m_TurnaroundLag ) ? 2u : 1u;
 	}
 	void tick( u32 n ) override
 	{
