@@ -30,7 +30,7 @@
 
 
 #define TIMING_NAMES 46
-const char timingNames[TIMING_NAMES][32] = {
+const char timingNames[][32] = {
 	"WAIT_FOR_SIGNALS", 
 	"WAIT_CYCLE_READ", 
 	"WAIT_CYCLE_WRITEDATA", 
@@ -161,6 +161,16 @@ const char timingNames[TIMING_NAMES][32] = {
 	"VSP_AIM_READ",
 	"VSP_AIM_WRITE",
 };
+
+// A missing comma between two entries concatenates the literals, silently
+// turning two keys into one plus an empty row -- exactly what cost six
+// hardware builds on 2026-08-18 (RAM_UNDER_IOVSP_AIM_READ). With the first
+// dimension inferred, that mistake now changes the row count and this line
+// refuses to compile instead of shipping.
+static_assert( sizeof( timingNames ) / sizeof( timingNames[ 0 ] )
+               == TIMING_NAMES,
+               "timingNames entry count != TIMING_NAMES -- missing comma or "
+               "stale count" );
 
 // Which CPU core boot.cpp should install. Set from CPU_CORE in the config file;
 // SCPU_CFG_CORE_DEFAULT applies when the key is absent.
