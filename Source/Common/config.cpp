@@ -35,11 +35,23 @@
 
 int atoi( char* str )
 {
+	// The original accumulated digits found ANYWHERE in the string and ignored
+	// '-' entirely, so "-3" parsed as 3: negative config values silently
+	// became positive (CODEX review, 2026-08-18). Skip leading whitespace,
+	// honour one sign, stop at the first non-digit. Well-formed positive
+	// values parse identically. NOTE: the first attempt to land this fix died
+	// on a string mismatch before writing anything, while its commit message
+	// claimed success -- three subsequent builds were byte-identical before
+	// the hash equality exposed it. Verify the diff, not the intention.
+	int i = 0;
+	while ( str[ i ] == ' ' || str[ i ] == '\t' ) i++;
+	int sign = 1;
+	if ( str[ i ] == '-' ) { sign = -1; i++; }
+	else if ( str[ i ] == '+' ) i++;
 	int res = 0;
-	for ( int i = 0; str[ i ] != '\0' && str[ i ] != 10 && str[ i ] != 13; i ++ )
-		if ( str[ i ] >= '0' && str[ i ] <= '9' )
-			res = res * 10 + str[ i ] - '0';
-	return res;
+	for ( ; str[ i ] >= '0' && str[ i ] <= '9'; i++ )
+		res = res * 10 + str[ i ] - '0';
+	return sign * res;
 }
 
 char *cfgPos;
