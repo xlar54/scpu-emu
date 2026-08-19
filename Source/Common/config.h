@@ -144,7 +144,15 @@ const char timingNames[TIMING_NAMES][32] = {
 	// Physical RAM-under-I/O policy. 0 always uses the conventional-map
 	// compatibility fallback, 1 forces the verified $01=$34 map, and 2 probes
 	// automatically. See cfgRAMUnderIO below.
-	"RAM_UNDER_IO"
+	//
+	// THE COMMA AFTER THIS ENTRY IS LOAD-BEARING. It was missing from K421 to
+	// K425: C++ concatenated the two adjacent literals into one key named
+	// RAM_UNDER_IOVSP_AIM_READ, the card's "RAM_UNDER_IO 1" stopped parsing,
+	// boot silently fell back from the physical under-I/O map, and every
+	// under-$D000 charset rendered from wrong DRAM -- six hardware builds and
+	// four wrong theories chased what one byte of punctuation caused. A
+	// static_assert on the initializer count follows in the guard commit.
+	"RAM_UNDER_IO",
 	// Diagnostic calibration, cycle-exact VSP work: shift the settle aim of
 	// precise VIC reads/writes by this many C64 cycles (-6..+6, default 0).
 	// Positive lands the access LATER. The horizontal shift of a VSP screen is
