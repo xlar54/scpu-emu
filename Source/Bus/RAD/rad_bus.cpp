@@ -8358,6 +8358,25 @@ void CRADBus::writeBurst( const C64BusWrite *writes, u32 count )
 		// direction run. Repeating that RAM write is side-effect free.
 		const bool repeatFirst = busWriteTurnaroundNeeded != 0;
 
+		// Walk the chunk's queue entries into L1 BEFORE the timed section. The
+		// armstub disables L1 data prefetching, so inside the burst loop every
+		// 64-byte line boundary of writes[] would otherwise be a cold miss in
+		// the middle of a cycle-counted window -- the miss itself is constant,
+		// but whether it eats a WAIT_UP_TO_CYCLE margin depends on where the
+		// linker happened to put the array THIS build. K419/K420 drew benign
+		// phases; K421-K423 corrupted a static screen with byte-identical
+		// burst code. Touching the lines here moves the misses to a place
+		// where time does not matter, which removes the build-placement
+		// lottery from delivery instead of re-rolling it.
+		{
+			const volatile u8 *touch = (const volatile u8 *)&writes[ offset ];
+			const u32 bytes = chunk * (u32)sizeof( C64BusWrite );
+			for ( u32 t = 0; t < bytes; t += 64 )
+				(void)touch[ t ];
+			(void)touch[ bytes - 1 ];
+			(void)*(const volatile u32 *)&busTiming;
+		}
+
 		busBeginBurstWrites( g2 );
 		BUS_RESYNC
 		for ( u32 i = 0; i < chunk; i++ )
