@@ -331,6 +331,36 @@ TEST( reu_a_stray_ff00_write_does_nothing_when_nothing_is_armed )
 	CHECK_EQ( reu.transfers(), 0u );
 }
 
+TEST( reu_large_units_are_addressable_above_512k_through_the_registers )
+{
+	// The size selectors advertise 2MB, 4MB and 16MB, and the RAM really is
+	// allocated -- but the guest can only reach it through $DF04/05/06. If the
+	// bank register decodes fewer bits than the fitted size needs, everything
+	// above that boundary is unreachable and silently aliases low memory,
+	// which looks to software like an REU that lies about its size.
+	//
+	// Every other test here reaches expansion RAM through poke()/peek(), the
+	// backdoor, so none of them can see this.
+	CREU reu; FakeHost host;
+	reu.init( REUSIZE_2MB );
+	reu.attachHost( &host );
+
+	host.mem[ 0x1000 ] = 0x5A;
+	reu.poke( 0x000000, 0x11 );			// sentinel at the aliasing target
+
+	reu.write( 0xDF02, 0x00 );			// C64 base $1000
+	reu.write( 0xDF03, 0x10 );
+	reu.write( 0xDF04, 0x00 );			// REU base $100000 (1MB)
+	reu.write( 0xDF05, 0x00 );
+	reu.write( 0xDF06, 0x10 );
+	reu.write( 0xDF07, 0x01 );			// one byte
+	reu.write( 0xDF08, 0x00 );
+	reu.write( 0xDF01, 0x90 );			// execute, stash
+
+	CHECK_EQ( reu.peek( 0x100000 ), (u8)0x5A );	// landed where asked
+	CHECK_EQ( reu.peek( 0x000000 ), (u8)0x11 );	// and did NOT alias to zero
+}
+
 TEST( reu_expansion_address_aliases_within_the_fitted_size )
 {
 	// A real unit decodes a fixed number of address lines, so an address past

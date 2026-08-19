@@ -91,6 +91,18 @@ public:
 	void attachHost( IREUHost *host ) { m_Host = host; }
 
 	bool present() const   { return m_Size != 0; }
+	// Bank-register bits the fitted size actually decodes. A 128K unit needs
+	// one bit above $DF05's 64K, 512K needs three (the 1750), 16MB needs all
+	// eight. Unimplemented bits read as 1 and are dropped on write, which is
+	// how size-probing software identifies the unit.
+	u8 bankMask() const
+	{
+		if ( m_Size <= 0x10000u ) return 0x00;
+		const u32 banks = ( m_Size - 1 ) >> 16;		// highest bank index
+		u8 m = 0;
+		while ( ( 1u << m ) <= banks && m < 8 ) m++;
+		return (u8)( ( 1u << m ) - 1 );
+	}
 	u32  sizeBytes() const { return m_Size; }
 
 	// Power-on / reset state. The hardware clears the command and status but

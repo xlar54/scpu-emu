@@ -177,7 +177,14 @@ bool CREU::read( u16 addr, u8 &value )
 	case 0xDF03: value = (u8)( m_C64Base >> 8 ); return true;
 	case 0xDF04: value = (u8)( m_REUBase & 0xFF ); return true;
 	case 0xDF05: value = (u8)( ( m_REUBase >> 8 ) & 0xFF ); return true;
-	case 0xDF06: value = (u8)( ( ( m_REUBase >> 16 ) & 0x07 ) | 0xF8 ); return true;
+	case 0xDF06:
+		// Unimplemented bank bits read as 1, as on a real unit -- but WHICH
+		// bits are unimplemented depends on the fitted size. Hardcoding the
+		// 1750's three bits made every size above 512K unreachable through
+		// the registers while peek()/poke() still worked, so the whole test
+		// suite passed over it.
+		value = (u8)( ( ( m_REUBase >> 16 ) & bankMask() ) | (u8)~bankMask() );
+		return true;
 	case 0xDF07: value = (u8)( m_Length & 0xFF ); return true;
 	case 0xDF08: value = (u8)( m_Length >> 8 ); return true;
 	case 0xDF09: value = (u8)( m_IRQMask | 0x1F ); return true;
@@ -235,7 +242,7 @@ bool CREU::write( u16 addr, u8 value )
 		return true;
 	case 0xDF06:
 		m_REUBase = ( m_REUBase & 0x00FFFFu )
-		          | ( ( (u32)value & 0x07u ) << 16 );
+		          | ( ( (u32)value & bankMask() ) << 16 );
 		m_REUShadow = m_REUBase;
 		return true;
 
@@ -349,7 +356,10 @@ void CREU::executeTransfer()
 	{
 		// Without autoload the registers keep where the transfer finished.
 		m_C64Base = c64;
-		m_REUBase = reu & 0x07FFFFFu;
+		// 24 bits, the full width of the three address registers. This was
+		// 0x07FFFFF -- 23 bits -- which silently truncated the top address
+		// bit of a 16MB unit when a transfer ended above 8MB.
+		m_REUBase = reu & 0xFFFFFFu;
 		// A completed transfer leaves the length reading 1 rather than 0 on
 		// real hardware. Worth confirming against VICE's reu.c before anything
 		// is allowed to depend on it -- it is the sort of detail that differs
