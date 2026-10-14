@@ -80,7 +80,7 @@ enum SCPUResyncDiagnosticPhase
 
 // Active-screen bytes per scheduler opportunity while the beam is outside the
 // picture. This is deliberately separate from the general display ration: a
-// 1000-byte character matrix then converges in four opportunities without
+// 1024-byte VIC matrix ring then converges in four opportunities without
 // turning every ordinary mirror drain into a 256-byte CPU pause.
 #define SCPU_MIRROR_SCREEN_BYTES_PER_OPPORTUNITY 256
 
@@ -120,6 +120,65 @@ struct SCPUIECEpochDiagnostic
 	u64 activeStartedAt;
 	u64 quietStartedAt;
 	u32 opportunitiesSinceQuiet;
+};
+
+// Bounded, measurement-only comparisons of the active physical VIC matrix
+// against the value the mirror believes it delivered. Storage is outside
+// CSuperCPU so enabling the diagnostic cannot move the timing-sensitive RAD
+// bus object in memory (see supercpu.cpp). The first three slots are clean
+// gameplay samples; the fourth preserves the matrix exactly as found when the
+// heartbeat declares a stall, including any outstanding mirror bytes.
+#define SCPU_VSP_MATRIX_MISMATCH_SAMPLES 16
+#define SCPU_VSP_MATRIX_CLEAN_CAPTURES 3
+#define SCPU_VSP_MATRIX_CAPTURE_SLOTS 4
+#define SCPU_VSP_MATRIX_STALL_SLOT 3
+struct SCPUVSPMatrixMismatch
+{
+	u16 offset;
+	u8 expected;
+	u8 physical;
+};
+
+struct SCPUVSPMatrixCapture
+{
+	u8  state;                 // 0=waiting, 1=armed, 2=captured
+	u8  kind;                  // 0=clean gameplay, 1=at-stall preservation
+	u8  safeWindow;
+	u8  mismatchSampleCount;
+	u32 targetFrame;
+	u32 qualifyingFrame;
+	u32 traceTotal;
+	u8  gamePhase;
+	u8  reserved0;
+	u16 reserved1;
+	u32 captureAttempts;
+	u32 unsafeWindowWaits;
+	u32 pendingWaits;
+	u32 logicalBase;
+	u32 physicalBase;
+	u16 rasterBefore;
+	u16 rasterAfter;
+	u32 pendingAtCapture;
+	u32 directMatches;
+	u32 mismatchCount;
+	u16 firstMismatch;
+	u16 lastMismatch;
+	s32 bestShift;
+	u32 bestShiftMatches;
+	u32 bestShiftCompared;
+	SCPUVSPMatrixMismatch mismatch[ SCPU_VSP_MATRIX_MISMATCH_SAMPLES ];
+};
+
+struct SCPUVSPMatrixDiagnostic
+{
+	u8  state;                 // 0=waiting, 1=gameplay qualified, 2=clean set complete
+	u8  gameplaySeen;
+	u8  phaseChanges;
+	u8  capturedCount;
+	u32 qualifyingFrames;
+	u32 quietFrames;
+	u32 traceTotal;
+	SCPUVSPMatrixCapture capture[ SCPU_VSP_MATRIX_CAPTURE_SLOTS ];
 };
 
 class CSuperCPU
@@ -252,6 +311,61 @@ public:
 	// CC64Memory::tickFast.
 	void setIOStretch( bool e ) { m_Memory.m_IOStretchEnable = e; }
 	void setMirrorStretch( bool e ) { m_Memory.m_MirrorStretchEnable = e; }
+	// Consecutive mirror opportunities skipped because the guest was inside a
+	// cycle-counted raster window, and the lifetime total. The RUN is what
+	// bounds the deferral -- see the guard in runFrame -- and the TOTAL is
+	// the readout that says whether the guard ever fired, which is the first
+	// thing to check if the screen does not change.
+	u32 m_RasterDeferRun = 0;
+	u64 m_RasterDeferred = 0;
+	// How many consecutive opportunities may be skipped. Mario's window is
+	// about 62 C64 cycles against a 134-cycle slice, so a single deferral
+	// normally clears it; this is the runaway bound for a program that polls
+	// $D012 continuously, not a tuning value.
+	static constexpr u32 SCPU_RASTER_DEFER_LIMIT = 8;
+
+	// Emulated BA stall; see CC64Memory::baStallSettle. mode: 0 off, 1 on
+	// except while a serial transaction window is armed, 2 always. maxCycles
+	// bounds ONE freeze, in C64 cycles: a badline is 43 and a badline that
+	// runs into sprite DMA cannot fill a line, so the clamp below keeps every
+	// configured value inside one line and out of the range where a stuck BA
+	// would be mistaken for a long steal.
+	void setBAStall( u32 mode, u32 maxCycles )
+	{
+		m_Memory.m_BAStallMode = (u8)( mode > 2 ? 2 : mode );
+		// 80, not 128: RAD_BA_STALL_CEILING in rad_bus.cpp clamps the pin side
+		// to 80 anyway, so a larger configured value would be silently
+		// unreachable. One number, enforced in both places, so the config
+		// documentation can state the real range.
+		if ( maxCycles < 8 )  maxCycles = 8;
+		if ( maxCycles > 80 ) maxCycles = 80;
+		m_Memory.m_BAStallMaxCycles = (u16)maxCycles;
+	}
+	// Evidence required before a CIA2 access opens or extends the serial
+	// transaction window. Clamped here as well as in readConfig, because the
+	// tests reach the memory object through this setter and not through the
+	// config file.
+	void setIECWindow( u32 mode )
+	{
+		m_Memory.m_IECWindowMode = (u8)( mode > 2 ? 2 : mode );
+	}
+
+	// The hypothesis-free hang detector (CW65C816's W65_PROG_ block). On by
+	// default: a diagnostic that needs a config edit to arm is a diagnostic
+	// that costs a hardware run when the edit is forgotten, and its confirm
+	// threshold is 8.4s of unbroken zero novelty specifically so that leaving
+	// it on cannot cost a normal run anything.
+	void setHangWatch( bool enable )
+	{
+		m_Core65816.m_ProgEnable = enable ? 1 : 0;
+	}
+	// Watched-RAM write forensics. Addresses above 0xFFFF disarm a slot; see
+	// CC64Memory::WatchedWrite for why the hook is free on every unwatched
+	// page and what the watched page itself pays.
+	void setRAMWatch( u32 slot0, u32 slot1 )
+	{
+		m_Memory.setRAMWatch( slot0, slot1 );
+	}
 	u32  mirrorDisplayBudget() const         { return m_MirrorDisplayBudget; }
 
 	void reset();
@@ -382,6 +496,15 @@ u32 scpuFrozenIECEpochDiagnosticCount();
 u32 scpuFrozenIECEpochHostHz();
 bool scpuFrozenIECEpochDiagnostic( u32 index,
 	                               SCPUIECEpochDiagnostic &out );
+
+// Copy the live bounded VSP matrix comparisons. Safe after the emulated CPU
+// has stopped; it only reads Pi-owned diagnostic storage.
+void scpuVSPMatrixDiagnostic( SCPUVSPMatrixDiagnostic &out );
+
+// Preserve one final physical-vs-shadow comparison when the heartbeat declares
+// a Mario/VSP stall. This is diagnostic-only and waits for a hidden physical
+// raster interval without advancing the guest or draining the mirror queue.
+bool scpuCaptureVSPStallMatrixDiagnostic( CSuperCPU *scpu );
 
 #define SCPU_TURBO_HZ   20000000u
 #define SCPU_NORMAL_HZ   1000000u

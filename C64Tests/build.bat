@@ -10,7 +10,7 @@ set "DISKS=%ROOT%diskimages"
 set "PETCAT=%ROOT%petcat.exe"
 set "TASS=%ROOT%64tass.exe"
 set "C1541=%ROOT%c1541.exe"
-set "DISK=%DISKS%\SCPU-TESTS.d81"
+set "DISK=%DISKS%\scpu-tests.d81"
 
 for %%T in ("%PETCAT%" "%TASS%" "%C1541%") do (
     if not exist "%%~T" (
@@ -66,7 +66,7 @@ call :asm "30-vicvsp.asm" "30-VICVSP"
 if errorlevel 1 exit /b 1
 
 if exist "%DISK%" del /q "%DISK%"
-if exist "%DISKS%\SCPU-TESTS.d64" del /q "%DISKS%\SCPU-TESTS.d64"
+if exist "%DISKS%\scpu-tests.d64" del /q "%DISKS%\scpu-tests.d64"
 "%C1541%" -format "scpu tests,st" d81 "%DISK%" ^
     -write "%PRG%\00-DETECT.prg" "00-detect" ^
     -write "%PRG%\01-SPEED.prg" "01-speed" ^

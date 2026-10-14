@@ -49,6 +49,13 @@ bool radWaitForMachineRunning();
 // single most useful number when a takeover will not start.
 u64 radMeasureMachineRate();
 
+// The last measurement radWaitForMachineRunning() accepted, in ARM cycles per
+// 1000 C64 cycles, or 0 before the first success. Boot logs it against
+// c64CpuHz( detected standard ): the pacer trusts the standard, and a
+// percent-scale disagreement means the standard is wrong or arm_freq is not
+// 1400MHz -- either way every paced cycle is wrong by that amount.
+u64 radLastMeasuredMachineRate();
+
 // Pulse /RESET and let the machine boot its KERNAL. Needed so that $01 ends up
 // at $37 (BASIC, KERNAL and I/O all banked in) before we snapshot the ROMs.
 void radResetMachine();

@@ -105,12 +105,16 @@ inline void CW65C816::attachFastBus( CSuperCPUMemoryMap *map )
 	m_Bus     = map;
 }
 
+// See the note on the in-class declarations for the measurement and for why
+// the attribute has to appear in both places.
+__attribute__((always_inline))
 inline u8 CW65C816::busRead8( u32 addr )
 {
 	preciseTimelineBeforeAccess( addr, false );
 	return m_FastBus ? m_FastBus->read8( addr ) : m_Bus->read8( addr );
 }
 
+__attribute__((always_inline))
 inline void CW65C816::busWrite8( u32 addr, u8 v )
 {
 	preciseTimelineBeforeAccess( addr, true );
@@ -149,6 +153,15 @@ inline void CW65C816::busTick( u32 n )
 	if ( m_FastBus ) m_FastBus->tick( n ); else m_Bus->tick( n );
 }
 
+// The physical phase trim for the settle that follows. See tickPhaseTrim in
+// cpu_bus.h: it never touches the logical ledger, which is why it is a
+// separate call and not an argument to busTick.
+inline void CW65C816::busPhaseTrim( s32 c64Cycles )
+{
+	if ( m_FastBus ) m_FastBus->tickPhaseTrim( c64Cycles );
+	else             m_Bus->tickPhaseTrim( c64Cycles );
+}
+
 inline void CW65C816::settleBusThrough( u64 logicalCycle )
 {
 	if ( logicalCycle <= m_BusSettledCycles ) return;
@@ -156,9 +169,19 @@ inline void CW65C816::settleBusThrough( u64 logicalCycle )
 	m_BusSettledCycles = logicalCycle;
 }
 
+__attribute__((always_inline))
 inline void CW65C816::preciseTimelineBeforeAccess( u32 addr, bool write )
 {
 	if ( !__builtin_expect( m_PreciseAccessTimeline, false ) ) return;
+	preciseTimelineBeforeAccessArmed( addr, write );
+}
+
+// noinline and inline together in ONE declaration, and neither on the
+// in-class one: GCC warns at every include site (-Wattributes) if a later
+// declaration adds inline-ness to a noinline function or the reverse.
+__attribute__((noinline)) inline
+void CW65C816::preciseTimelineBeforeAccessArmed( u32 addr, bool write )
+{
 	const u8 cycle = ++m_PreciseAccessCycle;
 	// Cycles 2 and 3 are the absolute operand fetches. They cannot be the
 	// physical VIC data access and skipping the capability query here keeps the
@@ -169,13 +192,51 @@ inline void CW65C816::preciseTimelineBeforeAccess( u32 addr, bool write )
 	{
 		// An access on cycle N starts only after cycles 1..N-lag have retired.
 		// m_Cycles still denotes this instruction's starting boundary here.
-		// Lag 1 is the plain case; lag 2 pre-pays the bus's read->write
-		// turnaround idle so the drive still lands on cycle N. When the aimed
-		// point has already passed -- the RMW's write directly after its own
-		// read -- the settle is a no-op and the turnaround pass supplies the
-		// spacing on its own. (K425 bisect: the bias-8 aim encoding is
-		// suspended; this is the exact K420 decode.)
-		settleBusThrough( m_Cycles + cycle - lag );
+		// Lag is 1 for every placed access: the primitive resyncs to the falling
+		// edge after its entry and drives in that cycle, and a turnaround write
+		// pays its K243 idle pass INSIDE that resync (radDirectWrite), so no
+		// access needs to enter a cycle early any more. When the aimed point has
+		// already passed -- the RMW's write directly after its own read -- the
+		// settle is a no-op, the entry is inside the dummy-write cycle, and the
+		// resync-as-pass lands the write on the 6510's cycle. (K425 bisect: the
+		// bias-8 aim encoding is suspended; this is the exact K420 decode.)
+		// VSP_AIM_READ / VSP_AIM_WRITE are a PHYSICAL phase trim and nothing
+		// else: whole C64 cycles added to the real-time deadline of the settle
+		// that places this access. They never enter the logical cycle handed to
+		// settleBusThrough. The previous form added them there, so an RMW write
+		// aimed +6 at cycle 6 with lag 2 settled the ledger through start+10 of
+		// a six-cycle instruction: the epilogue settle became a no-op, the next
+		// instruction's cycle-4 pre-read settle was skipped because its +3 was
+		// already "paid", and m_EmuCycles, the CIA deadlines and the interrupt
+		// sample ran ahead of the instruction that owned those cycles (CODEX,
+		// CHT 7000; host-measured lead = max( 0, aim - 2 )). The trim goes to
+		// the bus BEFORE the settle so the settle that runs next consumes it;
+		// a settle that is a no-op here (the $D019 acknowledge write directly
+		// after its own read) leaves it pending for the semantic write that
+		// follows. Both default to 0 and cost one byte test; the settle below is
+		// the exact K420 form, and the guard above guarantees cycle > lag.
+		//
+		// ASYMMETRY, unchanged, because a sweep will show it and it should not
+		// look like a fault: a settle can only ever WAIT. A positive trim moves
+		// the exit later by that many cycles; a negative one can only recover
+		// slack the natural placement had left, and past that it is a no-op.
+		// Negative readings that stop changing are the floor, not a broken knob.
+		{
+			// VSP_AIM_WRITE is applied by CC64Memory at the catch-up launch
+			// (K498), not as a settle trim: measured in the host model, a trim
+			// here landed before the catch-up and its slack swallowed it, and
+			// the INC received it a second time. m_PreciseAimWrite is kept for
+			// the startup readback only.
+			// The hook's unit is QUARTER cycles (K502). A read carries
+			// VSP_AIM_READ in whole cycles; a write carries the write lead as a
+			// negative trim, so its settle exits early enough for the heavier
+			// write path to enter the primitive mid-cycle (see ICpu::setWriteLead).
+			const s32 trimQuarters = write ? -(s32)m_WriteLeadQuarters
+			                               : 4 * (s32)m_PreciseAimRead;
+			if ( trimQuarters )
+				busPhaseTrim( trimQuarters );
+			settleBusThrough( m_Cycles + (u32)( cycle - lag ) );
+		}
 	}
 }
 

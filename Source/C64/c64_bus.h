@@ -128,13 +128,58 @@ public:
 	// about two C64 cycles.
 	virtual u64 phiCpuHalfStartHostCycles() { return 0; }
 
-	// True when the backend's NEXT single write will first spend a whole C64
-	// cycle idling the bus -- the read->write transceiver turnaround (K243:
-	// a real C64 measurably lost the write without it). Cycle-exact placement
-	// asks this to aim such a write's entry one cycle early, so the idle pass
-	// is absorbed into the timeline instead of displacing the drive. State
-	// changes with every physical access; query at the access, never cache.
+	// True when the backend's NEXT single write pays the read->write
+	// transceiver turnaround (K243: a real C64 measurably lost the write
+	// without it). The RAD backend pays that idle pass INSIDE the write's own
+	// resync -- the one cycle a read->write sequence always has between the
+	// two, where a 6510 puts an RMW's dummy write -- so it no longer displaces
+	// the drive and cycle-exact placement no longer aims a turnaround write a
+	// cycle early. Diagnostic and test visibility only. State changes with
+	// every physical access; query at the access, never cache.
 	virtual bool writeTurnaroundPending() { return false; }
+
+	// Host stamp (hostCycles units) taken by the most recent physical single
+	// read just after it aligned to the PHI2 falling edge that began its data
+	// cycle: the START of the cycle the read occupied, to within one edge poll.
+	// 0 when the backend keeps no such stamp. The raster-window catch-up
+	// anchors on this and not on the read's RETURN, which is one whole cycle
+	// and a teardown later: a count target built on the return held every
+	// placed write until the start of the cycle it belonged in, and the
+	// primitive's resync then carried it one whole cycle past.
+	virtual u64 lastReadCycleStartHostCycles() { return 0; }
+
+	// RASTER-WINDOW TURNAROUND (K504). While true, a single write that follows
+	// a read pays its K243 idle pass INSIDE its own resync -- one idle period,
+	// the 6510's dummy-write cycle -- instead of as a second period after it.
+	// The memory layer raises it only around a VIC write placed inside the
+	// raster window (a $D012 anchor at 1MHz within 200 cycles), which is where
+	// that placement was measured, and clears it right after. Every other
+	// write keeps the resync-then-pass order validated for general traffic
+	// (K243: two idle periods); K503 applied the short form to every write and
+	// Metal Dust's loader showed half-drawn screens and wrong colour cells.
+	virtual void setWriteTurnaroundMinimal( bool on ) { (void)on; }
+
+	// How many whole C64 cycles the VIC is holding the bus for RIGHT NOW,
+	// having waited them out. Observation only: no latch, no transceiver, no
+	// address and no /GAME is driven, so this is safe from any core-0 context
+	// between bus accesses -- the same contract as phiCpuHalfStartHostCycles().
+	//
+	// WHY THE EMULATED CPU NEEDS IT. On a badline the VIC pulls BA low and a
+	// real 6510 is FROZEN: it cannot fetch, so a NOP sled stops advancing.
+	// readFast() serves $0800-$0FFF out of the m_ReadBase shadow at every
+	// speed, so Mario's 24-NOP IRQ stabiliser issues no physical transaction,
+	// HANDLE_BUS_AVAILABLE_READ never runs, and the sled races through a steal
+	// the real machine absorbs. Measured K451: the second IRQ then arrives at
+	// $0849 inside the DEX loop instead of in the sled, TXS writes S = $0100 +
+	// X = $0104, and the machine hangs spinning on $9F88.
+	//
+	// Returning 0 is the common answer and must cost no more than one level
+	// read: the caller asks once per emulated instruction at 1MHz. A backend
+	// that cannot see BA returns 0 and the stall does not exist there.
+	// maxCycles bounds the wait, and a backend must never exceed it: these
+	// spins run under runFrame(), so a BA that never came back would take the
+	// frame loop and the button hook with it (see RAD_BA_WAIT_LIMIT).
+	virtual u32 busStealCycles( u32 maxCycles ) { (void)maxCycles; return 0; }
 
 	virtual const char *name() const = 0;
 };

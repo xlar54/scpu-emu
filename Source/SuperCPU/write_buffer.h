@@ -76,6 +76,12 @@ enum SCPUOptMode
 // raster-scheduled flush a granularity at which it can stop.
 #define SCPU_WRITEBUF_CHUNK 512
 
+// The VIC-II screen matrix is a 1K ring, even though an ordinary 40x25 frame
+// fetches only 1000 cells. VSP/DMA-delay scrolling can make the normally unused
+// final 24 bytes visible, so every delivery/defer decision must cover the full
+// hardware region rather than only the conventional visible-cell count.
+#define SCPU_VIC_MATRIX_BYTES 1024u
+
 class CWriteBuffer : public IMirrorSink
 {
 public:
@@ -109,7 +115,7 @@ public:
 	// SuperCPU exposes this as the "Z flag" alongside the optimization mode:
 	// almost nothing points the VIC at page 0 or 1, and CPU traffic there is
 	// heavy, so excluding it is a large win for a small compatibility risk.
-	void setExcludeZeroPageStack( bool exclude ) { m_ExcludeZPStack = exclude; }
+	void setExcludeZeroPageStack( bool exclude );
 
 	// --- IMirrorSink ------------------------------------------------------
 	bool onRamWrite( u16 addr, u8 value ) override;
@@ -182,7 +188,7 @@ public:
 	}
 
 	// flushUpTo with display-time policy. Hot sprite-shape bytes and bytes in
-	// the active 1000-byte screen matrix or 8000-byte bitmap are skipped, not
+	// the active 1024-byte screen-matrix ring or 8000-byte bitmap are skipped, not
 	// allowed to block cold traffic behind them. Skipped entries remain queued
 	// in stable order for a hidden-window drain. A base of 0xFFFFFFFF disables
 	// that display-region deferral.
@@ -300,6 +306,12 @@ public:
 
 	// Exposed for tests.
 	bool shouldMirror( u16 addr ) const;
+
+	// Re-derive IMirrorSink::m_MirrorFloor from m_Mode, m_RangeLo and
+	// m_ExcludeZPStack -- the same three fields shouldMirror() tests -- and
+	// repair same-value elimination over whatever range just changed hands.
+	// Called from the only two functions that can move any of them.
+	void recomputeMirrorFloor();
 
 private:
 	u32 flushSelectedChunk( u32 maxBytes, bool deferHot, u32 displayBase,

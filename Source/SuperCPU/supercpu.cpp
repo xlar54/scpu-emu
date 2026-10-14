@@ -36,6 +36,274 @@ static SCPUIECEpochDiagnostic s_FrozenIECEpochDiagnostics[
 static u32 s_FrozenIECEpochDiagnosticCount = 0;
 static u32 s_FrozenIECEpochHostHz = 0;
 
+static SCPUVSPMatrixDiagnostic s_VSPMatrixDiagnostic = {};
+static const CSuperCPU *s_VSPMatrixOwner = 0;
+static u32 s_VSPMatrixLastTraceTotal = 0;
+static u8 s_VSPMatrixLastPhase = 0;
+static bool s_VSPMatrixHavePhase = false;
+static u8 s_VSPMatrixExpected[ SCPU_VIC_MATRIX_BYTES ];
+static u8 s_VSPMatrixPhysical[ SCPU_VIC_MATRIX_BYTES ];
+
+#ifdef SCPU_HOST_BUILD
+static const u32 s_VSPMatrixCaptureFrames[ SCPU_VSP_MATRIX_CLEAN_CAPTURES ] =
+	{ 2, 4, 6 };
+#else
+// Three bounded observations catch both an immediate displacement and one that
+// accumulates while Mario scrolls, while remaining inside the roughly 430
+// active frames the failing hardware run survives.
+static const u32 s_VSPMatrixCaptureFrames[ SCPU_VSP_MATRIX_CLEAN_CAPTURES ] =
+	{ 60, 180, 360 };
+#endif
+
+static void resetVSPMatrixDiagnostic( const CSuperCPU *owner )
+{
+	s_VSPMatrixDiagnostic = SCPUVSPMatrixDiagnostic{};
+	s_VSPMatrixOwner = owner;
+	s_VSPMatrixLastTraceTotal = 0;
+	s_VSPMatrixLastPhase = 0;
+	s_VSPMatrixHavePhase = false;
+	for ( u32 i = 0; i < SCPU_VSP_MATRIX_CAPTURE_SLOTS; i++ )
+	{
+		SCPUVSPMatrixCapture &capture = s_VSPMatrixDiagnostic.capture[ i ];
+		capture.kind = i == SCPU_VSP_MATRIX_STALL_SLOT ? 1 : 0;
+		capture.targetFrame = i < SCPU_VSP_MATRIX_CLEAN_CAPTURES
+		                    ? s_VSPMatrixCaptureFrames[ i ] : 0;
+	}
+}
+
+static u32 hiddenRasterLinesLeft( C64VideoStandard video, u16 line )
+{
+	const u32 lines = c64RasterLines( video );
+	if ( line >= lines || !c64RasterIsSafeForBulkTransfer( video, line ) )
+		return 0;
+	return line > c64DisplayLastLine( video )
+	     ? ( lines - line ) + c64DisplayFirstLine( video )
+	     : c64DisplayFirstLine( video ) - line;
+}
+
+static bool waitForVSPMatrixWindow( IC64Bus &bus, C64VideoStandard video,
+	                                u16 &line )
+{
+	line = bus.rasterLine();
+	if ( hiddenRasterLinesLeft( video, line ) >= 24 ) return true;
+
+	// The heartbeat calls this only after declaring the guest stalled. Keep the
+	// guest and mirror queue frozen while the physical VIC advances to a hidden
+	// interval. Poll the bus only every ~50us so this diagnostic wait does not
+	// turn into thousands of back-to-back $D012 reads.
+	const u32 hz = bus.hostCyclesPerSec();
+	if ( !hz ) return false;
+	const u64 started = bus.hostCycles();
+	const u64 timeout = hz / 40u;       // 25ms: more than one NTSC/PAL frame
+	const u64 interval = hz / 20000u ? hz / 20000u : 1u;
+	u64 nextPoll = started + interval;
+	while ( bus.hostCycles() - started < timeout )
+	{
+		const u64 now = bus.hostCycles();
+		if ( now < nextPoll ) continue;
+		nextPoll = now + interval;
+		line = bus.rasterLine();
+		if ( hiddenRasterLinesLeft( video, line ) >= 24 ) return true;
+	}
+	return false;
+}
+
+static bool captureVSPMatrix( CSuperCPU &scpu, const C64Signals &sig,
+	                          SCPUVSPMatrixCapture &capture,
+	                          bool requireClean, bool waitForWindow )
+{
+	CC64Memory &memory = scpu.memory();
+	if ( memory.iecBusActive() ) return false;
+
+	capture.state = 1;
+	capture.captureAttempts++;
+	capture.qualifyingFrame = s_VSPMatrixDiagnostic.qualifyingFrames;
+	capture.traceTotal = memory.vspTraceTotal();
+	capture.gamePhase = memory.m_RAM[ 0x9F88 ];
+	const u32 logicalBase = memory.activeVICScreenBase();
+	const u32 physicalBase = memory.activeScreenBase();
+	if ( logicalBase >= 0x10000 || physicalBase >= 0x10000 ) return false;
+
+	const u32 pending = scpu.writeBuffer().pendingInRange(
+		logicalBase, SCPU_VIC_MATRIX_BYTES );
+	if ( requireClean && pending )
+	{
+		capture.pendingWaits++;
+		return false;
+	}
+
+	IC64Bus *bus = scpu.hostBus();
+	if ( !bus ) return false;
+	u16 before = 0xFFFF;
+	const bool safe = waitForWindow
+	                ? waitForVSPMatrixWindow( *bus, sig.video, before )
+	                : ( ( before = bus->rasterLine() ),
+	                    hiddenRasterLinesLeft( sig.video, before ) >= 24 );
+	if ( !safe )
+	{
+		capture.unsafeWindowWaits++;
+		return false;
+	}
+
+	// From here the observer does 1024 physical reads and a 17-shift compare
+	// with the guest stopped. That is the only path in the normal runtime
+	// configuration known to freeze the guest for more than a few raster
+	// lines, so it must be able to name itself.
+	memory.noteGuestStopCause( SCPU_GUEST_STOP_MATRIXDIAG );
+	const u8 *ram = memory.ramShadow();
+	for ( u32 i = 0; i < SCPU_VIC_MATRIX_BYTES; i++ )
+	{
+		const u16 logical = (u16)( logicalBase + i );
+		s_VSPMatrixExpected[ i ] =
+			scpu.writeBuffer().deliverValue( logical, ram[ logical ] );
+	}
+	for ( u32 i = 0; i < SCPU_VIC_MATRIX_BYTES; i++ )
+		s_VSPMatrixPhysical[ i ] = bus->readRAM(
+			(u16)( physicalBase + i ) );
+	const u16 after = bus->rasterLine();
+
+	capture.logicalBase = logicalBase;
+	capture.physicalBase = physicalBase;
+	capture.rasterBefore = before;
+	capture.rasterAfter = after;
+	capture.safeWindow = hiddenRasterLinesLeft( sig.video, after ) != 0;
+	// Preserve the count as found BEFORE the comparison. In particular, the
+	// stall slot deliberately does not drain an incomplete matrix first.
+	capture.pendingAtCapture = pending;
+	capture.directMatches = 0;
+	capture.mismatchCount = 0;
+	capture.firstMismatch = 0xFFFF;
+	capture.lastMismatch = 0xFFFF;
+	capture.mismatchSampleCount = 0;
+	for ( u32 i = 0; i < SCPU_VIC_MATRIX_BYTES; i++ )
+	{
+		if ( s_VSPMatrixPhysical[ i ] == s_VSPMatrixExpected[ i ] )
+		{
+			capture.directMatches++;
+			continue;
+		}
+		if ( capture.firstMismatch == 0xFFFF ) capture.firstMismatch = (u16)i;
+		capture.lastMismatch = (u16)i;
+		capture.mismatchCount++;
+		if ( capture.mismatchSampleCount < SCPU_VSP_MATRIX_MISMATCH_SAMPLES )
+		{
+			SCPUVSPMatrixMismatch &m =
+				capture.mismatch[ capture.mismatchSampleCount++ ];
+			m.offset = (u16)i;
+			m.expected = s_VSPMatrixExpected[ i ];
+			m.physical = s_VSPMatrixPhysical[ i ];
+		}
+	}
+
+	capture.bestShift = 0;
+	capture.bestShiftMatches = capture.directMatches;
+	capture.bestShiftCompared = SCPU_VIC_MATRIX_BYTES;
+	for ( s32 shift = -8; shift <= 8; shift++ )
+	{
+		if ( shift == 0 ) continue;
+		u32 matches = 0, compared = 0;
+		for ( s32 physical = 0; physical < (s32)SCPU_VIC_MATRIX_BYTES;
+		      physical++ )
+		{
+			const s32 expected = physical + shift;
+			if ( expected < 0 || expected >= (s32)SCPU_VIC_MATRIX_BYTES )
+				continue;
+			compared++;
+			if ( s_VSPMatrixPhysical[ physical ]
+			     == s_VSPMatrixExpected[ expected ] )
+				matches++;
+		}
+		if ( (u64)matches * capture.bestShiftCompared
+		     > (u64)capture.bestShiftMatches * compared )
+		{
+			capture.bestShift = shift;
+			capture.bestShiftMatches = matches;
+			capture.bestShiftCompared = compared;
+		}
+	}
+	capture.state = 2;
+	s_VSPMatrixDiagnostic.capturedCount++;
+	return true;
+}
+
+static void tryVSPMatrixDiagnostic( CSuperCPU &scpu,
+	                                const C64Signals &sig )
+{
+	SCPUVSPMatrixDiagnostic &d = s_VSPMatrixDiagnostic;
+	if ( s_VSPMatrixOwner != &scpu ) resetVSPMatrixDiagnostic( &scpu );
+	if ( sig.machine != MACHINE_C64 ) return;
+
+	CC64Memory &memory = scpu.memory();
+	const u32 traceTotal = memory.vspTraceTotal();
+	d.traceTotal = traceTotal;
+	const u8 phase = memory.m_RAM[ 0x9F88 ];
+	// D016 is the fine-scroll register and intentionally walks through several
+	// values during Mario gameplay. D018=$CE plus a change in Mario's own $9F88
+	// phase byte proves gameplay without requiring that phase to change at 60Hz.
+	if ( memory.m_VICRegShadow[ 0x18 ] != 0xCE )
+	{
+		d.qualifyingFrames = 0;
+		d.quietFrames = 0;
+		s_VSPMatrixLastTraceTotal = traceTotal;
+		s_VSPMatrixLastPhase = phase;
+		s_VSPMatrixHavePhase = false;
+		return;
+	}
+
+	if ( !s_VSPMatrixHavePhase )
+	{
+		s_VSPMatrixLastPhase = phase;
+		s_VSPMatrixHavePhase = true;
+	}
+	else if ( phase != s_VSPMatrixLastPhase )
+	{
+		s_VSPMatrixLastPhase = phase;
+		d.gameplaySeen = 1;
+		if ( d.phaseChanges != 0xFF ) d.phaseChanges++;
+	}
+
+	const bool traceAdvanced = traceTotal != s_VSPMatrixLastTraceTotal;
+	s_VSPMatrixLastTraceTotal = traceTotal;
+	if ( !traceAdvanced )
+	{
+		if ( ++d.quietFrames > 1 ) d.qualifyingFrames = 0;
+		return;
+	}
+	d.quietFrames = 0;
+	if ( !d.gameplaySeen ) return;
+	d.qualifyingFrames++;
+	d.state = 1;
+
+	for ( u32 i = 0; i < SCPU_VSP_MATRIX_CLEAN_CAPTURES; i++ )
+	{
+		SCPUVSPMatrixCapture &capture = d.capture[ i ];
+		if ( capture.state == 2 ) continue;
+		if ( d.qualifyingFrames < capture.targetFrame ) break;
+		capture.state = 1;
+		captureVSPMatrix( scpu, sig, capture, true, false );
+		break; // At most one 1K observer per emulated frame.
+	}
+	if ( d.capture[ SCPU_VSP_MATRIX_CLEAN_CAPTURES - 1 ].state == 2 )
+		d.state = 2;
+}
+
+void scpuVSPMatrixDiagnostic( SCPUVSPMatrixDiagnostic &out )
+{
+	out = s_VSPMatrixDiagnostic;
+}
+
+bool scpuCaptureVSPStallMatrixDiagnostic( CSuperCPU *scpu )
+{
+	if ( !scpu || s_VSPMatrixOwner != scpu
+	     || !scpu->hostBus() || !s_VSPMatrixDiagnostic.gameplaySeen )
+		return false;
+	SCPUVSPMatrixCapture &capture =
+		s_VSPMatrixDiagnostic.capture[ SCPU_VSP_MATRIX_STALL_SLOT ];
+	if ( capture.state == 2 ) return true;
+	return captureVSPMatrix( *scpu, scpu->hostBus()->signals(), capture,
+	                         false, true );
+}
+
 // A K411 VIC-map change leaves as much as 9KB of matrix/graphics replay for
 // the raster scheduler. A tight IEC poll is positive evidence that those
 // chunks must not be introduced yet, even after the edge-only transaction
@@ -120,6 +388,18 @@ CSuperCPU::CSuperCPU()
 	  m_MirrorDisplayBudget( SCPU_MIRROR_DISPLAY_BYTES_DEFAULT ),
 	  m_FrameHook( 0 ), m_FrameHookCtx( 0 )
 {
+}
+
+// Lets CC64Memory read the 65816's PC and cycle count without including its
+// header or knowing its type. Packed into one u64 so a forensics hook costs one
+// call and not two; the cycle half is the LOW 32 bits of m_Cycles, the same
+// field and the same clock domain the interrupt ring stamps, which is what
+// makes the two rings comparable.
+static u64 scpuCoreProbe( void *ctx )
+{
+	const CW65C816 *core = (const CW65C816 *)ctx;
+	return ( (u64)(u32)core->cycles() << 32 )
+	     | (u32)( ( (u32)core->m_PBR << 16 ) | core->m_PC );
 }
 
 void CSuperCPU::disablePhysicalMirror()
@@ -283,6 +563,10 @@ bool CSuperCPU::init( IC64Bus *bus, SCPUCoreType core, u32 simmMB,
 		m_CPU = &m_Core65816;
 		m_Core65816.attachFastBus( &m_MemoryMap );
 		m_Registers.trackEmulationMode( &m_Core65816.m_E );
+		// So the memory layer's watched-write and $D012-read forensics can
+		// stamp entries in the CORE's clock domain and name the writer. Called
+		// only from those two rare hooks -- see CC64Memory::setCPUProbe.
+		m_Memory.setCPUProbe( &scpuCoreProbe, &m_Core65816 );
 		break;
 
 	case SCPU_CORE_6502:
@@ -342,6 +626,19 @@ bool CSuperCPU::init( IC64Bus *bus, SCPUCoreType core, u32 simmMB,
 		if ( self->m_CPU ) self->m_CPU->requestRunBreak();
 	}, this );
 
+	// Opening or closing the register bank moves the KERNAL shadow between
+	// bank 1 $E000 (KT) and $6000 (KS), and CSuperCPURegisters applies that
+	// through a raw u32*, so the register write is the only thing that knows
+	// the read map changed. Installed here, ahead of the reset() below,
+	// because reset() calls trackKernalShadow() and
+	// CSuperCPURegisters::reset(), both of which apply the shadow base and
+	// must already be able to invalidate when they do.
+	m_Registers.setMapHook( []( void *ctx )
+	{
+		CSuperCPU *self = (CSuperCPU *)ctx;
+		self->m_Memory.rebuildReadDecode();
+	}, this );
+
 	reset();
 	// reset() deliberately invalidates every CIA shadow, so establish the
 	// deterministic C64 KERNAL direction state only afterwards. A physical C128
@@ -376,6 +673,7 @@ void CSuperCPU::reset()
 	s_IECEpochDiagnosticSequence = 0;
 	s_IECEpochDiagnosticCurrent = 0;
 	s_IECEpochDiagnosticActive = false;
+	resetVSPMatrixDiagnostic( this );
 	for ( u32 i = 0; i < SCPU_IEC_EPOCH_DIAG_CAPACITY; i++ )
 	{
 		SCPUIECEpochDiagnostic empty = {};
@@ -945,7 +1243,8 @@ static void flushMirrorsRasterAware( CWriteBuffer &buffer, IC64Bus &bus,
 			budgetBytes = ( linesLeft * perLine * 3 ) / 4;
 			const bool screenPending = screenBase < 0x10000
 			                        && buffer.hasPendingInRange(
-			                             screenBase, 1000, stageMapRefresh );
+			                             screenBase, SCPU_VIC_MATRIX_BYTES,
+			                             stageMapRefresh );
 			const bool bitmapPending = bitmapBase < 0x10000
 			                        && buffer.hasPendingInRange(
 			                             bitmapBase, 8000, stageMapRefresh );
@@ -957,11 +1256,12 @@ static void flushMirrorsRasterAware( CWriteBuffer &buffer, IC64Bus &bus,
 				// the raster is sampled again before the next one.
 				if ( screenLeft == 0 ) break;
 				displayPriority = true;
-				// Matrix first: it is only 1000 bytes and includes bitmap colour
-				// selection. The bitmap consumes the remaining hidden opportunities
+				// Matrix first: its full 1K ring includes the normally unused tail
+				// that VSP can expose, as well as bitmap colour selection. The bitmap
+				// consumes the remaining hidden opportunities
 				// and converges over subsequent frames without visible-picture tears.
 				priorityBase = screenPending ? screenBase : bitmapBase;
-				priorityLen = screenPending ? 1000 : 8000;
+				priorityLen = screenPending ? SCPU_VIC_MATRIX_BYTES : 8000;
 				if ( budgetBytes > screenLeft ) budgetBytes = screenLeft;
 			}
 			else
@@ -1059,7 +1359,31 @@ u64 CSuperCPU::runFrame()
 	u64 ticksUsed = repaid;
 	m_FrameTickDebt -= repaid;
 	u64 executed = 0;
+	// One deferral decision per guest run. Every background operation before
+	// the next run must share it, including work after the frame budget ends.
+	// Rechecking the limit per helper would exhaust it without executing any
+	// guest instructions and admit traffic into the very window we protected.
+	auto deferRasterWork = [this]() -> bool
+	{
+		const bool defer = m_Memory.mirrorDeferWindowOpen()	// K507: also right after an /IRQ
+		                && m_RasterDeferRun < SCPU_RASTER_DEFER_LIMIT;
+		if ( defer )
+		{
+			++m_RasterDeferRun;
+			++m_RasterDeferred;
+		}
+		else
+			m_RasterDeferRun = 0;
+		return defer;
+	};
+	bool rasterCritical = m_Memory.mirrorDeferWindowOpen();
 	updateIECEpochDiagnostic();
+	// Measurement-only K442 observer. It remains completely passive until
+	// Mario's own phase byte proves gameplay, then takes three bounded, guarded
+	// hidden-window physical-vs-shadow comparisons before this frame's drain or
+	// background sweep can alter the evidence.
+	if ( !rasterCritical )
+		tryVSPMatrixDiagnostic( *this, sig );
 
 	// The frame is run in slices rather than one call, for two reasons. A
 	// speed change breaks run() so the remainder can be re-budgeted at the new
@@ -1101,7 +1425,9 @@ u64 CSuperCPU::runFrame()
 		const u64 sliceBudget = ( sliceTicks + ticksPerCycle - 1 ) / ticksPerCycle;
 		if ( budget > sliceBudget ) budget = sliceBudget;
 
+		m_Memory.noteGuestResumed();
 		const u64 ran = m_CPU->run( budget );
+		m_Memory.noteGuestStopped();
 		executed += ran;
 		ticksUsed += ran * ticksPerCycle;
 		// The first serial edge requests a run break, so this observes the
@@ -1110,6 +1436,8 @@ u64 CSuperCPU::runFrame()
 		updateIECEpochDiagnostic();
 		const bool stageMapRefresh = mayStageDeferredMapRefresh(
 			m_WriteBuffer, m_Memory, *m_Bus );
+		if ( stageMapRefresh && m_WriteBuffer.hasDeferredMapRefresh() )
+			m_Memory.noteGuestStopCause( SCPU_GUEST_STOP_MAPREFRESH );
 
 		// Opportunistic flush: one raster read. Cold traffic may use its small
 		// display ration; the active screen matrix and hot sprite shapes wait
@@ -1124,8 +1452,25 @@ u64 CSuperCPU::runFrame()
 		// CLK for an acknowledgment phase the host never entered, which is
 		// precisely the $DD00=$87 deadlock captured on hardware. Mirroring can
 		// always wait 100ms; the serial bus cannot.
-		if ( !m_MirrorHalted && !m_Memory.iecBusActive()
+		// AND NEVER INSIDE A CYCLE-COUNTED RASTER WINDOW, for the same class of
+		// reason as the serial guard above: this helper's own raster queries are
+		// physical bus reads and its installments stall the emulated CPU for up
+		// to several hundred microseconds, and raster code assigns MEANING to
+		// the cycle count between its $D012 read and its VIC write. The physical
+		// raster keeps advancing throughout such a pause.
+		//
+		// The deferral is BOUNDED so a $D012-polling program cannot postpone
+		// mirroring for ever: after SCPU_RASTER_DEFER_LIMIT consecutive
+		// opportunities the flush proceeds regardless. Mirroring can always
+		// wait 100ms, as the serial note above says; it cannot wait for ever.
+		rasterCritical = deferRasterWork();
+		if ( !m_MirrorHalted && !m_Memory.iecBusActive() && !rasterCritical
 		     && !m_WriteBuffer.empty() && ticksUsed < frameTicks )
+		{
+			// One tag for the whole helper: its raster queries and its physical
+			// installments are the same stop, and splitting them would need the
+			// memory layer plumbed through a function that takes an IC64Bus.
+			m_Memory.noteGuestStopCause( SCPU_GUEST_STOP_FLUSH );
 			flushMirrorsRasterAware( m_WriteBuffer, *m_Bus, sig,
 			                         displayPerOpportunity,
 			                         transferPerOpportunity,
@@ -1134,6 +1479,7 @@ u64 CSuperCPU::runFrame()
 			                         m_Memory.activeScreenBase(),
 			                         m_Memory.activeBitmapBase(),
 			                         stageMapRefresh );
+		}
 
 		// Physical-C64 display DRAM can acquire sparse stored single-bit errors
 		// while the VIC is actively fetching. Repair the measured vulnerable
@@ -1143,16 +1489,18 @@ u64 CSuperCPU::runFrame()
 		// 60us. A timed trial alternates repair off/on, making the visual result
 		// self-controlled without adding physical reads on machines whose bus has
 		// no calibrated stable read window.
-		if ( m_DisplayScrubEnabled && !m_MirrorHalted
+		if ( m_DisplayScrubEnabled && !m_MirrorHalted && !rasterCritical
 		     && sig.machine == MACHINE_C64
 		     && scrubBitmapBase < 0x10000
 		     && ( m_Memory.m_VICRegShadow[ 0x11 ] & 0x10 )
 		     && !m_Memory.iecBusActive() && m_WriteBuffer.empty()
 		     && ticksUsed < frameTicks )
 		{
+			m_Memory.noteGuestStopCause( SCPU_GUEST_STOP_RASTER );
 			const u16 scrubLine = m_Bus->rasterLine();
 			if ( c64RasterIsSafeForBulkTransfer( sig.video, scrubLine ) )
 			{
+				m_Memory.noteGuestStopCause( SCPU_GUEST_STOP_SCRUB );
 				m_WriteBuffer.resyncDisplayed(
 					m_Memory.activeScreenBase(), scrubBitmapBase, 8192,
 					32, m_DisplayScrubMasked, m_DisplayScrubPhaseOn, false );
@@ -1181,8 +1529,11 @@ u64 CSuperCPU::runFrame()
 	// The cycles spent here belong to the next frame, which is precisely the
 	// point: it re-phases the emulated frame against the real raster instead of
 	// letting the two drift.
-	if ( !m_MirrorHalted && !m_WriteBuffer.empty() && !m_Memory.iecBusActive() )
+	if ( !m_MirrorHalted && !m_WriteBuffer.empty() && !m_Memory.iecBusActive()
+	     && !rasterCritical )
 	{
+		m_Memory.noteGuestStopCause( SCPU_GUEST_STOP_BORDER
+		                           | SCPU_GUEST_STOP_RASTER );
 		const u16 line = m_Bus->rasterLine();
 		const u32 lines = c64RasterLines( sig.video );
 
@@ -1196,17 +1547,23 @@ u64 CSuperCPU::runFrame()
 			const u32 clockHz = m_Memory.iecThrottleActive()
 			                  ? SCPU_NORMAL_HZ : currentClockHz();
 			const u32 ticksPerCycle = SCPU_TURBO_HZ / clockHz;
+			m_Memory.noteGuestResumed();
 			const u64 ran = m_CPU->run( approachTicks / ticksPerCycle );
+			m_Memory.noteGuestStopped();
 			executed += ran;
 			m_FrameTickDebt += ran * ticksPerCycle;
 			updateIECEpochDiagnostic();
+			// Approaching the border executes guest code and can start a new
+			// raster-critical interval, just as an ordinary slice can.
+			rasterCritical = deferRasterWork();
 		}
 
 		// Re-check the serial bus: the approach run may have started one.
-		if ( !m_MirrorHalted && !m_Memory.iecBusActive() )
+		if ( !m_MirrorHalted && !m_Memory.iecBusActive() && !rasterCritical )
 		{
 			const bool stageMapRefresh = mayStageDeferredMapRefresh(
 				m_WriteBuffer, m_Memory, *m_Bus );
+			m_Memory.noteGuestStopCause( SCPU_GUEST_STOP_FLUSH );
 			flushMirrorsRasterAware( m_WriteBuffer, *m_Bus, sig,
 			                         displayPerOpportunity,
 			                         transferPerOpportunity,
@@ -1240,7 +1597,10 @@ u64 CSuperCPU::runFrame()
 					                    ? ( lines - line ) + c64DisplayFirstLine( sig.video )
 					                    : c64DisplayFirstLine( sig.video ) - line;
 					if ( linesLeft >= 12 )
+					{
+						m_Memory.noteGuestStopCause( SCPU_GUEST_STOP_SWEEP );
 						m_WriteBuffer.resyncSweep( transferPerOpportunity );
+					}
 				}
 			}
 		}
@@ -1255,11 +1615,27 @@ u64 CSuperCPU::runFrame()
 	// One coarse clock/raster pairing per frame gives non-IRQ programs a
 	// reference without perturbing VIDEO_MODE 0. Precise anchors taken inside
 	// raster handlers outrank this sample for roughly a frame.
-	if ( m_Memory.vicLogEnabled() && !m_Memory.iecBusActive() )
+	if ( m_Memory.vicLogEnabled() && !m_Memory.iecBusActive() && !rasterCritical )
 	{
 		const u16 line = m_Bus->rasterLine();
 		if ( line != 0xFFFF ) m_Memory.noteRasterCoarse( line );
 	}
+
+	// The stop opened by the last run() above is still open, and the frame hook
+	// runs inside it: scpuCheckButton()'s own note records that one logger write
+	// costs MILLISECONDS, which is the right order of magnitude for the K478
+	// displacement even though this card's config leaves every per-second print
+	// off. Tagging here rather than in boot.cpp keeps the attribution in the
+	// host-built unit and needs no frame-hook change.
+	m_Memory.noteGuestStopCause( SCPU_GUEST_STOP_FRAMEEND );
+
+	// The hypothesis-free backstop for the interrupt-control ring's latch. The
+	// precise latch is the first impossible raster compare, which is the
+	// measured signature of the Mario hang and nothing else; this one knows
+	// only that forward progress stopped. Once per frame, one compare against
+	// a counter the detector already maintains -- and it is here rather than in
+	// rollProgressEpoch because this unit has both complete types.
+	m_Memory.noteProgressSuspects( m_Core65816.m_ProgSuspects );
 
 	return executed;
 }

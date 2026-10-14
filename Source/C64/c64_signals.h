@@ -76,6 +76,25 @@ static inline u32 c64RasterLines( C64VideoStandard v )
 	}
 }
 
+// PHI2 frequency. The VIC-II divides the colour subcarrier, so a C64's CPU
+// clock is never a round megahertz: PAL is 17.734472MHz/18 = 985248Hz and both
+// NTSC revisions are 14.31818MHz/14 = 1022727Hz -- they differ in lines and
+// cycles per line, not in PHI2. Scott's NTSC machine measured 1.022708MHz at
+// the frame cadence, 19ppm from the nominal figure (CHT 1024). Anything
+// converting emulated cycles into real time must use these and not 1000000:
+// in setPacing() the round megahertz cost a constant +2.27% on every paced
+// cycle, and rad_bus.cpp's SID rate already carries the same pair by hand.
+static inline u32 c64CpuHz( C64VideoStandard v )
+{
+	switch ( v )
+	{
+	case VIDEO_NTSC_R56A:
+	case VIDEO_NTSC_R8:   return 1022727;
+	case VIDEO_PAL:
+	default:              return 985248;
+	}
+}
+
 // First and last rasterline of the visible display window -- the lines during
 // which the VIC-II is fetching character, colour and bitmap data. Driving bulk
 // traffic on the bus across these lines corrupts those fetches and the picture

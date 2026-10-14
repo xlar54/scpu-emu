@@ -29,7 +29,7 @@
 #define _config_h
 
 
-#define TIMING_NAMES 46
+#define TIMING_NAMES 57
 const char timingNames[][32] = {
 	"WAIT_FOR_SIGNALS", 
 	"WAIT_CYCLE_READ", 
@@ -153,13 +153,93 @@ const char timingNames[][32] = {
 	// four wrong theories chased what one byte of punctuation caused. A
 	// static_assert on the initializer count follows in the guard commit.
 	"RAM_UNDER_IO",
-	// Diagnostic calibration, cycle-exact VSP work: shift the settle aim of
-	// precise VIC reads/writes by this many C64 cycles (-6..+6, default 0).
+	// Diagnostic calibration, cycle-exact VSP work: move the REAL-TIME deadline
+	// of each placed VIC read/write by this many whole C64 cycles (-6..+6,
+	// default 0). A physical phase trim only: the cycles the guest is charged,
+	// the bus ledger and the pacer's grid never see it (CW65C816::busPhaseTrim).
 	// Positive lands the access LATER. The horizontal shift of a VSP screen is
 	// the readout: sweep VSP_AIM_WRITE until the shift is zero, and that value
 	// is the machine's measured end-to-end placement constant.
 	"VSP_AIM_READ",
 	"VSP_AIM_WRITE",
+	// Stop retiring emulated instructions while the VIC-II holds BA, the way a
+	// real 6510 is frozen on a badline. 0 off, 1 (default) on except while a
+	// serial transaction window is armed, 2 always. See CC64Memory::
+	// baStallSettle and the hardware note in default.cfg.
+	"BA_STALL",
+	// Ceiling on ONE such freeze, in C64 cycles. 8..80, default 80 -- the top of
+	// the range IS RAD_BA_STALL_CEILING, so nothing configurable is unreachable.
+	"BA_STALL_MAX",
+	// How much evidence a serial-transaction window needs. 0 legacy, 1 (default)
+	// ignore a level on a line the guest is itself pulling down, 2 positive
+	// evidence only. See CC64Memory::m_IECWindowMode and default.cfg.
+	"IEC_WINDOW",
+	// Hypothesis-free hang detector: freeze the interrupt ring when the set of
+	// executed code addresses stops growing. 1 (default) on, 0 off. See the
+	// W65_PROG_ block in Source/CPU/W65C816/w65c816.h.
+	"HANG_WATCH",
+	// Two RAM addresses whose writes are logged with value, writer PC and
+	// cycle, in DECIMAL because this parser is atoi. 0 disarms a slot, which
+	// makes $0000 the one address not watchable from the config. Default
+	// 40840 = $9F88, Mario's frame-phase index: the byte the 2026-10-12 hang
+	// spins on. A watch puts an out-of-line call on every write to that
+	// address's 4K page, so do not point one at page $0 without measuring.
+	"RAM_WATCH",
+	"RAM_WATCH2",
+	// Diagnostic-minimal mode. 0 (DEFAULT) keeps every instrument, because the
+	// 2026-10-12 hang is NOT solved: HANG_WATCH, the interrupt ring, RAM_WATCH
+	// and the VSP trace are all still producing the evidence the investigation
+	// runs on, and a default that quietly disarmed them would be the worst kind
+	// of speed-up. 1 drops only instruments that answer CLOSED questions, which
+	// today means the K449 per-stage bus timers.
+	//
+	// WHY THOSE AND NOTHING ELSE. Verified in the rebuilt rad_bus.o with the
+	// project toolchain: radAccumRead is inlined TWICE into radDirectRead --
+	// once for radBusStages and, under the ( addr & 0xF000 ) == 0xD000 test, a
+	// second straight-line copy for radBusStagesIO -- so every $Dxxx transfer
+	// executes two ~40-instruction accumulator bodies against a measured
+	// unstalled transfer floor of 639 ARM plain and 2001 turnaround. Every guest
+	// I/O access pays it, because CRADBus::read/write reach the bus through
+	// RAD_SPEEK/RAD_SPOKE and those are radDirectRead/radDirectWrite.
+	//
+	// AND WHY IT IS A CONFIG KEY RATHER THAN A REBUILD: the TI benchmark cannot
+	// see this cost at all -- its loop executes out of Pi RAM and never touches
+	// the expansion port -- so the A/B that matters is a Mario run, which means
+	// it has to be selectable in two boots on the card. The per-write counters,
+	// by contrast, are 3 instructions each and a runtime gate would cost 2 to
+	// save 3; those use the compile-time SCPU_DIAG_WRITE_COUNTERS gate in
+	// Source/C64/c64_memory.h instead.
+	"DIAG_MINIMAL",
+	// THE LATE-CASE VSP FIX, gated (K500). 1 serves a guest $D011 read that
+	// falls inside the raster window (a $D012 anchor read at 1MHz within the
+	// last 200 cycles) from the VIC register shadow instead of the bus, when
+	// the anchor's low byte proves the raster MSB is 0. Bits 6..0 are already
+	// shadow-served (the GEOS fix), so the value is identical; what goes is
+	// the transfer (2.3 cycles) and the turnaround it forces on the write that
+	// follows, so a DEC/INC $D011 pair reaches its count target early and the
+	// catch-up places every frame on it. Exact value 1 only; default 0.
+	"VSP_D011_SHADOW_READ",
+	// THE WRITE LEAD (K502), quarter C64 cycles 0..3, default 2. The settle
+	// that places a VIC write exits this much before the pacer's lock phase so
+	// the write's entry into the bus primitive lands mid-cycle instead of on
+	// the falling edge it must precede. Measured need: the write path from a
+	// settle exit to the primitive is ~630 ARM heavier than the read path the
+	// lock phase was tuned for (catch= -0.46 cycle on every DEC, letters
+	// flickering 0/+1 on the oracle disk). 0 reproduces the pre-K502 placement.
+	"VSP_WRITE_LEAD",
+	// BISECT KEY (K505). 1 (default): K501's placement inside a raster window
+	// -- the K243 pass paid inside the write's resync, lag 1, the catch-up
+	// target anchored on the anchor read's cycle start. 0: K500's placement
+	// for those three (resync then pass, lag 2 on a pending turnaround, target
+	// on the read's return). Metal Dust's intro regressed somewhere in
+	// K498-K504 while Mario was fixed; this splits the two without a rebuild.
+	"VSP_PLACEMENT_K501",
+	// TRACE FILTER (K506). 1: the vsp trace ring retains only VIC writes placed
+	// inside a raster window (a $D012 anchor at 1MHz within 200 cycles). The
+	// ring holds 128 events and a game writes $D011 every frame, so by the
+	// time the card is pulled the intro that mattered is long overwritten;
+	// with this on, the ring is the intro's windowed writes. Default 0.
+	"VSP_TRACE_WINDOW_ONLY",
 };
 
 // A missing comma between two entries concatenates the literals, silently
@@ -251,6 +331,51 @@ extern int cfgRAMUnderIO;
 // Diagnostic VSP placement calibration, cycles, -6..+6, default 0.
 extern int cfgVSPAimRead;
 extern int cfgVSPAimWrite;
+
+// Emulated BA stall; see BA_STALL in the names table. Default 1.
+extern int cfgBAStall;
+extern int cfgBAStallMax;
+
+#define SCPU_CFG_BA_STALL_DEFAULT     1
+#define SCPU_CFG_BA_STALL_MAX_DEFAULT 80
+
+// Evidence required to arm the serial-transaction window; see IEC_WINDOW in the
+// names table. Default 1: a line the guest is pulling down is its own output
+// looping back, not a drive answering.
+extern int cfgIECWindow;
+
+#define SCPU_CFG_IEC_WINDOW_DEFAULT   1
+
+// Hang detector and watched-RAM write forensics; see HANG_WATCH and RAM_WATCH
+// in the names table. cfgRAMWatch/cfgRAMWatch2 are 0 for "disarmed".
+extern int cfgHangWatch;
+extern int cfgRAMWatch;
+extern int cfgRAMWatch2;
+
+#define SCPU_CFG_HANG_WATCH_DEFAULT  1
+// $9F88. Decimal because the config parser is atoi.
+#define SCPU_CFG_RAM_WATCH_DEFAULT   40840
+#define SCPU_CFG_RAM_WATCH2_DEFAULT  0
+
+// See DIAG_MINIMAL in the names table. The default is OFF in the sense that
+// nothing is disarmed: we are mid-investigation and the hang instruments must
+// survive a default boot.
+extern int cfgDiagMinimal;
+
+// See VSP_D011_SHADOW_READ in the names table. 0 off (default), 1 on.
+extern int cfgVSPD011ShadowRead;
+
+// See VSP_WRITE_LEAD in the names table. Quarter cycles, 0..3.
+extern int cfgVSPWriteLead;
+#define SCPU_CFG_VSP_WRITE_LEAD_DEFAULT 2
+
+// See VSP_PLACEMENT_K501 in the names table. 1 (default) or 0.
+extern int cfgVSPPlacementK501;
+
+// See VSP_TRACE_WINDOW_ONLY in the names table. 0 (default) or 1.
+extern int cfgVSPTraceWindowOnly;
+
+#define SCPU_CFG_DIAG_MINIMAL_DEFAULT 0
 
 #define SCPU_CFG_RAM_UNDER_IO_OFF      0
 #define SCPU_CFG_RAM_UNDER_IO_FORCE    1

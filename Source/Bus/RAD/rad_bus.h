@@ -29,6 +29,116 @@
 // cycles too, so this is the same clock the whole design is pinned to.
 #define SCPU_ARM_CLOCK_HZ 1400000000u
 
+// Per-stage ARM-cycle accounting for the two single-access primitives.
+//
+// Measured, not assumed. Across the 21 DEC/INC $D011 pairs in
+// .tmp/traces/vsptrace-k448-mario.txt the host delta is bimodal: 8 pairs mean
+// 15043 ARM (10.99 C64 cycles) and 13 mean 16401 (11.98), the modes 1358 ARM
+// = 0.992 cycles apart. Against a model budget of 6 * 1368.889 = 8213 the
+// clean mode carries 6830 ARM -- five C64 cycles -- of physical-access time
+// the cycle model never charges, and debt stays 0, so the pacer never sees it.
+//
+// Attributing that five needs the ENTRY PHI PHASE, not a fixed tax per wait
+// macro. BUS_RESYNC is WAIT_FOR_CPU_HALFCYCLE then WAIT_FOR_VIC_HALFCYCLE,
+// which spin while PHI is low and while PHI is high respectively, so the pair
+// always exits at the NEXT PHI2 falling edge whichever half it entered in and
+// its own duration IS the entry phase (phase = perC64 - resync). Bucketing by
+// it therefore needs no extra GPIO read inside the window.
+//
+// Bounded on purpose: fixed-size counters in Pi memory, no logging, no extra
+// C64 access. Every stamp is one MRS of PMCCNTR_EL0, and every accumulation
+// runs after the final stamp of its access, outside the measured intervals.
+struct RADBusStageStats
+{
+	u64 count;
+	u64 sum;
+	u32 min;
+	u32 max;
+};
+
+struct RADBusAccessStats
+{
+	RADBusStageStats readResync;	// entry -> PHI2 fall; this is the phase
+	RADBusStageStats readVIC;	// p1+p2: address setup through the PHI2 rise
+	RADBusStageStats readCPU;	// p3: sample, trailing half, teardown
+	RADBusStageStats writeResync;
+	// p1 bucketed by whether the write pays the K243 read->write turnaround.
+	// Since the K50x placement fix radDirectWrite pays the first idle pass
+	// inside its resync, so on a C64 the two buckets differ by the direction
+	// turn alone and the pass's whole cycle shows in writeResync; a C128's
+	// second pass still shows here. Measured with no stamp inside the primitive
+	// that implements it: CODEX forbade removing the protection, not measuring
+	// it from outside.
+	RADBusStageStats writeP1Turn;
+	RADBusStageStats writeP1Plain;
+	RADBusStageStats writeP2;	// data hold through the next PHI2 fall
+	// Segments that outlasted one VIC half -- 684 ARM on NTSC at arm_freq=1400,
+	// the figure Config/default.cfg states at lines 13-14 and 331 -- i.e. the
+	// BA spin waited out a VIC fetch. Counted apart so a badline cannot
+	// silently inflate the stage averages it would otherwise hide inside.
+	u64 readBAStalls;
+	u64 writeBAStalls;
+	// Turnaround writes were counted NOWHERE, and that gap is what made the
+	// first K449 reading wrong. wp1turn's MEAN was read as the K243 pass
+	// costing 2.12 C64 cycles; it costs 0.995, because min 2001 - min 639 =
+	// 1362 ARM against a 1368.889 NTSC period, and the pass is exactly one
+	// period by construction (busWriteByte_p1 loops WAIT_FOR_CPU_HALFCYCLE +
+	// WAIT_FOR_VIC_HALFCYCLE, falling edge to falling edge). The 2.12 was
+	// 1362 ARM of pass plus 1535 of uncounted badline. Counting it is what
+	// stops that misreading recurring.
+	u64 writeTurnBAStalls;
+};
+
+// Two populations, deliberately. A reset-to-date average over ALL physical
+// traffic cannot be compared with the $D011 pair's 6830 ARM: keyboard scans,
+// CIA polls, the screen mirror drain and the boot ROM block reads outnumber
+// I/O-window accesses by orders of magnitude and have different BA and
+// turnaround behaviour, so their average describes neither population.
+// radBusStagesIO is $D000-$DFFF alone, which is the traffic the VSP artifact
+// is actually made of; radBusStages remains the whole-bus figure that Problem
+// B's throughput question needs.
+extern RADBusAccessStats radBusStages;
+extern RADBusAccessStats radBusStagesIO;
+
+// DIAG_MINIMAL 1 clears this; default true, so a default boot measures what
+// K478 measured plus one load and one branch per accumulator.
+//
+// VERIFIED in the rebuilt rad_bus.o with the project toolchain: radAccumRead is
+// inlined TWICE into radDirectRead -- once for radBusStages, and a second
+// straight-line copy for radBusStagesIO guarded by the
+// cmp w23,#0xd,lsl#12 / b.eq at radDirectRead+0x39c -- so every $Dxxx transfer
+// executes two accumulator bodies of ~40 ARM instructions each, against a
+// measured unstalled transfer floor of 639 ARM plain and 2001 turnaround. (The
+// add x24,x24,#0xe0 near the tail is base rematerialisation for the second
+// copy's BA-stall field, NOT a loop back-edge; there is no loop here.) The gate
+// is one ldrb and one branch per accumulator, so ON costs what K478 cost plus
+// four instructions per I/O transfer, and OFF gives back the ~30 instructions
+// of min/max/sum/count bookkeeping in each copy.
+//
+// TWO THINGS ARE DELIBERATELY OUTSIDE THE GATE. The BA-stall THRESHOLD
+// counters (readBAStalls, writeBAStalls, writeTurnBAStalls) are two compares
+// and an increment, and bastall-r/w is quoted verbatim in the open BA-stall
+// investigation -- turning those off would disarm live evidence to save
+// nothing. And the four READ_CYCLE_COUNTER stamps stay, because the thresholds
+// need their deltas; two of them sit inside BUS_RESYNC/p1 windows with 311-535
+// ARM of documented margin (Config/default.cfg:350-351,365), so they consume
+// slack rather than wall time. It is the min/max/sum bookkeeping AFTER
+// c128TrafficEnd() that costs real time, and that is what this gates.
+// scpuLineStage() already prints 0 for a zero count, so a gated run reads as
+// empty buckets rather than dividing by zero.
+extern bool radBusStageTimingEnabled;
+
+// Cost of one back-to-back stamp pair, taken as the minimum of 64 samples: the
+// counter is monotonic and uncontended on core 0, so the floor is the real
+// instruction cost and anything above it is interference. Reported, never
+// silently subtracted, so a stage total that is only noise reads as noise.
+// No measurement of PMCCNTR_EL0 read cost exists anywhere in this project yet
+// -- grep of Source/ and CHT finds none -- so this is the unverified premise
+// under every stage figure above, not a footnote. Called from the diagnostic
+// formatter, where no transfer is in flight, so it cannot land between two.
+extern u32 radBusStampCost;
+void radCalibrateStampCost();
+
 class CLogger;
 class CWriteBuffer;
 
@@ -65,6 +175,22 @@ public:
 	u32  hostCyclesPerSec() override { return SCPU_ARM_CLOCK_HZ; }
 	u64  phiCpuHalfStartHostCycles() override;
 	bool writeTurnaroundPending() override;
+	u64  lastReadCycleStartHostCycles() override;
+	void setWriteTurnaroundMinimal( bool on ) override;
+	u32  busStealCycles( u32 maxCycles ) override;
+
+	// Emulated-BA-stall instrumentation, counted here because this is where
+	// the pin is read. A badline is 43 cycles and a badline plus eight sprites
+	// still cannot fill a line, so a stall that reaches the ceiling is not a
+	// long steal -- it is a machine whose BA stopped coming back. Spending the
+	// ceiling on every instruction after that would be a 60x slowdown,
+	// indistinguishable from the freeze the ceiling exists to prevent, so a
+	// run of them latches the sampler off until the next reset.
+	u64  m_BAStallCycles = 0;
+	u64  m_BAStallEvents = 0;
+	u64  m_BAStallCaps = 0;
+	u32  m_BAStallCapRun = 0;
+	bool m_BAStallFaulted = false;
 
 	const char *name() const override { return "RAD expansion unit"; }
 

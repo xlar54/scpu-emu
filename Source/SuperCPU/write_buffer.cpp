@@ -286,6 +286,66 @@ void CWriteBuffer::setOptMode( SCPUOptMode mode )
 	case SCPU_OPT_DEFAULT:
 	default:                 m_RangeLo = 0x0000; m_RangeHi = 0xFFFF; break;
 	}
+
+	recomputeMirrorFloor();
+}
+
+void CWriteBuffer::setExcludeZeroPageStack( bool exclude )
+{
+	m_ExcludeZPStack = exclude;
+	recomputeMirrorFloor();
+}
+
+// The floor is a LOWER BOUND on what shouldMirror() can accept, never a
+// restatement of it. Only the three tests below can exclude a LOW address:
+//
+//   SCPU_OPT_FULL        mirrors nothing at all, so nothing is above the floor.
+//   the Z flag           excludes $0000-$01FF in every mode except
+//                        SCPU_OPT_NONE, which means "no optimization".
+//   m_RangeLo            the mode's own lower bound.
+//
+// m_RAMUnderIOAccessible is deliberately NOT an input: the window it governs
+// is $D000-$DFFF, which is above every floor this can compute, so it can only
+// reject addresses the floor already admits -- and shouldMirror() still runs
+// for those. Leaving it out keeps the floor sound no matter how that rule
+// changes.
+void CWriteBuffer::recomputeMirrorFloor()
+{
+	const u32 previous = m_MirrorFloor;
+	u32 floor;
+	if ( m_Mode == SCPU_OPT_FULL )
+		floor = 0x10000u;				// mirrors nothing; skip every write
+	else
+	{
+		floor = m_RangeLo;
+		if ( m_Mode != SCPU_OPT_NONE && m_ExcludeZPStack && floor < 0x0200u )
+			floor = 0x0200u;
+	}
+	if ( floor == previous ) return;
+	m_MirrorFloor = floor;
+
+	// SAME-VALUE ELIMINATION IS WHY THIS IS NOT JUST AN ASSIGNMENT.
+	//
+	// onRamWrite() used to clear m_Synced for every write the policy skipped,
+	// so that "delivered once" stopped implying "still equal" the moment the
+	// shadow moved without real DRAM moving -- 3D Pool stages sprite shapes at
+	// $0200-$03FF under a restrictive mode and rewrites the same values under a
+	// permissive one, and without that clear its balls stayed garbage on the
+	// real screen while the shadow was perfect. Writes rejected by the floor no
+	// longer reach that clear.
+	//
+	// They do not need it WHILE they are below the floor, because elimination
+	// lives inside onRamWrite() and they never get there. The bit only matters
+	// again when the floor DROPS and those addresses become deliverable, so the
+	// obligation is discharged exactly here, once per mode change, over the
+	// range that changed hands in either direction. A $D077 write is not a hot
+	// path: this is at most 1024 stores, against the ~1.19M sink calls per
+	// benchmark run the floor removes.
+	u32 upTo = previous > floor ? previous : floor;
+	if ( upTo > 0x10000u ) upTo = 0x10000u;
+	for ( u32 w = 0; w < ( upTo + 63u ) / 64u; w++ )
+		m_Synced[ w ] = 0;
+	m_NoProgressValid = false;
 }
 
 bool CWriteBuffer::shouldMirror( u16 addr ) const
@@ -657,7 +717,7 @@ u32 CWriteBuffer::flushUpToPolicy( u32 maxBytes, bool deferHot,
 	while ( m_Count > 0 && sent < maxBytes )
 	{
 		const u32 n = flushSelectedChunk( maxBytes - sent, deferHot,
-		                                  screenBase, 1000, false,
+		                                  screenBase, SCPU_VIC_MATRIX_BYTES, false,
 		                                  bitmapBase, 8000 );
 		if ( n == 0 )
 		{

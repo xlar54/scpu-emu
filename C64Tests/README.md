@@ -17,7 +17,7 @@ The build uses only the bundled `petcat.exe`, `64tass.exe`, and `c1541.exe`.
 BASIC sources live under `C64Tests/basic`, 65816 assembly sources live under
 `C64Tests/asm`, and generated programs are placed in `C64Tests/prg`. Temporary
 assembler listings and labels go under `C64Tests/obj`. The script creates the
-ready-to-mount `C64Tests/diskimages/SCPU-TESTS.d81` disk image. Load and run
+ready-to-mount `C64Tests/diskimages/scpu-tests.d81` disk image. Load and run
 each program normally:
 
 ```basic
@@ -52,6 +52,7 @@ tests will report that no accelerator was detected.
 | `16-nmitiming` | ML | CIA2 Timer-A one-shot timing, native-window delivery and 1024-edge stress | repeatable sweep signatures, zero misses, and native/deferred totals adding to `$40` |
 | `17-supermon816` | ML | native-mode 65816 machine-language monitor adapted for the C64/SuperCPU | `Supermon 816 1.1.10` prompt; visible input cursor; `X` returns to BASIC |
 | `18-ramspeed` | ML | identical two-million-pair loops in private SRAM and SuperRAM | memory check passes; raw jiffy counts provide an old/new firmware comparison |
+| `30-vicvsp` | ML | Mario-style double-IRQ VSP timing, SuperCPU 1 MHz transition, `$D011` RMW placement, and collision-based idle-address detection | mode 2 exposes the visual displacement; mode 4 reports a recognised idle address; modes 5-8 scope four adjacent IRQ sub-windows |
 
 `01-speed` reports raw jiffies, the Normal/Turbo ratio, and an effective MHz
 estimate obtained by treating the forced-Normal run as the 1.0 MHz reference.
@@ -168,6 +169,37 @@ Run it on the old and new firmware with the same physical switch position and
 video standard; compare the hexadecimal `BANK $02 SUPERRAM` jiffy counts.
 Lower is faster. The bank `$01` figure is the control and should remain close
 between firmware builds.
+
+`30-vicvsp` isolates the timing technique used by VSP games from their game
+logic. Mode 1 executes the same `DEC`/`INC` pair against harmless RAM and must
+leave the lettered rows ordered. Mode 2 selects 1 MHz with `$D07A`, uses a
+double raster interrupt, and reaches `DEC $D011`/`INC $D011` after the same 104
+C64 cycles as the measured Mario handler. Mode 3 substitutes the decoded/no-
+effect `$D071` register for the speed strobes, providing a Turbo negative
+control. The visible pattern is a corruption/stability canary, not a claimed
+whole-screen VSP displacement: the definitive output is the timing trace.
+Space cold-starts BASIC. The test toggles CIA2 PB0 (user-port pin C) high from
+cycle 6 through cycle 104 of the second IRQ, producing a 98-C64-cycle scope
+pulse whose falling edge immediately precedes the `$D011` trigger. Disconnect
+user-port hardware before running it. A `VSPT` diagnostic block at `$02D0`
+exposes the selected mode, frame count, post-trigger raster, expected cycle and
+pulse counts, and the post-trigger `$D0B8` speed status. Mode 4 replaces the
+visual matrix with the collision detector from VICE's `vsp-tester`. It prints
+the VIC-II idle address observed during VSP and reports `PASS` for the known
+`$3FFF`, `$38FF`, `$3807`, `$38C7`, and `$38D7` results. Signature bytes
+`$02DE/$02DF` contain that address and `$02E0` is `1` for a recognised result
+or `$FF` for an unexpected result. The same PRG selects the official NMOS sync
+sequence on a stock 6510 and a legal equivalent on a SuperCPU/65816.
+
+Modes 5-8 localise intermittent host-side delay inside the same 104-cycle
+mode-2 handler. They measure four adjacent PB0 pulse windows: IRQ entry through
+the delay loop (44 cycles), raster comparison and jitter absorber (30 cycles),
+the final NOP sled (18 cycles), and the final marker/trigger handoff (6 cycles).
+All four modes execute five identical CIA2 marker stores; only which adjacent
+pair changes PB0 differs, so the instrumentation load is constant. Run each
+mode for several seconds and note which nominal pulse acquires an extra
+approximately 10 microseconds. The mode whose width varies contains the
+remaining contention source.
 
 The assembler's `.AS`/`.AL` directives control how immediate operands are
 encoded; they do not alter the CPU's saved M flag. Code entered with `.AS`

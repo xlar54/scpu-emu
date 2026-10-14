@@ -583,6 +583,124 @@ static bool busDiagEndLine( char *dst, u32 capacity, u32 &length )
 // the normal read primitive itself the same direct p1/p2/p3 sequence.
 static bool sidReadAtFallingEdge = false;
 
+RADBusAccessStats radBusStages;
+RADBusAccessStats radBusStagesIO;
+// stageSynced of the most recent radDirectRead: PMCCNTR just after its
+// BUS_RESYNC, i.e. the falling edge that began the cycle the read occupied,
+// to within one GPLEV0 poll. CRADBus::lastReadCycleStartHostCycles() hands it
+// to the memory layer's raster-window catch-up as the anchor read's start.
+static u64 radLastReadSyncedHost = 0;
+// K504: the memory layer's "this write is placed inside the raster window"
+// flag (IC64Bus::setWriteTurnaroundMinimal), and what the most recent write
+// actually did with it, for the stage threshold below.
+static bool radWriteTurnaroundMinimal = false;
+static bool radLastWriteMinimal = false;
+// Default TRUE: a card booted without DIAG_MINIMAL in its config measures
+// essentially what K478 measured, so no archived number silently changes
+// meaning. See the note in rad_bus.h.
+bool radBusStageTimingEnabled = true;
+u32 radBusStampCost = 0;
+
+void radCalibrateStampCost()
+{
+	u32 best = 0xFFFFFFFFu;
+	for ( u32 i = 0; i < 64; i++ )
+	{
+		u64 a, b;
+		READ_CYCLE_COUNTER( a );
+		READ_CYCLE_COUNTER( b );
+		const u32 d = (u32)( b - a );
+		if ( d < best ) best = d;
+	}
+	radBusStampCost = best;
+}
+
+static inline void radStage( RADBusStageStats &s, u64 from, u64 to )
+{
+	const u32 d = (u32)( to - from );
+	if ( s.count == 0 || d < s.min ) s.min = d;
+	if ( d > s.max ) s.max = d;
+	s.count++;
+	s.sum += d;
+}
+
+// One VIC half-cycle is 684 ARM on NTSC at arm_freq=1400, and the K448 trace
+// reports 1368 as its own grid denominator. A p1+p2 segment occupies exactly
+// that half, so anything past this threshold is the BA spin having waited out
+// an extra VIC fetch phase rather than the segment being slow.
+#define RAD_STAGE_PHASE_LONG_ARM 1000u
+
+// One PHI period per CONFIGURED pass, because that is what the K243
+// protection costs: the loop in busWriteByte_p1 runs WAIT_FOR_CPU_HALFCYCLE
+// + WAIT_FOR_VIC_HALFCYCLE per pass, falling edge to falling edge, so each
+// pass is one whole C64 cycle. (The FIRST pass is paid inside radDirectWrite's
+// resync since the K50x placement fix, so p1 loops passes-1 times; the
+// writeTurnBAStalls threshold below is scaled by that.) Measured on this card
+// (passes=1), before that move: the
+// unstalled floors are 639 ARM plain and 2001 ARM turnaround, a difference
+// of 1362 against a 1368.889 NTSC period. Scaled by the variable and not
+// hardcoded to one period because acquire() configures a C128 for TWO
+// (rad_bus.cpp: machine == MACHINE_C128 ? 2 : 1); a fixed one-period offset
+// would put the threshold below the C128 floor of ~3480 ARM and count every
+// C128 turnaround write as a stall. 1420 is the PAL period at arm_freq=1400
+// against NTSC's 1368.9, so using the larger keeps the threshold clear of
+// the protection on both standards: it can never read the pass as a stall.
+#define RAD_STAGE_TURN_PERIOD_ARM 1420u
+
+static inline void radAccumRead( RADBusAccessStats &s, u64 entry, u64 synced,
+                                 u64 rising, u64 done )
+{
+	// One load and a branch in place of three bucket updates; see
+	// radBusStageTimingEnabled in rad_bus.h for the measurement and for why the
+	// BA-stall test below stays outside the gate.
+	if ( radBusStageTimingEnabled )
+	{
+		radStage( s.readResync, entry, synced );
+		radStage( s.readVIC, synced, rising );
+		radStage( s.readCPU, rising, done );
+	}
+	if ( (u32)( rising - synced ) > RAD_STAGE_PHASE_LONG_ARM )
+		s.readBAStalls++;
+}
+
+static inline void radAccumWrite( RADBusAccessStats &s, bool turnaround,
+                                  u64 entry, u64 synced, u64 driven, u64 done )
+{
+	// Gated for the same measured reason as the read side; the turnaround split
+	// below is untouched and still measures both buckets.
+	if ( radBusStageTimingEnabled )
+	{
+		radStage( s.writeResync, entry, synced );
+		radStage( turnaround ? s.writeP1Turn : s.writeP1Plain, synced, driven );
+		radStage( s.writeP2, driven, done );
+	}
+	// The K243 pass legitimately spends a whole C64 cycle idling, so the two
+	// buckets need thresholds one configured pass apart. Suppressing the
+	// turnaround bucket -- what stood here -- left 41% of writes (142854 of
+	// 351439) with no stall accounting, and 1535 ARM/write of uncounted
+	// badline time then read as protection cost: wp1turn - wp1plain came out
+	// 2897 ARM where the pass is 1362 (min 2001 - min 639, against a 1368.889
+	// period). Measuring both is cheaper than re-deriving which half of a
+	// mean is which. Runs after stageDone and c128TrafficEnd(), so the extra
+	// load of busWriteTurnaroundPasses is outside every timed window.
+	if ( turnaround )
+	{
+		// passes - 1: radDirectWrite pays the first pass inside its resync, so
+		// p1's turnaround bucket holds only a C128's second pass; on a C64 it is
+		// the plain floor plus the direction turn and the threshold is the plain
+		// one. Without this a turnaround write stalled by under a cycle would
+		// read as the (no longer present) pass and never be counted.
+		const u32 extraPasses = ( radLastWriteMinimal && busWriteTurnaroundPasses )
+		                      ? busWriteTurnaroundPasses - 1u : busWriteTurnaroundPasses;
+		const u32 turnLong = RAD_STAGE_PHASE_LONG_ARM
+		                   + RAD_STAGE_TURN_PERIOD_ARM * extraPasses;
+		if ( (u32)( driven - synced ) > turnLong )
+			s.writeTurnBAStalls++;
+	}
+	else if ( (u32)( driven - synced ) > RAD_STAGE_PHASE_LONG_ARM )
+		s.writeBAStalls++;
+}
+
 __attribute__((noinline)) u8 radDirectRead( u16 addr, bool forceRAM )
 {
 	register u32 g2;
@@ -592,10 +710,24 @@ __attribute__((noinline)) u8 radDirectRead( u16 addr, bool forceRAM )
 	// K202's hardware-validated blocking path. A transaction claims the open
 	// C128 traffic epoch before it aligns to the physical bus; C64-class hosts
 	// return immediately because the refresh interlock is disabled.
+	// $D000-$DFFF regardless of the runtime /GAME selector: this is the
+	// traffic the VSP artifact is made of, and it must not be averaged in with
+	// the RAM and ROM accesses that outnumber it.
+	const bool ioWindow = ( addr & 0xF000 ) == 0xD000;
 	c128TrafficBegin();
+	// Stamp after the C128 epoch claim, never before: on a C128 that block is
+	// refresh-interlock time and has nothing to do with PHI phase.
+	u64 stageEntry, stageSynced, stageRising, stageDone;
+	READ_CYCLE_COUNTER( stageEntry );
 	BUS_RESYNC
+	// Safe to stamp here: p1's first deadline is WAIT_ENABLE_ADDRLATCH = 535
+	// ARM from this anchor and its first BA test is WAIT_BA_SIGNAL_AVAIL = 311
+	// (Config/default.cfg:350-351), both hundreds of cycles away, so one MRS
+	// consumes margin inside those windows and cannot move either deadline.
+	READ_CYCLE_COUNTER( stageSynced );
 	busReadByte_p1( g2, addr );
 	busReadByte_p2( g2, selectIO );
+	READ_CYCLE_COUNTER( stageRising );
 	const u32 sampleAt = ( ( addr & 0xFC00 ) == 0xD400 )
 	                   ? (u32)busTiming.WAIT_CYCLE_READ_SID
 	                   : (u32)busTiming.WAIT_CYCLE_READ;
@@ -603,7 +735,23 @@ __attribute__((noinline)) u8 radDirectRead( u16 addr, bool forceRAM )
 		busReadByte_p3FallingEdge( g2, v, false, selectIO );
 	else
 		busReadByte_p3( g2, v, false, sampleAt, selectIO );
+	READ_CYCLE_COUNTER( stageDone );
 	c128TrafficEnd();
+	// The falling edge that began this read's cycle, for the memory layer's
+	// raster-window catch-up (lastReadCycleStartHostCycles). One store, after
+	// c128TrafficEnd and outside every timed window: the stamp itself was
+	// already taken at stageSynced.
+	radLastReadSyncedHost = stageSynced;
+	// Accounting only past this point. The sampleAt computation above stays
+	// where it is, inside the readCPU span, rather than being hoisted out of
+	// the window: moving work across these primitives is exactly what the C128
+	// positional diagnostics caught changing results from an identical source
+	// sequence (rad_lowlevel.h:35-37), and measuring must not be what does it.
+	radAccumRead( radBusStages, stageEntry, stageSynced, stageRising,
+	              stageDone );
+	if ( ioWindow )
+		radAccumRead( radBusStagesIO, stageEntry, stageSynced, stageRising,
+	              stageDone );
 	return v;
 }
 
@@ -618,11 +766,67 @@ __attribute__((noinline)) void radDirectWrite( u16 addr, u8 value,
 	register u32 g2;
 	const bool selectIO = radSelectIOWithGame && !forceRAM
 	                   && addr >= 0xD000 && addr <= 0xDFFF;
+	// Read the pending-direction flag BEFORE the window. It cannot change under
+	// us on core 0, and both the pass below and p1's stage bucket are keyed on
+	// it. acquire() sets busWriteTurnaroundPasses to 1 for a C64 (rad_bus.cpp,
+	// "6/6 C64" branch) and 2 for a C128.
+	const bool payingTurnaround = busWriteTurnaroundNeeded != 0;
+	const bool ioWindow = ( addr & 0xF000 ) == 0xD000;
 	c128TrafficBegin();
+	u64 stageEntry, stageSynced, stageDriven, stageDone;
+	READ_CYCLE_COUNTER( stageEntry );
+	// THE FIRST K243 PASS IS PAID INSIDE THIS RESYNC, not after it. The flag is
+	// raised only by a read's p3, which releases the bus AT a PHI2 falling edge
+	// (RESTART_CYCLE_COUNTER then DISABLE_...); from anywhere after that,
+	// BUS_RESYNC's wait to the NEXT falling edge completes one whole idle period
+	// in which nothing is driven, and p1 then leaves the address latch off until
+	// TIMING_ENABLE_RWOUT_ADDR_LATCH_WRITING-40 ARM into the cycle it drives.
+	// That is exactly what one configured pass is: turn the transceiver first,
+	// as the pass itself did, and tell p1 it has been paid. A C128 still pays
+	// its second pass in p1. What this removes is the SECOND whole idle cycle
+	// the old order (resync, THEN pass) spent after an RMW's own read: a 6510's
+	// DEC $D011 writes two cycles after it reads, the single cycle between is
+	// its dummy write, and that cycle is where this pass now goes -- the drive
+	// lands where the 6510's does instead of one cycle later (two with the
+	// catch-up, see CC64Memory::noteVSPRasterAnchor). The protection itself is
+	// unchanged in kind and count: resync plus one complete idle period with the
+	// direction already turned, before the first drive after a read.
+	// K504: the pass is paid inside the resync ONLY for a write the memory
+	// layer placed inside the raster window; every other turnaround write keeps
+	// K243's validated order, resync then the pass in p1 (two idle periods).
+	const bool minimalTurn = payingTurnaround && radWriteTurnaroundMinimal;
+	radLastWriteMinimal = minimalTurn;
+	if ( minimalTurn )
+	{
+		CLR_GPIO( bDIR_Dx );
+		SET_BANK2_OUTPUT
+	}
 	BUS_RESYNC
-	busWriteByte_p1( g2, addr, value, selectIO );
+	READ_CYCLE_COUNTER( stageSynced );
+	busWriteByte_p1( g2, addr, value, selectIO, minimalTurn ? 1u : 0u );
+	// Checked rather than assumed, because this is the one stamp that lands
+	// between a pin change and an edge poll: p1's last act enables the data
+	// drive at WAIT_ENABLE_DATA_WRITING = 625 ARM from the falling-edge anchor
+	// (Config/default.cfg:365), and p2 then polls for the NEXT falling edge
+	// 743 ARM later. One MRS cannot shift the edge p2 detects, so neither the
+	// /GAME release nor the WAIT_DATA_HOLD = 20 window anchored on that edge
+	// moves. If WAIT_ENABLE_DATA_WRITING is ever retuned past ~1340 this
+	// stamp has to move out to the far side of p2.
+	READ_CYCLE_COUNTER( stageDriven );
 	busWriteByte_p2( g2, false, selectIO );
+	READ_CYCLE_COUNTER( stageDone );
 	c128TrafficEnd();
+	// writeResync on RMW traffic reads close to a full 1368.9 ARM: busReadByte_p3
+	// ends with RESTART_CYCLE_COUNTER after WAIT_FOR_VIC_HALFCYCLE, leaving the
+	// counter anchored AT a falling edge, and this resync spins to the NEXT one.
+	// That whole cycle IS the K243 pass now (see above), so on a C64 the p1
+	// turnaround bucket no longer contains an idle period and wp1turn - wp1plain
+	// measures the direction turn alone; on a C128 it still holds the second pass.
+	radAccumWrite( radBusStages, payingTurnaround, stageEntry, stageSynced,
+	               stageDriven, stageDone );
+	if ( ioWindow )
+		radAccumWrite( radBusStagesIO, payingTurnaround, stageEntry,
+	               stageSynced, stageDriven, stageDone );
 }
 
 static inline void busDiagRawWrite( u16 addr, u8 value )
@@ -8479,9 +8683,109 @@ bool CRADBus::writeTurnaroundPending()
 {
 	// The flag is file-scope state in lowlevel_dma.h, maintained by the same
 	// primitives this translation unit instantiates; exposing it here keeps
-	// the memory layer able to aim turnaround-compensated placement without
-	// reaching into the low-level header.
+	// the memory layer and the diagnostics able to see the bus direction
+	// without reaching into the low-level header. Placement no longer aims on
+	// it (the pass is paid inside the write's resync, see radDirectWrite).
 	return busWriteTurnaroundNeeded != 0;
+}
+
+u64 CRADBus::lastReadCycleStartHostCycles()
+{
+	// Published by radDirectRead after its timed window; see there. 0 until
+	// the first physical read, which the catch-up treats as "no stamp".
+	return radLastReadSyncedHost;
+}
+
+void CRADBus::setWriteTurnaroundMinimal( bool on )
+{
+	// One store; read by radDirectWrite before its timed window. See the
+	// declaration in c64_bus.h for when the memory layer raises it.
+	radWriteTurnaroundMinimal = on;
+}
+
+// Hard ceiling on one emulated BA stall, in C64 cycles, independent of the
+// configured bound. A badline holds the CPU from cycle 12 to 54 (43 cycles)
+// and sprite DMA can extend that across a line boundary, so one NTSC line of
+// 65 plus margin covers every legitimate steal; anything longer is a fault.
+// The configured BA_STALL_MAX range is 8..80 for this reason -- see
+// CSuperCPU::setBAStall -- so no configurable value is silently unreachable.
+#define RAD_BA_STALL_CEILING 80
+
+// Consecutive ceiling hits that latch the sampler off. One is possible at a
+// genuine edge case; sixteen in a row is a BA that stopped returning.
+#define RAD_BA_STALL_CAP_RUN_LIMIT 16
+
+u32 CRADBus::busStealCycles( u32 maxCycles )
+{
+	// Observational, exactly like phiCpuHalfStartHostCycles(): GPLEV0 reads
+	// only, nothing driven, no C128 refresh epoch claimed -- c128_refresh.h
+	// explicitly blesses callers that align to PHI and inspect BA without
+	// owning the refresh interlock, which is this function's whole contract.
+	// HANDLE_BUS_AVAILABLE and HANDLE_BUS_AVAILABLE_READ are deliberately NOT
+	// reused -- the burst paths, cpu_hijack and the C128 refresh core all
+	// share those macros, and this asks a different question: not "may I drive
+	// the bus yet" but "how long is the CPU frozen".
+	if ( m_TrafficHalted || m_BAStallFaulted || !maxCycles ) return 0;
+
+	// THE FAST PATH IS ONE LEVEL READ, phase-blind on purpose. BA is a level,
+	// not a clock: the VIC holds it low for the whole steal (cycles 12..54 on
+	// a badline, three cycles ahead of each sprite's s-accesses), so a sample
+	// taken anywhere inside that window reads low and one outside reads high.
+	// The only error a blind sample can make is a single cycle at an edge, and
+	// the caller's resume point is pinned by the RELEASE below rather than by
+	// when it noticed. Waiting for a half-cycle edge here instead would cost
+	// up to half a microsecond on every emulated instruction at 1MHz and would
+	// quantise instruction boundaries to PHI -- the placement the pacer's own
+	// phase lock exists to control.
+	//
+	// Plain u32, not `register`: the keyword is deprecated in C++14 and REMOVED
+	// in C++17, and phiCpuHalfStartHostCycles() below already drives the same
+	// GPLEV0/PHI macros with a plain local.
+	u32 g2 = read32( ARM_GPIO_GPLEV0 );
+	if ( !VIC_BA ) return 0;
+
+	// Count whole C64 cycles the way radHijackCPU()'s handover spin does
+	// (cpu_hijack.cpp: WAIT_FOR_VIC_HALFCYCLE_EDGE / RESTART_CYCLE_COUNTER /
+	// WAIT_UP_TO_CYCLE( TIMING_BA_SIGNAL_AVAIL ) / sample bBA), falling edge to
+	// falling edge. Each pass IS one C64 cycle by construction, so this returns
+	// a cycle count and not a duration that has to be divided by a nominal
+	// period. RESTART_CYCLE_COUNTER only READS PMCCNTR into the file-static
+	// armCycleCounter, so it cannot disturb the pacer's own clock. The PHI waits
+	// inside the edge macro are bounded by RAD_PHI_WAIT_LIMIT, so a stopped
+	// clock exits instead of hanging; worst case with BA stuck low is ~10ms per
+	// instruction for sixteen instructions before the latch below disarms us.
+	//
+	// THE COUNT IS RIGHT BECAUSE OF THE INCREMENT ORDER, not in spite of it.
+	// We entered partway through a cycle in which BA was already low, and that
+	// cycle is stolen. Pass k samples cycle (entry + k); the first pass that
+	// reads BA high means cycles entry .. entry+k-1 were stolen, which is k.
+	if ( maxCycles > RAD_BA_STALL_CEILING ) maxCycles = RAD_BA_STALL_CEILING;
+	u32 stolen = 0;
+	bool released = false;
+	while ( stolen < maxCycles )
+	{
+		WAIT_FOR_VIC_HALFCYCLE_EDGE
+		RESTART_CYCLE_COUNTER
+		WAIT_UP_TO_CYCLE( busTiming.TIMING_BA_SIGNAL_AVAIL );
+		g2 = read32( ARM_GPIO_GPLEV0 );
+		stolen++;
+		if ( !VIC_BA ) { released = true; break; }
+	}
+
+	m_BAStallCycles += stolen;
+	m_BAStallEvents++;
+	// `released`, not `stolen >= maxCycles`: a steal that ends exactly ON the
+	// ceiling is a real release, and counting it as a cap would both inflate
+	// capped= and feed the fault latch with healthy samples.
+	if ( !released )
+	{
+		m_BAStallCaps++;
+		if ( ++m_BAStallCapRun >= RAD_BA_STALL_CAP_RUN_LIMIT )
+			m_BAStallFaulted = true;
+	}
+	else
+		m_BAStallCapRun = 0;
+	return stolen;
 }
 
 u16 CRADBus::rasterLine()

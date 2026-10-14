@@ -136,7 +136,7 @@ Source/kernel8.img
 
 # Ours, not commercial -- the test disk built from C64Tests/asm by build.bat.
 # Tracked so a fresh clone can run the suite without assembling it first.
-!/C64Tests/diskimages/SCPU-TESTS.d81
+!/C64Tests/diskimages/scpu-tests.d81
 
 # Profiling dumps. Regenerate them rather than tracking them; the histogram
 # that justified the bank-0 inlining is preserved in commit 15cd5b7.

@@ -232,6 +232,66 @@ bool CHostBus::irqAsserted()
 	return m_IRQ;
 }
 
+// THE BADLINE RULE, written down once, in the stand-in that has no BA pin.
+// The firmware never runs this: CRADBus::busStealCycles reads the real VIC's
+// BA instead, because a model that disagrees with the VIC is worse than no
+// model. This exists so the rule can be TESTED against the published rule, and
+// so the stall can be exercised without a cartridge.
+//
+// SOURCE: Christian Bauer, "The MOS 6567/6569 video controller (VIC-II) and
+// its application in the Commodore 64", section 3.5 -- a Bad Line Condition
+// holds when RASTER >= $30 and RASTER <= $F7, (RASTER & 7) == YSCROLL
+// ($D011 bits 0-2), and DEN ($D011 bit 4) was set at some point in raster line
+// $30. Sections 3.6.3 and 3.14.6 give the placement: the VIC performs 40
+// c-accesses in cycles 15-54 and pulls BA low three cycles ahead of the first
+// one, so the CPU is held from cycle 12 through 54 and resumes at 55 -- about
+// 43 cycles. A VSP-created badline (the guest writing $D011 mid-line so the
+// condition becomes true late) starts the steal at that write, which is why
+// Mario's INC resumes at 54 and completes at 59.
+//
+// THREE deliberate simplifications, all only reachable here, and the first two
+// are what make this a BOUND rather than an identity -- in OPPOSITE directions,
+// which is exactly why the firmware reads the pin instead of this.
+//   AEC   Bauer 3.6.3: AEC stays high for three cycles after BA falls, so a
+//         real 6510 can still finish up to three WRITE cycles in 12..14. This
+//         model freezes it at 12, OVER-stating a steal entered in those three
+//         cycles by up to three cycles. A stall that is too long is as bad as
+//         none, so this is named rather than left implicit.
+//   SPRITES  not modelled at all, which UNDER-states any line carrying sprite
+//         DMA. This is the larger error and the one the sibling project's
+//         negative result cares about (stall more, never less).
+//   DEN   read live rather than latched at line $30, because this stand-in
+//         keeps no per-frame VIC state; it matters only to a program that
+//         toggles DEN mid-frame.
+u32 CHostBus::busStealCycles( u32 maxCycles )
+{
+	// Without an emulated-cycle source the raster counter advances on bus
+	// accesses, which cannot place a cycle inside a line; refuse rather than
+	// invent a steal.
+	if ( !m_CycleSource || !maxCycles ) return 0;
+
+	const u32 perLine = c64CyclesPerLine( m_Signals.video );
+	const u32 lines   = c64RasterLines( m_Signals.video );
+	if ( !perLine || !lines ) return 0;
+	const u64 now  = m_CycleSource( m_CycleContext );
+	const u32 line = (u32)( ( now / perLine ) % lines );
+	// Bauer numbers the cycles of a line from 1, and the VSP trace's
+	// cycle-in-line figures are quoted in that same frame, so keep it here
+	// instead of converting at every comparison.
+	const u32 cycle = (u32)( now % perLine ) + 1;
+
+	const u8 d011 = m_Memory[ 0xD011 ];
+	if ( line < 0x30 || line > 0xF7 ) return 0;
+	if ( !( d011 & 0x10 ) ) return 0;
+	if ( ( line & 7 ) != (u32)( d011 & 7 ) ) return 0;
+	if ( cycle < HOSTBUS_BADLINE_BA_LOW || cycle > HOSTBUS_BADLINE_BA_LAST )
+		return 0;
+
+	u32 stolen = HOSTBUS_BADLINE_BA_LAST + 1 - cycle;
+	if ( stolen > maxCycles ) stolen = maxCycles;
+	return stolen;
+}
+
 u16 CHostBus::rasterLine()
 {
 	m_Cycles++;

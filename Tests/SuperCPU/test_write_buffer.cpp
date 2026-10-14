@@ -668,7 +668,7 @@ TEST( writebuf_visible_drain_skips_screen_and_keeps_making_progress )
 	// The whole active matrix can remain dirty in a scroller. A matrix byte at
 	// the FIFO head must not prevent later character/sprite/general RAM traffic
 	// from using the display-time ration.
-	for ( u32 i = 0; i < 1000; i++ )
+	for ( u32 i = 0; i < SCPU_VIC_MATRIX_BYTES; i++ )
 		f.poke( (u16)( 0x7400 + i ), (u8)( i ^ 0x5A ) );
 	f.poke( 0x2000, 0x11 );
 	f.poke( 0x2001, 0x22 );
@@ -677,8 +677,10 @@ TEST( writebuf_visible_drain_skips_screen_and_keeps_making_progress )
 	CHECK_EQ( f.bus.m_Memory[ 0x2000 ], 0x11 );
 	CHECK_EQ( f.bus.m_Memory[ 0x2001 ], 0x22 );
 	CHECK( f.bus.m_Memory[ 0x7400 ] != (u8)( 0 ^ 0x5A ) );
-	CHECK_EQ( f.wb.pending(), 1000u );
-	CHECK( f.wb.hasPendingInRange( 0x7400, 1000 ) );
+	// The normally unused tail must remain deferred too: VSP can fetch it.
+	CHECK( f.bus.m_Memory[ 0x77FF ] != (u8)( 1023 ^ 0x5A ) );
+	CHECK_EQ( f.wb.pending(), SCPU_VIC_MATRIX_BYTES );
+	CHECK( f.wb.hasPendingInRange( 0x7400, SCPU_VIC_MATRIX_BYTES ) );
 }
 
 TEST( writebuf_repeated_zero_progress_display_scan_is_cached )
@@ -688,17 +690,17 @@ TEST( writebuf_repeated_zero_progress_display_scan_is_cached )
 
 	// With only the active matrix pending, a visible drain has no eligible
 	// byte. The first call must prove that once; later scheduler opportunities
-	// must not stream the same 1000-entry queue through cache again.
-	for ( u32 i = 0; i < 1000; i++ )
+	// must not stream the same 1024-entry queue through cache again.
+	for ( u32 i = 0; i < SCPU_VIC_MATRIX_BYTES; i++ )
 		f.poke( (u16)( 0x7400 + i ), (u8)( i ^ 0x5A ) );
 	f.wb.flushUpToPolicy( 64, false, 0x7400 );
-	CHECK_EQ( f.wb.pending(), 1000u );
-	CHECK_EQ( f.wb.m_PolicyEntriesExamined, 1000u );
+	CHECK_EQ( f.wb.pending(), SCPU_VIC_MATRIX_BYTES );
+	CHECK_EQ( f.wb.m_PolicyEntriesExamined, SCPU_VIC_MATRIX_BYTES );
 	CHECK_EQ( f.wb.m_PolicyZeroProgressScans, 1u );
 
 	for ( u32 i = 0; i < 32; i++ )
 		f.wb.flushUpToPolicy( 64, false, 0x7400 );
-	CHECK_EQ( f.wb.m_PolicyEntriesExamined, 1000u );
+	CHECK_EQ( f.wb.m_PolicyEntriesExamined, SCPU_VIC_MATRIX_BYTES );
 	CHECK_EQ( f.wb.m_PolicyZeroProgressScans, 1u );
 	CHECK_EQ( f.wb.m_PolicyNoProgressCacheHits, 32u );
 
@@ -706,12 +708,12 @@ TEST( writebuf_repeated_zero_progress_display_scan_is_cached )
 	f.poke( 0x2000, 0xA5 );
 	f.wb.flushUpToPolicy( 64, false, 0x7400 );
 	CHECK_EQ( f.bus.m_Memory[ 0x2000 ], 0xA5 );
-	CHECK_EQ( f.wb.pending(), 1000u );
-	CHECK( f.wb.m_PolicyEntriesExamined > 1000u );
+	CHECK_EQ( f.wb.pending(), SCPU_VIC_MATRIX_BYTES );
+	CHECK( f.wb.m_PolicyEntriesExamined > SCPU_VIC_MATRIX_BYTES );
 
 	// So does a display-map change: the old matrix is now ordinary traffic.
 	f.wb.flushUpToPolicy( 64, false, 0x8000 );
-	CHECK_EQ( f.wb.pending(), 936u );
+	CHECK_EQ( f.wb.pending(), SCPU_VIC_MATRIX_BYTES - 64u );
 }
 
 TEST( writebuf_zero_progress_cache_tracks_hot_sprite_generation )
@@ -776,7 +778,7 @@ TEST( writebuf_hidden_drain_prioritizes_screen_and_keeps_latest_values )
 		f.poke( (u16)( 0x7400 + i ), (u8)i );
 	f.poke( 0x7400, 0xA5 );
 
-	f.wb.flushRangeUpTo( 0x7400, 1000, 64 );
+	f.wb.flushRangeUpTo( 0x7400, SCPU_VIC_MATRIX_BYTES, 64 );
 	CHECK_EQ( f.bus.m_Memory[ 0x7400 ], 0xA5 );
 	for ( u32 i = 1; i < 64; i++ )
 		CHECK_EQ( f.bus.m_Memory[ 0x7400 + i ], (u8)i );
@@ -784,8 +786,8 @@ TEST( writebuf_hidden_drain_prioritizes_screen_and_keeps_latest_values )
 	CHECK_EQ( f.wb.pending(), 18u );
 
 	// Finish the matrix, then ordinary FIFO order resumes for the cold bytes.
-	f.wb.flushRangeUpTo( 0x7400, 1000, 64 );
-	CHECK( !f.wb.hasPendingInRange( 0x7400, 1000 ) );
+	f.wb.flushRangeUpTo( 0x7400, SCPU_VIC_MATRIX_BYTES, 64 );
+	CHECK( !f.wb.hasPendingInRange( 0x7400, SCPU_VIC_MATRIX_BYTES ) );
 	CHECK_EQ( f.wb.pending(), 2u );
 	f.wb.flush();
 	CHECK_EQ( f.bus.m_Memory[ 0x2000 ], 0x11 );
@@ -1137,4 +1139,87 @@ TEST( reloc_resync_and_sample_use_the_translated_physical_address )
 	for ( u32 i = 0; i < 0x10000 / 512; i++ )
 		f.wb.resyncSweep( 512 );
 	CHECK_EQ( f.bus.m_Memory[ 0xE005 ], f.mem.m_RAM[ 0xC005 ] );
+}
+
+// THE GUARD FOR THE MIRROR FLOOR. CC64Memory skips the sink entirely for any
+// address below IMirrorSink::m_MirrorFloor, so the floor must never exclude an
+// address shouldMirror() would have ACCEPTED -- that would silently stop
+// mirroring real display bytes. Checked exhaustively: every optimization mode,
+// both Z-flag states, all 65536 addresses.
+//
+// Deleting recomputeMirrorFloor()'s call from setOptMode makes this fail in the
+// thousands, which is what makes it a bisect and not decoration.
+TEST( mirror_floor_never_excludes_an_address_the_policy_would_accept )
+{
+	WBFixture f;
+	static const SCPUOptMode modes[] = {
+		SCPU_OPT_NONE, SCPU_OPT_DEFAULT, SCPU_OPT_BASIC,
+		SCPU_OPT_VICBANK0, SCPU_OPT_VICBANK1,
+		SCPU_OPT_VICBANK2, SCPU_OPT_VICBANK3, SCPU_OPT_FULL };
+
+	for ( u32 z = 0; z < 2; z++ )
+	for ( u32 m = 0; m < sizeof( modes ) / sizeof( modes[ 0 ] ); m++ )
+	{
+		f.wb.setOptMode( modes[ m ] );
+		f.wb.setExcludeZeroPageStack( z != 0 );
+		// Aggregated into one check per configuration on purpose: asserting
+		// 65536 times per mode would add ~370k checks to the suite total and
+		// drown the number the whole suite is tracked by.
+		u32 violations = 0;
+		for ( u32 a = 0; a < 0x10000; a++ )
+			if ( f.wb.shouldMirror( (u16)a ) && a < f.wb.m_MirrorFloor )
+				violations++;
+		CHECK_EQ( violations, 0u );
+	}
+}
+
+// And the floor must be TIGHT where it matters, or the measured 96% win is not
+// actually being taken. The shipped default is SCPU_OPT_DEFAULT with the Z flag
+// set, which is what puts the TI benchmark's zero page and stack traffic below
+// the floor.
+TEST( mirror_floor_is_0200_in_the_shipped_default_mode )
+{
+	WBFixture f;
+	f.wb.setOptMode( SCPU_OPT_DEFAULT );
+	f.wb.setExcludeZeroPageStack( true );
+	CHECK_EQ( f.wb.m_MirrorFloor, 0x0200u );
+
+	// SCPU_OPT_NONE means "no optimization": nothing may be skipped.
+	f.wb.setOptMode( SCPU_OPT_NONE );
+	CHECK_EQ( f.wb.m_MirrorFloor, 0x0000u );
+
+	// SCPU_OPT_FULL mirrors nothing, so every write skips the sink.
+	f.wb.setOptMode( SCPU_OPT_FULL );
+	CHECK_EQ( f.wb.m_MirrorFloor, 0x10000u );
+
+	f.wb.setOptMode( SCPU_OPT_VICBANK2 );
+	CHECK_EQ( f.wb.m_MirrorFloor, 0x8000u );
+}
+
+// Same-value elimination must survive the floor moving. onRamWrite() no longer
+// sees the writes the floor rejects, so it cannot disarm their m_Synced bits;
+// recomputeMirrorFloor() discharges that obligation at the mode change instead.
+// This is the 3D Pool failure, staged through the floor: deliver a byte while
+// the range is permissive, change the shadow while it is restrictive, then
+// rewrite the SAME value permissively and require it to reach real DRAM.
+TEST( mirror_floor_change_rearms_elimination_for_the_exposed_range )
+{
+	WBFixture f;
+	f.wb.setOptMode( SCPU_OPT_NONE );		// page 1 mirrored: deliver it
+	f.poke( 0x01C0, 0x5A );
+	f.wb.flush();
+	CHECK_EQ( f.bus.m_Memory[ 0x01C0 ], (u8)0x5A );
+
+	// Restrictive: the shadow moves, real DRAM does not. With the floor this
+	// write never reaches the sink at all.
+	f.wb.setOptMode( SCPU_OPT_DEFAULT );
+	f.wb.setExcludeZeroPageStack( true );
+	f.ram[ 0x01C0 ] = 0x11;
+
+	// Permissive again, rewriting the value real DRAM still holds. If the
+	// m_Synced bit survived, this is eliminated and DRAM keeps $5A forever.
+	f.wb.setOptMode( SCPU_OPT_NONE );
+	f.poke( 0x01C0, 0x11 );
+	f.wb.flush();
+	CHECK_EQ( f.bus.m_Memory[ 0x01C0 ], (u8)0x11 );
 }

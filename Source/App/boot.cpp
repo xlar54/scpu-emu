@@ -36,6 +36,7 @@
 #include "../Bus/RAD/bus_timing.h"
 #include "../Bus/RAD/rad_bus.h"
 #include "../Bus/RAD/c128_refresh.h"
+#include "../Bus/RAD/cpu_hijack.h"
 #include "../SuperCPU/supercpu.h"
 
 // Defined in main.cpp, which owns the FAT filesystem object.
@@ -57,6 +58,15 @@ public:
 // lowlevel_dma.h, which needs the whole GPIO header stack ahead of it.
 extern volatile u32 radBAWaitTimeouts;
 extern volatile u32 radPHIWaitTimeouts;
+
+// How many times those ceilings were NEWLY reached while the emulator was
+// running, and the first pair of values that did it. Latched here instead of
+// logged there: see the note in scpuCheckButton for why a console write cannot
+// happen inside the run loop. Printed on the guest-stopped diagnostic line,
+// beside the stop it would otherwise have caused.
+static u32 s_BusWaitTimeoutReports = 0;
+static u32 s_BusWaitTimeoutFirstBA = 0;
+static u32 s_BusWaitTimeoutFirstPHI = 0;
 
 // Heartbeat: proves the frame loop is still running, and reports what the
 // emulated machine is doing while it does so.
@@ -94,6 +104,14 @@ static void radBusHaltAndProbe( u32 &eligiblePhases, u32 &addrChanges,
 // a CIA timing row can be about 240 characters, substantially more than the
 // old 128-byte scratch buffer allowed.
 static const u32 SCPU_DUMP_LINE_SIZE = 256;
+// Spelled with the drive, like SCPU_BUS_DIAG_FILE. writeFile() passes DRIVE
+// only to f_mount and this string verbatim to f_open, so unprefixed it reaches
+// the card only because FatFs here has SD as volume 0 with FF_FS_RPATH 0 --
+// a coincidence of the configuration, and this file is the only record a VSP
+// run leaves behind.
+static const char *SCPU_VSP_TRACE_FILE = "SD:SCPU/vsptrace-e18.txt";
+static C64VideoStandard s_DetectedVideo = VIDEO_PAL;
+static bool s_DetectedVideoValid = false;
 
 static void scpuLineStart( char *dst, u32 capacity, u32 &length )
 {
@@ -212,6 +230,77 @@ struct SCPUResetDiagnostic
 	u32 nmisTaken;
 	bool liveIRQ;
 	bool liveNMI;
+	// Interrupt-entry ring copied out of the core, plus the guest's live
+	// interrupt vectors.  Mario bypasses the KERNAL ($0314 = $0000) and
+	// re-points $FFFE between $0813, $0846 and $0898, so which one is loaded at
+	// death says which rung the chain stopped on without any per-write
+	// instrumentation.  These are RAM reads, not bus reads: the value is the
+	// byte UNDER the KERNAL, which is the one the 6510 fetches only while $01
+	// has the KERNAL banked out -- true for Mario, not in general, so do not
+	// read this field as "the vector" on another title.
+	CW65C816::W65InterruptEntry intRing[ CW65C816::W65_INT_RING ];
+	u32 intRingHead;
+	u32 intRingFrozen;
+	u32 intRingFrozenCycles;
+	u32 stackAnomalies;
+	// The progress detector's SUSPECT copy, taken ~0.35s into the stall, plus
+	// its counters.  Two rings and not one because the transition into a hang
+	// and its steady state are different evidence and the live ring can only
+	// hold one of them: 64 entries is about five frames.
+	CW65C816::W65InterruptEntry intRingSuspect[ CW65C816::W65_INT_RING ];
+	u32 intRingSuspectHead;
+	u32 progEpochs;
+	u32 progStallEpochsMax;
+	u32 progSuspects;
+	u32 progConfirmed;
+	u32 progSuspectCycles;
+	u32 progConfirmCycles;
+	u32 progCellCount;
+	u16 progCells[ CW65C816::W65_PROG_CELL_REPORT ];
+	u16 progPC;
+	// Watched-RAM write forensics, newest last.
+	CC64Memory::WatchedWrite watchRing[ CC64Memory::SCPU_WATCH_RING ];
+	u32 watchPos;
+	u32 watchWrites;
+	u32 watchChanges;
+	u32 watchAddr[ 2 ];
+	// $9F88 read two ways.  m_RAM is the byte in DRAM; the memory map is what
+	// the guest's CMP at $A765 actually fetches.  If those two disagree the
+	// hang is case (c) -- written correctly, read from somewhere else -- and
+	// this pair proves it without any further instrumentation.
+	u8  phaseViaRAM;
+	u8  phaseViaMap;
+	u8  phaseShadow;	// $9F87, which $09B3 writes with the same Y
+	// What the guest last saw of the raster, and what it is waiting for.
+	u8  d012Reads[ CC64Memory::SCPU_D012_RING ];
+	u32 d012ReadCyc[ CC64Memory::SCPU_D012_RING ];
+	u32 d012ReadPos;
+	u32 d012ReadCount;
+	u16 rasterCompare;
+	// RST8 forensics. The whole second hang was one $D011 read merging a live
+	// raster bit into the control latch, so these say outright which arm of
+	// d011RasterHighBit() ran instead of leaving it to be inferred.
+	u32 rst8Samples;
+	u32 rst8Rejected;
+	u8  rst8LastLow;
+	u8  rst8LastRejLow;
+	u32 rst8Writes;
+	u32 compareImpossible;
+	u32 anchorRefused;
+	// The interrupt-control write ring, live and latched. This is the one
+	// instrument that records what ARMED a compare rather than what the
+	// handler did afterwards; see VICIntCtlWrite in c64_memory.h.
+	VICIntCtlWrite ictl[ SCPU_ICTL_RING ];
+	VICIntCtlWrite ictlFrozen[ SCPU_ICTL_RING ];
+	u32 ictlHead;
+	u32 ictlFrozenHead;
+	u32 ictlFrozenReason;
+	u32 ictlFrozenCycles;
+	u32 d019Writes;
+	u32 d019AckHeld;
+	u32 d019AckHeldLate;
+	u8  vectors[ 6 ];	// $FFFA..$FFFF
+	u8  softVectors[ 2 ];	// $0314..$0315
 	// CIA2 timer-NMI model state at snapshot time.
 	u32 nmiSynth;
 	u8  nmiHoldActive;
@@ -256,6 +345,17 @@ struct SCPUResetDiagnostic
 	u64 scrubMismatchText;
 	u64 scrubMismatchBitmap;
 	u64 scrubRepaired;
+	VSPTimingEvent vsp[ SCPU_VSP_TRACE_SIZE ];
+	u32 vspCount;
+	u32 vspTotal;
+	u32 vspOverwritten;
+	u8 vspGamePhase;
+	u8 vspVideo;
+	u16 vspCyclesPerLine;
+	u16 vspRasterLines;
+	bool vspVideoValid;
+	bool vspValid;
+	SCPUVSPMatrixDiagnostic vspMatrix;
 	SCPURuntimeResult runtime;
 };
 
@@ -274,6 +374,14 @@ static void scpuSnapshotResetDiagnostic( CSuperCPU *scpu )
 	d.preResetDD00 = s_PreResetDD00;
 	d.preResetDD02 = s_PreResetDD02;
 	d.runtime = scpuCurrentRuntimeResult( scpu );
+	d.vspCount = d.vspTotal = d.vspOverwritten = 0;
+	d.vspGamePhase = 0;
+	d.vspVideo = (u8)s_DetectedVideo;
+	d.vspCyclesPerLine = (u16)c64CyclesPerLine( s_DetectedVideo );
+	d.vspRasterLines = (u16)c64RasterLines( s_DetectedVideo );
+	d.vspVideoValid = s_DetectedVideoValid;
+	d.vspValid = false;
+	scpuVSPMatrixDiagnostic( d.vspMatrix );
 
 	if ( !d.haveCPU )
 	{
@@ -293,11 +401,78 @@ static void scpuSnapshotResetDiagnostic( CSuperCPU *scpu )
 		d.e = core->m_E ? 1 : 0;
 		d.irqsTaken = core->m_IRQsTaken;
 		d.nmisTaken = core->m_NMIsTaken;
+		d.intRingHead = core->m_IntRingHead;
+		d.intRingFrozen = core->m_IntRingFrozen;
+		d.intRingFrozenCycles = core->m_IntRingFrozenCycles;
+		d.stackAnomalies = core->m_StackAnomalies;
+		for ( u32 i = 0; i < CW65C816::W65_INT_RING; i++ )
+			d.intRing[ i ] = core->m_IntRing[ i ];
+		for ( u32 i = 0; i < CW65C816::W65_INT_RING; i++ )
+			d.intRingSuspect[ i ] = core->m_IntRingSuspect[ i ];
+		d.intRingSuspectHead = core->m_IntRingSuspectHead;
+		d.progEpochs = core->m_ProgEpochs;
+		d.progStallEpochsMax = core->m_ProgStallEpochsMax;
+		d.progSuspects = core->m_ProgSuspects;
+		d.progConfirmed = core->m_ProgConfirmed;
+		d.progSuspectCycles = core->m_ProgSuspectCycles;
+		d.progConfirmCycles = core->m_ProgConfirmCycles;
+		d.progCellCount = core->m_ProgCellCount;
+		d.progPC = core->m_ProgPC;
+		for ( u32 i = 0; i < CW65C816::W65_PROG_CELL_REPORT; i++ )
+			d.progCells[ i ] = core->m_ProgCells[ i ];
+		for ( u32 i = 0; i < 6; i++ )
+			d.vectors[ i ] = scpu->memory().m_RAM[ 0xFFFA + i ];
+		d.softVectors[ 0 ] = scpu->memory().m_RAM[ 0x0314 ];
+		d.softVectors[ 1 ] = scpu->memory().m_RAM[ 0x0315 ];
 		radBusSampleInterrupts( d.liveIRQ, d.liveNMI );
 	}
 
 	{
 		CC64Memory &m = scpu->memory();
+		d.vspCount = m.copyVSPTrace( d.vsp, SCPU_VSP_TRACE_SIZE,
+		                              d.vspTotal, d.vspOverwritten );
+		d.vspGamePhase = m.m_RAM[ 0x9F88 ];
+		d.vspValid = true;
+		for ( u32 i = 0; i < CC64Memory::SCPU_WATCH_RING; i++ )
+			d.watchRing[ i ] = m.m_WatchRing[ i ];
+		d.watchPos = m.m_WatchPos;
+		d.watchWrites = m.m_WatchWrites;
+		d.watchChanges = m.m_WatchChanges;
+		d.watchAddr[ 0 ] = cfgRAMWatch;
+		d.watchAddr[ 1 ] = cfgRAMWatch2;
+		for ( u32 i = 0; i < CC64Memory::SCPU_D012_RING; i++ )
+		{
+			d.d012Reads[ i ] = m.m_D012Reads[ i ];
+			d.d012ReadCyc[ i ] = m.m_D012ReadCyc[ i ];
+		}
+		d.d012ReadPos = m.m_D012ReadPos;
+		d.d012ReadCount = m.m_D012ReadCount;
+		d.rasterCompare = m.rasterCompare();
+		d.rst8Samples = m.m_D011RST8Samples;
+		d.rst8Rejected = m.m_D011RST8Rejected;
+		d.rst8LastLow = m.m_D011RST8LastLow;
+		d.rst8LastRejLow = m.m_D011RST8LastRejLow;
+		d.rst8Writes = m.m_D011RST8Writes;
+		d.compareImpossible = m.m_RasterCompareImpossible;
+		d.anchorRefused = m.m_RasterAnchorRefused;
+		for ( u32 i = 0; i < SCPU_ICTL_RING; i++ )
+		{
+			d.ictl[ i ] = m.m_ICtlRing[ i ];
+			d.ictlFrozen[ i ] = m.m_ICtlFrozen[ i ];
+		}
+		d.ictlHead = m.m_ICtlHead;
+		d.ictlFrozenHead = m.m_ICtlFrozenHead;
+		d.ictlFrozenReason = m.m_ICtlFrozenReason;
+		d.ictlFrozenCycles = m.m_ICtlFrozenCycles;
+		d.d019Writes = m.m_D019Writes;
+		d.d019AckHeld = m.m_D019AckHeldIRQ;
+		d.d019AckHeldLate = m.m_D019AckHeldIRQLate;
+		// $9F88 through the DRAM array and through the map the guest reads.
+		// Both are RAM, so neither touches a chip register and both are safe
+		// while /RESET is asserted.
+		d.phaseViaRAM = m.m_RAM[ 0x9F88 ];
+		d.phaseShadow = m.m_RAM[ 0x9F87 ];
+		d.phaseViaMap = (u8)scpu->memoryMap().read8( 0x9F88 );
 		d.nmiSynth = (u32)m.m_SynthNMIsDelivered;
 		d.nmiHoldActive = m.iecThrottleActive() ? 1 : 0;
 		d.nmiRescales = (u32)m.m_CIA2Rescales;
@@ -331,7 +506,11 @@ static void scpuSnapshotResetDiagnostic( CSuperCPU *scpu )
 		d.mirrorBitmapPending = d.vicBitmapBase < 0x10000
 		                      && w.hasPendingInRange( d.vicBitmapBase, 8000 );
 		d.mirrorAccepted = w.m_WritesAccepted;
-		d.mirrorSkipped = w.m_WritesSkipped;
+		// Both halves of "the policy discarded this write": the ones the sink
+		// examined, and the ones CC64Memory's mirror floor rejected before the
+		// call. Reporting only the first would have hidden ~96% of them -- see
+		// IMirrorSink::m_MirrorFloor.
+		d.mirrorSkipped = w.m_WritesSkipped + w.m_MirrorFloorSkipped;
 		d.mirrorFlushed = w.m_BytesFlushed;
 		d.mirrorEntriesExamined = w.m_PolicyEntriesExamined;
 		d.mirrorZeroProgressScans = w.m_PolicyZeroProgressScans;
@@ -532,6 +711,30 @@ static void scpuEmitResetDiagnostic()
 	               d.vic11, d.vic16, d.vic18, d.vic15, d.vic20, d.vic21,
 	               (unsigned)( d.vicScreenBase & 0xFFFF ),
 	               (unsigned)( d.vicBitmapBase & 0xFFFF ) );
+	if ( d.vspValid )
+		s_Logger->Write( "SCPU", LogNotice,
+		               "  vsp trace: retained=%u total=%u overwritten=%u signature D016=$%02X x=%u D018=$%02X phase=$%02X",
+		               (unsigned)d.vspCount, (unsigned)d.vspTotal,
+		               (unsigned)d.vspOverwritten, d.vic16,
+		               (unsigned)( d.vic16 & 7 ), d.vic18,
+		               d.vspGamePhase );
+	for ( u32 i = 0; i < SCPU_VSP_MATRIX_CAPTURE_SLOTS; i++ )
+	{
+		const SCPUVSPMatrixCapture &capture = d.vspMatrix.capture[ i ];
+		if ( capture.state != 2 ) continue;
+		s_Logger->Write( "SCPU", LogNotice,
+		               "  vsp matrix%u%s: mismatch=%u direct=%u/1024 shift=%d score=%u/%u pending=%u raster=%u-%u safe=%u",
+		               (unsigned)i, capture.kind ? "-stall" : "",
+		               (unsigned)capture.mismatchCount,
+		               (unsigned)capture.directMatches,
+		               (int)capture.bestShift,
+		               (unsigned)capture.bestShiftMatches,
+		               (unsigned)capture.bestShiftCompared,
+		               (unsigned)capture.pendingAtCapture,
+		               (unsigned)capture.rasterBefore,
+		               (unsigned)capture.rasterAfter,
+		               (unsigned)capture.safeWindow );
+	}
 	s_Logger->Write( "SCPU", LogNotice,
 	               "  mirror: mode=%u pending=%u screen/bitmap=%u/%u accepted=%llu skipped=%llu flushed=%llu",
 	               (unsigned)d.mirrorMode, (unsigned)d.mirrorPending,
@@ -689,21 +892,61 @@ static bool scpuCheckButton( void *ctx )
 		}
 	}
 
-	// Say so the FIRST time a bus wait ever hits its ceiling. Before those
+	// Note the FIRST time a bus wait ever hits its ceiling. Before those
 	// ceilings existed this was the freeze that took the whole firmware down
 	// -- no frame hook, no button, power cycle only -- so it left no trace at
-	// all. One line, once, is the difference between a mystery and a lead.
+	// all. Knowing it happened, once, is the difference between a mystery and a
+	// lead.
+	//
+	// IT NO LONGER WRITES A CONSOLE LINE, and that is a correctness change, not
+	// a tidy-up. This runs in the frame hook, which means the emulated CPU is
+	// STOPPED, and s_Logger's device is the Circle console: helpers.h's
+	// STANDARD_SETUP falls back to m_Screen when no logdev is given, and
+	// Firmware/RaspberryPi/cmdline.txt is "width=720 height=480". By run time the
+	// console has long scrolled, so every line reaches CScreenDevice::Scroll,
+	// which copies 720 x 464 x 4 = 1,336,320 bytes and -- with
+	// SCREEN_DMA_BURST_LENGTH defaulting to 2 in circle/sysconfig.h -- then
+	// BLOCKS core 0 in CDMAChannel::Wait(). This file already states the
+	// magnitude twice from its own experience: "one heartbeat write costs
+	// milliseconds" and "costs enough real time to stutter the display for a
+	// visible instant", which is why HEARTBEAT defaults to 0.
+	//
+	// AND IT IS NOT HYPOTHETICAL ON THIS CARD. CHT.3 records this very line
+	// firing twice over: "BUS WAIT TIMEOUT: BA=3034 PHI=0" in the K403 freeze
+	// and "BA=3 PHI=0" over 38 otherwise quiet minutes. So the write does fire,
+	// it fires rarely in a healthy run, and it fires from inside a guest stop --
+	// which is the shape of the 2026-10-12 Mario displacement, one multi-
+	// millisecond guest stop out of 63 captured events.
+	//
+	// NOTE THE SECOND MECHANISM THE SAME COUNTERS IMPLY, because it is at least
+	// as likely as the scroll and this latch is how it gets read: each timeout
+	// means one bus access spun the full RAD_BA_WAIT_LIMIT = 4000 C64 cycles
+	// (lowlevel_dma.h:160) and then proceeded anyway. Three or four of those
+	// inside one mirror drain is ~12ms on their own with no console involved --
+	// which is what CHT.3 diagnosed as K403's "all=29669us/260" epoch. buswait=
+	// and the existing guest-stop cause mask separate the two: a FRAMEEND-tagged
+	// peak points at the frame hook, a BORDER/FLUSH-tagged one at the BA ceiling.
+	//
+	// NOTHING IS LOST, and that is the condition this edit had to meet. The
+	// detection predicate is unchanged and still runs HERE, at the same point,
+	// on the same two counters and behind the same IEC-quiet guard -- only the
+	// cost of reporting it moves. The live totals are already printed verbatim
+	// by the diagnostic dump ("  bus wait timeouts: BA=%u PHI=%u"), which runs
+	// with the machine already stopped, and the first-change pair plus the
+	// change count are latched below and printed on the guest-stopped line.
 	if ( !scpu || !scpu->memory().iecBusActive() )
 	{
 		static u32 lastBA = 0, lastPHI = 0;
 		if ( radBAWaitTimeouts != lastBA || radPHIWaitTimeouts != lastPHI )
 		{
+			if ( !s_BusWaitTimeoutReports )
+			{
+				s_BusWaitTimeoutFirstBA = radBAWaitTimeouts;
+				s_BusWaitTimeoutFirstPHI = radPHIWaitTimeouts;
+			}
+			s_BusWaitTimeoutReports++;
 			lastBA = radBAWaitTimeouts;
 			lastPHI = radPHIWaitTimeouts;
-			CScopedLoggingIRQs irqs;
-			s_Logger->Write( "SCPU", LogNotice,
-			               "BUS WAIT TIMEOUT: BA=%u PHI=%u (bus stopped answering)",
-			               (unsigned)lastBA, (unsigned)lastPHI );
 		}
 	}
 
@@ -727,8 +970,10 @@ static bool scpuCheckButton( void *ctx )
 		// silently lost merely because the other physical button was used.
 		if ( !s_RebootRequested )
 		{
-			const SCPURuntimeResult runtime =
-				scpuCurrentRuntimeResult( scpu );
+			// Snapshot the passive VSP sidecar as well.  This reads only Pi-owned
+			// state; it does not add a physical VIC/CIA access before the reboot.
+			scpuSnapshotResetDiagnostic( scpu );
+			const SCPURuntimeResult runtime = s_ResetDiagnostic.runtime;
 			CScopedLoggingIRQs saveIRQs;
 			if ( !scpuSaveRuntimeBusDiag( runtime ) )
 				s_Logger->Write( "SCPU", LogError,
@@ -990,6 +1235,10 @@ static bool scpuCheckButton( void *ctx )
 				if ( ++s_HeartbeatStalledRuns == 3 && !s_HeartbeatDumped )
 				{
 					s_HeartbeatDumped = true;
+					// Preserve a fourth matrix sample at the failure itself. This
+					// diagnostic waits for a hidden physical raster interval but does
+					// not advance the guest or drain outstanding mirror bytes.
+					scpuCaptureVSPStallMatrixDiagnostic( scpu );
 					scpuSnapshotResetDiagnostic( scpu );
 					{
 						CScopedLoggingIRQs dumpIRQs;
@@ -1189,7 +1438,8 @@ static SCPURuntimeSample scpuCaptureRuntimeSample( CSuperCPU *scpu,
 	s.emuCycles = scpu->memory().m_EmuCycles;
 	s.ramWrites = scpu->memory().m_RamWrites;
 	s.acceptedWrites = scpu->writeBuffer().m_WritesAccepted;
-	s.skippedWrites = scpu->writeBuffer().m_WritesSkipped;
+	s.skippedWrites = scpu->writeBuffer().m_WritesSkipped
+	                + scpu->writeBuffer().m_MirrorFloorSkipped;
 	s.postedWaitCycles = scpu->memory().m_MirrorStretchCycles;
 	s.slowCycles = scpu->memory().m_SlowPacedCycles;
 	s.iecThrottledCycles = scpu->memory().m_IECThrottledCycles;
@@ -1295,8 +1545,75 @@ static void scpuLogPiARMClock( CLogger *logger, const char *when,
 		               "Pi ARM clock %s: measured-rate query failed", when );
 		return;
 	}
-	logger->Write( "SCPU", LogNotice, "Pi ARM clock %s: %u Hz",
-	               when, (unsigned)rateHz );
+	// Every cycle count in this project -- bus waits, the pacing grid, the
+	// speed verdict, every microsecond column in every diagnostic -- is
+	// denominated in SCPU_ARM_CLOCK_HZ, and nothing has ever checked that the
+	// Pi agrees. config.txt pins arm_freq=1400 with force_turbo=1, so a
+	// disagreement here is a fault (throttling, or an edited config.txt), not
+	// ordinary idle clock scaling.
+	const u32 assumed = SCPU_ARM_CLOCK_HZ;
+	const u32 delta = rateHz > assumed ? rateHz - assumed : assumed - rateHz;
+	if ( delta > assumed / 100u )
+		logger->Write( "SCPU", LogWarning,
+		               "Pi ARM clock %s: measured %u Hz but this firmware assumes "
+		               "%u Hz -- EVERY cycle count is off by %u%%",
+		               when, (unsigned)rateHz, (unsigned)assumed,
+		               (unsigned)( (u64)delta * 100u / assumed ) );
+	else
+		logger->Write( "SCPU", LogNotice,
+		               "Pi ARM clock %s: %u Hz (assumed %u Hz)",
+		               when, (unsigned)rateHz, (unsigned)assumed );
+}
+
+// The mailbox query above reports what the FIRMWARE believes the ARM clock
+// is. This measures the counter we actually time with: PMCCNTR_EL0 against
+// CNTPCT_EL0, whose rate is fixed by CNTFRQ_EL0 and does not move with
+// arm_freq or throttling. It cannot catch a mid-run thermal step (config.txt
+// has temp_soft_limit=70, and initial_turbo=2 pins the clock across this
+// window anyway) -- what it CAN catch is our cycle unit not being
+// SCPU_ARM_CLOCK_HZ at all: a counter divider, or a config.txt edited after
+// the bus timings were tuned. Runs before the bus is acquired, so there is no
+// timed window to disturb.
+static u32 s_MeasuredCycleCounterHz = 0;
+
+static void scpuLogMeasuredCycleCounter( CLogger *logger )
+{
+	u64 frq = 0;
+	asm volatile( "mrs %0, CNTFRQ_EL0" : "=r" ( frq ) );
+	if ( !frq )
+	{
+		logger->Write( "SCPU", LogWarning,
+		               "cycle counter: CNTFRQ_EL0 reads 0; cannot verify the ARM clock" );
+		return;
+	}
+
+	u64 t0 = 0, t1 = 0;
+	asm volatile( "mrs %0, CNTPCT_EL0" : "=r" ( t0 ) );
+	const u64 p0 = radBus.hostCycles();
+	// 10ms: long enough that the register reads around the window are noise.
+	const u64 window = frq / 100u;
+	do {
+		asm volatile( "mrs %0, CNTPCT_EL0" : "=r" ( t1 ) );
+	} while ( t1 - t0 < window );
+	const u64 p1 = radBus.hostCycles();
+	const u64 elapsed = t1 - t0;
+	if ( !elapsed ) return;
+	s_MeasuredCycleCounterHz = (u32)( ( p1 - p0 ) * frq / elapsed );
+
+	const u32 assumed = SCPU_ARM_CLOCK_HZ;
+	const u32 delta = s_MeasuredCycleCounterHz > assumed
+	                ? s_MeasuredCycleCounterHz - assumed
+	                : assumed - s_MeasuredCycleCounterHz;
+	if ( delta > assumed / 100u )
+		logger->Write( "SCPU", LogWarning,
+		               "cycle counter: PMCCNTR runs at %u Hz, not the assumed %u Hz "
+		               "-- EVERY cycle count in this firmware is off by %u%%",
+		               (unsigned)s_MeasuredCycleCounterHz, (unsigned)assumed,
+		               (unsigned)( (u64)delta * 100u / assumed ) );
+	else
+		logger->Write( "SCPU", LogNotice,
+		               "cycle counter: PMCCNTR measured %u Hz against assumed %u Hz",
+		               (unsigned)s_MeasuredCycleCounterHz, (unsigned)assumed );
 }
 
 static void scpuAppendPiThrottledDiag( char *dst, u32 capacity, u32 &length )
@@ -1337,6 +1654,16 @@ static void scpuAppendPiThrottledDiag( char *dst, u32 capacity, u32 &length )
 	scpuLineText( dst, capacity, length, " core1=" );
 	if ( s_PiARMClockCore1Valid )
 		scpuLineDecimal( dst, capacity, length, s_PiARMClockCore1 );
+	else
+		scpuLineText( dst, capacity, length, "NOT-SAMPLED" );
+	// The ASSUMED rate belongs in the file beside the measured ones. A trace
+	// read weeks later cannot otherwise tell whether its microsecond columns
+	// were computed against the clock the Pi was actually running at.
+	scpuLineText( dst, capacity, length, " assumed=" );
+	scpuLineDecimal( dst, capacity, length, SCPU_ARM_CLOCK_HZ );
+	scpuLineText( dst, capacity, length, " pmccntr-measured=" );
+	if ( s_MeasuredCycleCounterHz )
+		scpuLineDecimal( dst, capacity, length, s_MeasuredCycleCounterHz );
 	else
 		scpuLineText( dst, capacity, length, "NOT-SAMPLED" );
 	scpuLineText( dst, capacity, length, "\r\npi throttled core1=" );
@@ -1422,17 +1749,1369 @@ static void scpuAppendRuntimePiDiag( char *dst, u32 capacity, u32 &length )
 	              " bits 0-3=live 16-19=sticky\r\n" );
 }
 
+static void scpuAppendVSPTraceDiag( char *dst, u32 capacity, u32 &length )
+{
+	const SCPUResetDiagnostic &d = s_ResetDiagnostic;
+	if ( !d.vspValid )
+	{
+		scpuLineText( dst, capacity, length,
+		              "vsp trace: no reset-time snapshot available\r\n" );
+		return;
+	}
+
+	scpuLineText( dst, capacity, length, "vsp trace: retained=" );
+	scpuLineDecimal( dst, capacity, length, d.vspCount );
+	scpuLineText( dst, capacity, length, " total=" );
+	scpuLineDecimal( dst, capacity, length, d.vspTotal );
+	scpuLineText( dst, capacity, length, " overwritten=" );
+	scpuLineDecimal( dst, capacity, length, d.vspOverwritten );
+	scpuLineText( dst, capacity, length, " signature D016=$" );
+	scpuLineHexByte( dst, capacity, length, d.vic16 );
+	scpuLineText( dst, capacity, length, " x=" );
+	scpuLineDecimal( dst, capacity, length, d.vic16 & 7 );
+	scpuLineText( dst, capacity, length, " D018=$" );
+	scpuLineHexByte( dst, capacity, length, d.vic18 );
+	scpuLineText( dst, capacity, length, " phase=$" );
+	scpuLineHexByte( dst, capacity, length, d.vspGamePhase );
+	scpuLineText( dst, capacity, length, "\r\n" );
+	scpuLineText( dst, capacity, length, "video: detected=" );
+	if ( !d.vspVideoValid )
+		scpuLineText( dst, capacity, length, "UNKNOWN" );
+	else if ( d.vspVideo == VIDEO_PAL )
+		scpuLineText( dst, capacity, length, "PAL" );
+	else if ( d.vspVideo == VIDEO_NTSC_R56A )
+		scpuLineText( dst, capacity, length, "NTSC-R56A" );
+	else
+		scpuLineText( dst, capacity, length, "NTSC-R8" );
+	scpuLineText( dst, capacity, length, " cycles/line=" );
+	scpuLineDecimal( dst, capacity, length, d.vspCyclesPerLine );
+	scpuLineText( dst, capacity, length, " lines=" );
+	scpuLineDecimal( dst, capacity, length, d.vspRasterLines );
+	scpuLineText( dst, capacity, length, "\r\n" );
+
+	const SCPUVSPMatrixDiagnostic &matrix = d.vspMatrix;
+	scpuLineText( dst, capacity, length, "matrix compare: state=" );
+	scpuLineDecimal( dst, capacity, length, matrix.state );
+	scpuLineText( dst, capacity, length, " gameplay=" );
+	scpuLineDecimal( dst, capacity, length, matrix.gameplaySeen );
+	scpuLineText( dst, capacity, length, " phase-changes=" );
+	scpuLineDecimal( dst, capacity, length, matrix.phaseChanges );
+	scpuLineText( dst, capacity, length, " qualifying=" );
+	scpuLineDecimal( dst, capacity, length, matrix.qualifyingFrames );
+	scpuLineText( dst, capacity, length, " quiet=" );
+	scpuLineDecimal( dst, capacity, length, matrix.quietFrames );
+	scpuLineText( dst, capacity, length, " trace=" );
+	scpuLineDecimal( dst, capacity, length, matrix.traceTotal );
+	scpuLineText( dst, capacity, length, " captured=" );
+	scpuLineDecimal( dst, capacity, length, matrix.capturedCount );
+	scpuLineText( dst, capacity, length, "\r\n" );
+	for ( u32 slot = 0; slot < SCPU_VSP_MATRIX_CAPTURE_SLOTS; slot++ )
+	{
+		const SCPUVSPMatrixCapture &capture = matrix.capture[ slot ];
+		scpuLineText( dst, capacity, length, "matrix slot" );
+		scpuLineDecimal( dst, capacity, length, slot );
+		scpuLineText( dst, capacity, length, capture.kind ? " stall" : " clean" );
+		scpuLineText( dst, capacity, length, ": state=" );
+		scpuLineDecimal( dst, capacity, length, capture.state );
+		scpuLineText( dst, capacity, length, " target/frame=" );
+		scpuLineDecimal( dst, capacity, length, capture.targetFrame );
+		scpuLineChar( dst, capacity, length, '/' );
+		scpuLineDecimal( dst, capacity, length, capture.qualifyingFrame );
+		scpuLineText( dst, capacity, length, " trace=" );
+		scpuLineDecimal( dst, capacity, length, capture.traceTotal );
+		scpuLineText( dst, capacity, length, " phase=$" );
+		scpuLineHexByte( dst, capacity, length, capture.gamePhase );
+		scpuLineText( dst, capacity, length, " attempts=" );
+		scpuLineDecimal( dst, capacity, length, capture.captureAttempts );
+		scpuLineText( dst, capacity, length, " wait unsafe/pending=" );
+		scpuLineDecimal( dst, capacity, length, capture.unsafeWindowWaits );
+		scpuLineChar( dst, capacity, length, '/' );
+		scpuLineDecimal( dst, capacity, length, capture.pendingWaits );
+		scpuLineText( dst, capacity, length, "\r\n" );
+		if ( capture.state != 2 ) continue;
+
+		scpuLineText( dst, capacity, length, "matrix bases" );
+		scpuLineDecimal( dst, capacity, length, slot );
+		scpuLineText( dst, capacity, length, ": logical=$" );
+		scpuLineHexByte( dst, capacity, length,
+		                 (u8)( capture.logicalBase >> 8 ) );
+		scpuLineHexByte( dst, capacity, length, (u8)capture.logicalBase );
+		scpuLineText( dst, capacity, length, " physical=$" );
+		scpuLineHexByte( dst, capacity, length,
+		                 (u8)( capture.physicalBase >> 8 ) );
+		scpuLineHexByte( dst, capacity, length, (u8)capture.physicalBase );
+		scpuLineText( dst, capacity, length, " raster=" );
+		scpuLineDecimal( dst, capacity, length, capture.rasterBefore );
+		scpuLineChar( dst, capacity, length, '-' );
+		scpuLineDecimal( dst, capacity, length, capture.rasterAfter );
+		scpuLineText( dst, capacity, length, " safe=" );
+		scpuLineDecimal( dst, capacity, length, capture.safeWindow );
+		scpuLineText( dst, capacity, length, " pending=" );
+		scpuLineDecimal( dst, capacity, length, capture.pendingAtCapture );
+		scpuLineText( dst, capacity, length, "\r\n" );
+
+		scpuLineText( dst, capacity, length, "matrix result" );
+		scpuLineDecimal( dst, capacity, length, slot );
+		scpuLineText( dst, capacity, length, ": direct=" );
+		scpuLineDecimal( dst, capacity, length, capture.directMatches );
+		scpuLineText( dst, capacity, length, "/1024 mismatch=" );
+		scpuLineDecimal( dst, capacity, length, capture.mismatchCount );
+		scpuLineText( dst, capacity, length, " first/last=$" );
+		if ( capture.firstMismatch == 0xFFFF )
+			scpuLineText( dst, capacity, length, "----/----" );
+		else
+		{
+			scpuLineHexByte( dst, capacity, length,
+			                 (u8)( capture.firstMismatch >> 8 ) );
+			scpuLineHexByte( dst, capacity, length,
+			                 (u8)capture.firstMismatch );
+			scpuLineChar( dst, capacity, length, '/' );
+			scpuLineHexByte( dst, capacity, length,
+			                 (u8)( capture.lastMismatch >> 8 ) );
+			scpuLineHexByte( dst, capacity, length,
+			                 (u8)capture.lastMismatch );
+		}
+		scpuLineText( dst, capacity, length, " best-shift=" );
+		if ( capture.bestShift < 0 )
+		{
+			scpuLineChar( dst, capacity, length, '-' );
+			scpuLineDecimal( dst, capacity, length,
+			                 (u32)( -capture.bestShift ) );
+		}
+		else
+		{
+			scpuLineChar( dst, capacity, length, '+' );
+			scpuLineDecimal( dst, capacity, length,
+			                 (u32)capture.bestShift );
+		}
+		scpuLineText( dst, capacity, length, " score=" );
+		scpuLineDecimal( dst, capacity, length, capture.bestShiftMatches );
+		scpuLineChar( dst, capacity, length, '/' );
+		scpuLineDecimal( dst, capacity, length, capture.bestShiftCompared );
+		scpuLineText( dst, capacity, length, "\r\n" );
+
+		for ( u32 i = 0; i < capture.mismatchSampleCount; i++ )
+		{
+			const SCPUVSPMatrixMismatch &m = capture.mismatch[ i ];
+			scpuLineText( dst, capacity, length, "matrix mismatch" );
+			scpuLineDecimal( dst, capacity, length, slot );
+			scpuLineText( dst, capacity, length, " +$" );
+			scpuLineHexByte( dst, capacity, length, (u8)( m.offset >> 8 ) );
+			scpuLineHexByte( dst, capacity, length, (u8)m.offset );
+			scpuLineText( dst, capacity, length, " expected/physical=$" );
+			scpuLineHexByte( dst, capacity, length, m.expected );
+			scpuLineChar( dst, capacity, length, '/' );
+			scpuLineHexByte( dst, capacity, length, m.physical );
+			scpuLineText( dst, capacity, length, "\r\n" );
+		}
+	}
+
+	for ( u32 i = 0; i < d.vspCount; i++ )
+	{
+		const VSPTimingEvent &e = d.vsp[ i ];
+		scpuLineText( dst, capacity, length, "vsp" );
+		if ( i < 10 ) scpuLineChar( dst, capacity, length, '0' );
+		scpuLineDecimal( dst, capacity, length, i );
+		scpuLineText( dst, capacity, length, " seq=" );
+		scpuLineDecimal( dst, capacity, length, e.sequence );
+		scpuLineText( dst, capacity, length, " w$" );
+		scpuLineHexByte( dst, capacity, length, (u8)( e.address >> 8 ) );
+		scpuLineHexByte( dst, capacity, length, (u8)e.address );
+		scpuLineChar( dst, capacity, length, '=' );
+		scpuLineHexByte( dst, capacity, length, e.value );
+		scpuLineChar( dst, capacity, length, '/' );
+		scpuLineHexByte( dst, capacity, length, e.physicalValue );
+		scpuLineText( dst, capacity, length, " raster=" );
+		if ( e.flags & SCPU_VSP_RASTER_VALID )
+		{
+			scpuLineHexByte( dst, capacity, length, e.raster );
+			scpuLineChar( dst, capacity, length, '+' );
+			if ( e.hostCycle >= e.rasterHostCycle )
+				scpuLineDecimal64( dst, capacity, length,
+				                   e.hostCycle - e.rasterHostCycle );
+			else
+				scpuLineText( dst, capacity, length, "WRAP" );
+		}
+		else
+			scpuLineText( dst, capacity, length, "--" );
+		scpuLineText( dst, capacity, length, " host=" );
+		scpuLineDecimal64( dst, capacity, length, e.hostCycle );
+		// The one derived number this sidecar exists to produce: the interval
+		// since the previous write TO THE SAME REGISTER. Across Mario's
+		// DEC/INC pair on $D011 that interval IS how long the register holds
+		// its decremented value, which NMOS gives as exactly 6 -- against the
+		// real card's 90us/92 cycles and our measured 100us/102. It is
+		// deliberately NOT "since the previous retained event": the handler
+		// also writes $D016 and $D018, and an intervening one would silently
+		// turn this into a different measurement with nothing to say so.
+		//
+		// Printed in HUNDREDTHS of a C64 cycle against the hostPerC64 in the
+		// grid= field below, so 600 is exactly six. Whole cycles would hide a
+		// one-cycle error whenever that denominator is off: on the nominal
+		// 1,000,000Hz grid (1400 ARM at 1.4GHz) a true NTSC 7 divides to 6.84
+		// and floors to the 6 this trace is read to confirm.
+		scpuLineText( dst, capacity, length, " dprev=" );
+		u32 prev = i;
+		while ( prev && d.vsp[ prev - 1 ].address != e.address )
+			prev--;
+		if ( prev && e.hostPerC64
+		     && e.hostCycle >= d.vsp[ prev - 1 ].hostCycle )
+		{
+			const u64 dhost = e.hostCycle - d.vsp[ prev - 1 ].hostCycle;
+			scpuLineDecimal64( dst, capacity, length, dhost );
+			scpuLineText( dst, capacity, length, "h=" );
+			scpuLineDecimal64( dst, capacity, length,
+			                   dhost * 100u / e.hostPerC64 );
+			scpuLineText( dst, capacity, length, "cc" );
+		}
+		else
+			scpuLineText( dst, capacity, length, "--" );
+		// The stall charged between the previous retained event and this one.
+		// On a scrolling Mario capture the $D011 INC must show a nonzero value
+		// here whenever its DEC landed early in the line, and dprev must equal
+		// 59 - DECcycle; a zero here with a 6-cycle dprev is the K451 failure
+		// reappearing.
+		scpuLineText( dst, capacity, length, " bastall=" );
+		scpuLineDecimal( dst, capacity, length, e.baStallCycles );
+		scpuLineChar( dst, capacity, length, '/' );
+		scpuLineDecimal( dst, capacity, length, e.baStallEvents );
+		// WHICH END MOVED, in whole PHI cycles: the anchor $D012 read's own BA
+		// spins, then this write's. Printed adjacently because the reading is
+		// the PAIR -- these are the only two numbers in the trace that can say
+		// whether a whole-cycle placement slip happened on the read end or the
+		// write end, and every other placement field here averages over both.
+		// Not a duration and not hundredths: one unit is one whole C64 cycle.
+		// THE BADLINE REFERENCE. Host cycles back to the last badline-class
+		// release and that release's length. The length is not decoration: a
+		// release of 40+ is the only thing that licenses treating the stamp as
+		// in-line cycle ~54, and reconstructing its entry as release minus
+		// length must land near in-line 12 or the reference is not a badline.
+		scpuLineText( dst, capacity, length, " badref=" );
+		if ( e.sinceBadlineHost == 0xFFFFFFFFu )
+			scpuLineText( dst, capacity, length, "--" );
+		else
+		{
+			scpuLineDecimal64( dst, capacity, length, e.sinceBadlineHost );
+			scpuLineChar( dst, capacity, length, 'h' );
+			scpuLineText( dst, capacity, length, "/len" );
+			scpuLineDecimal( dst, capacity, length, e.badlineReleaseLen );
+		}
+		// counted/elapsed since the guest's own $D012 anchor, for THIS event: the
+		// guest cycles the core charged against the C64 cycles that really passed.
+		// Equal means the pacer held 1:1 across the span; counted > elapsed means
+		// cycles ran unpaced inside it. One unit is one whole C64 cycle; elapsed
+		// is printed in hundredths like dprev=.
+		scpuLineText( dst, capacity, length, " anc=" );
+		if ( ( e.flags & SCPU_VSP_RASTER_VALID ) && e.c64Cycle >= e.rasterC64Cycle
+		     && e.hostCycle >= e.rasterHostCycle && e.hostPerC64 )
+		{
+			scpuLineDecimal64( dst, capacity, length, e.c64Cycle - e.rasterC64Cycle );
+			scpuLineText( dst, capacity, length, "c/" );
+			scpuLineDecimal64( dst, capacity, length,
+			                   ( e.hostCycle - e.rasterHostCycle ) * 100u / e.hostPerC64 );
+			scpuLineText( dst, capacity, length, "cc" );
+		}
+		else
+			scpuLineText( dst, capacity, length, "--" );
+		// catch= (K499): the catch-up's deficit at ENTRY, countTarget - entry,
+		// in signed hundredths of a cycle, then the wait it applied. Positive
+		// is early-and-corrected; negative is late-and-UNcorrected, the half
+		// of the placement no other field shows. -- when the gate did not run
+		// for this write (no anchor, not factor 1, inside a serial window).
+		scpuLineText( dst, capacity, length, " catch=" );
+		if ( ( e.flags & SCPU_VSP_CATCH_VALID ) && e.hostPerC64 )
+		{
+			const s64 d = e.catchDeficit;
+			scpuLineChar( dst, capacity, length, d < 0 ? '-' : '+' );
+			scpuLineDecimal64( dst, capacity, length,
+			                   (u64)( d < 0 ? -d : d ) * 100u / e.hostPerC64 );
+			scpuLineChar( dst, capacity, length, '/' );
+			scpuLineDecimal64( dst, capacity, length,
+			                   (u64)e.catchWait * 100u / e.hostPerC64 );
+			scpuLineText( dst, capacity, length, "cc" );
+		}
+		else
+			scpuLineText( dst, capacity, length, "--" );
+		scpuLineText( dst, capacity, length, " spins=" );
+		scpuLineDecimal( dst, capacity, length, e.anchorBASpins );
+		scpuLineChar( dst, capacity, length, 'r' );
+		scpuLineChar( dst, capacity, length, '/' );
+		scpuLineDecimal( dst, capacity, length, e.writeBASpins );
+		scpuLineChar( dst, capacity, length, 'w' );
+		// postrel= is the assumption-free half of this trace: host cycles from
+		// the BA release to this write, then the same in hundredths of a C64
+		// cycle like dprev=. The trailing b/s says whether the release it is
+		// measured from was badline-class or a sprite steal -- an 's' makes the
+		// number meaningless for the invariant, see SCPU_VSP_RELEASE_BADLINE.
+		// Against the invariant's INC at 59, and with the two in-cycle offsets
+		// VSPTimingEvent::sinceReleaseHost spells out, roughly 380..580 says our
+		// placement is right and K456's +3..+4 hold error lives in the raster=
+		// reconstruction, whose anchor cycle is assumed and which the stall
+		// itself moved; roughly 730..930 says the write really is about 3.5
+		// cycles late. The bands do not touch; a point value read out of this
+		// would be over-reading it by a cycle.
+		scpuLineText( dst, capacity, length, " postrel=" );
+		if ( e.sinceReleaseHost == 0xFFFF || !e.hostPerC64 )
+			scpuLineText( dst, capacity, length, "--" );
+		else
+		{
+			scpuLineDecimal( dst, capacity, length, e.sinceReleaseHost );
+			scpuLineText( dst, capacity, length, "h=" );
+			scpuLineDecimal( dst, capacity, length,
+			                 (u32)e.sinceReleaseHost * 100u / e.hostPerC64 );
+			scpuLineText( dst, capacity, length, "cc" );
+			scpuLineChar( dst, capacity, length,
+			              ( e.flags & SCPU_VSP_RELEASE_BADLINE ) ? 'b' : 's' );
+		}
+		scpuLineText( dst, capacity, length, " emu=" );
+		scpuLineDecimal64( dst, capacity, length, e.emuCycle );
+		scpuLineText( dst, capacity, length, " c64=" );
+		scpuLineDecimal64( dst, capacity, length, e.c64Cycle );
+		scpuLineText( dst, capacity, length, " pace=" );
+		if ( e.hostCycle >= e.pacingAnchor )
+		{
+			scpuLineChar( dst, capacity, length, '+' );
+			scpuLineDecimal64( dst, capacity, length,
+			                   e.hostCycle - e.pacingAnchor );
+		}
+		else
+		{
+			scpuLineChar( dst, capacity, length, '-' );
+			scpuLineDecimal64( dst, capacity, length,
+			                   e.pacingAnchor - e.hostCycle );
+		}
+		scpuLineText( dst, capacity, length, " debt=" );
+		scpuLineDecimal64( dst, capacity, length, e.pacingDebt );
+		scpuLineText( dst, capacity, length, " grid=" );
+		if ( e.hostPerC64 )
+		{
+			scpuLineDecimal64( dst, capacity, length,
+			                   e.hostCycle % e.hostPerC64 );
+			scpuLineChar( dst, capacity, length, '/' );
+			scpuLineDecimal64( dst, capacity, length,
+			                   e.pacingAnchor % e.hostPerC64 );
+			scpuLineChar( dst, capacity, length, '/' );
+			scpuLineDecimal( dst, capacity, length, e.hostPerC64 );
+		}
+		else
+			scpuLineText( dst, capacity, length, "--" );
+		// THE DEC-CYCLE-FREE DECOMPOSITION. dprev= above is the physical spacing
+		// between the two writes and bastall= is what was charged inside it, so
+		// this is the REMAINDER: the real time from release to second write that
+		// the freeze does not account for. VICE gives Mario hold = 59 - DECcycle
+		// and the DEC/INC pair is six NMOS cycles of code, so the steal between
+		// them is 53 - DECcycle; subtract and the DEC cycle CANCELS, leaving 6 at
+		// every point of the reference sweep (45-39, 29-23, 9-3, 6-0). No raster
+		// anchor, no assumed line start, no cycle-in-line. It must read 600.
+		//   ~600  the release-to-write path is clean and the +3..+4 is NOT outside
+		//         the charge. The live candidates are then an over-long freeze and
+		//         the raster= reconstruction, and max(bastall=) over the $D011 INC
+		//         events separates them: the reference bounds that steal by
+		//         53 - 14 = 39, so a 42..46 there is the freeze running past the
+		//         release
+		//   ~900  three cycles of real time between release and write that were
+		//         never charged -- the physical path, most likely
+		//         HANDLE_BUS_AVAILABLE re-waiting a steal the emulated stall had
+		//         already paid for. Handing stall cycles back would then be fixing
+		//         the wrong end, straight out of the sled the stall repaired
+		// WHAT IT CANNOT SEE, so it is not over-read: an over-long freeze leaves
+		// this at 600, because the extra cycles sit inside BOTH terms -- we really
+		// did spin for them and we really did charge them. It LOCATES the error,
+		// it does not size it.
+		//
+		// The stall is SUMMED over the dprev span, because baStallCycles is
+		// charged since the previous RETAINED event while dprev= is deliberately
+		// since the previous write to the SAME register; an intervening $D016 or
+		// $D018 write would otherwise move part of the freeze outside the field
+		// and make it read ~900 for no reason but the handler's register order.
+		// seq= adjacency is REQUIRED for that sum to be complete: the ring drops
+		// events by overwriting them, and a dropped event's charge is lost from
+		// the sum while its real time stays inside dprev. Unguarded that reads as
+		// a clean ~900 -- the same silent failure the postrel= attribution flag
+		// exists to prevent, so it gets the same treatment and prints "seq".
+		scpuLineText( dst, capacity, length, " code=" );
+		if ( prev && e.hostPerC64
+		     && e.hostCycle >= d.vsp[ prev - 1 ].hostCycle )
+		{
+			if ( e.sequence - d.vsp[ prev - 1 ].sequence != i - ( prev - 1 ) )
+				scpuLineText( dst, capacity, length, "seq" );
+			else
+			{
+				u64 spanStall = 0;
+				for ( u32 j = prev; j <= i; j++ )
+					spanStall += d.vsp[ j ].baStallCycles;
+				const s64 cc =
+					(s64)( ( e.hostCycle - d.vsp[ prev - 1 ].hostCycle )
+					       * 100u / e.hostPerC64 )
+					- (s64)( spanStall * 100u );
+				if ( cc < 0 )
+				{
+					scpuLineChar( dst, capacity, length, '-' );
+					scpuLineDecimal64( dst, capacity, length, (u64)-cc );
+				}
+				else
+					scpuLineDecimal64( dst, capacity, length, (u64)cc );
+				scpuLineText( dst, capacity, length, "cc" );
+			}
+		}
+		else
+			scpuLineText( dst, capacity, length, "--" );
+		// --- THE DISPLACEMENT FIELDS ---------------------------------------
+		// stall= is the longest interval since the previous retained event in
+		// which the emulated CPU executed nothing while the physical raster
+		// kept moving, in host cycles and then in hundredths of a C64 cycle
+		// like dprev= and postrel=. The trailing hex is the SCPU_GUEST_STOP_*
+		// bitmask for that interval. 201 NTSC lines is about 1,300,000cc here,
+		// so a stall= that explains the K478 raster=$FE events must read seven
+		// figures; anything in the low thousands is a normal mirror
+		// installment and is NOT a candidate, whatever its cause bits say.
+		//
+		// d012= is reads/first: how many times the guest read $D012 since the
+		// previous retained event, and the value the FIRST of them returned.
+		// raster= above is the LAST one, which is why this is the half that
+		// settles it -- a handler whose poll walked down from the bottom
+		// border reads many times starting near 248, while one entered 201
+		// lines late reads a handful starting near 254.
+		//
+		// irq= is host cycles from the rising edge of the PHYSICAL /IRQ
+		// assertion we observed to this write. The healthy $35 events fix the
+		// normal handler-entry-to-VSP distance; a bad event matching it says
+		// the hardware asserted late (so look at the raster compare, not at
+		// our scheduler), and a bad event far above it says we were stopped
+		// between the assertion and the handler -- which stall= must then
+		// corroborate, or the two fields disagree and neither is believed.
+		scpuLineText( dst, capacity, length, " stall=" );
+		scpuLineDecimal( dst, capacity, length, e.stallHost );
+		if ( e.hostPerC64 )
+		{
+			scpuLineChar( dst, capacity, length, 'h' );
+			scpuLineChar( dst, capacity, length, '=' );
+			scpuLineDecimal64( dst, capacity, length,
+			                   (u64)e.stallHost * 100u / e.hostPerC64 );
+			scpuLineText( dst, capacity, length, "cc" );
+		}
+		scpuLineChar( dst, capacity, length, '/' );
+		scpuLineHexByte( dst, capacity, length, e.stallCause );
+		scpuLineText( dst, capacity, length, " d012=" );
+		scpuLineDecimal( dst, capacity, length, e.d012Reads );
+		scpuLineChar( dst, capacity, length, '/' );
+		scpuLineHexByte( dst, capacity, length, e.d012First );
+		scpuLineText( dst, capacity, length, " irq=" );
+		if ( e.irqToWriteHost == 0xFFFFFFFFu )
+			scpuLineText( dst, capacity, length, "--" );
+		else
+		{
+			scpuLineDecimal( dst, capacity, length, e.irqToWriteHost );
+			scpuLineChar( dst, capacity, length, 'h' );
+		}
+		scpuLineText( dst, capacity, length, " factor=" );
+		scpuLineDecimal( dst, capacity, length, e.factor );
+		if ( e.address == 0xD011 )
+		{
+			// This is deliberately labelled as the nearest raster ANCHOR,
+			// not the exact write line. The raw host stamps above let the
+			// analysis reconstruct that line using the measured C64 clock.
+			scpuLineText( dst, capacity, length,
+			              " bl(anchor/ysc/match/range/den)=" );
+			scpuLineDecimal( dst, capacity, length, e.raster & 7 );
+			scpuLineChar( dst, capacity, length, '/' );
+			scpuLineDecimal( dst, capacity, length, e.value & 7 );
+			scpuLineChar( dst, capacity, length, '/' );
+			scpuLineChar( dst, capacity, length,
+			              ( e.flags & SCPU_VSP_ANCHOR_BADLINE_MOD ) ? 'Y' : 'N' );
+			scpuLineChar( dst, capacity, length, '/' );
+			scpuLineChar( dst, capacity, length,
+			              ( e.flags & SCPU_VSP_ANCHOR_BADLINE_RANGE ) ? 'Y' : 'N' );
+			scpuLineChar( dst, capacity, length, '/' );
+			scpuLineChar( dst, capacity, length,
+			              ( e.flags & SCPU_VSP_D011_DEN ) ? 'Y' : 'N' );
+		}
+		scpuLineText( dst, capacity, length, " sig=" );
+		scpuLineHexByte( dst, capacity, length, e.d016 );
+		scpuLineChar( dst, capacity, length, '/' );
+		scpuLineHexByte( dst, capacity, length, e.d018 );
+		scpuLineChar( dst, capacity, length, '/' );
+		scpuLineHexByte( dst, capacity, length, e.gamePhase );
+		scpuLineText( dst, capacity, length, "\r\n" );
+	}
+}
+
+// Pacer totals since the last emulated reset, for both diagnostic files. A
+// guest run ends with a button press and a console that has long scrolled
+// away, so the SD files are the only place these can be read afterwards.
+// count:avg/min/max, in ARM cycles. The average is emitted already computed
+// because this line is read by eye first and by a parser second, and min/max
+// are what distinguish a stage with a bimodal phase distribution from a slow
+// one -- the distinction the whole K448 $D011 question turns on.
+static void scpuLineStage( char *dst, u32 capacity, u32 &length,
+                           const char *name, const RADBusStageStats &s )
+{
+	scpuLineText( dst, capacity, length, name );
+	scpuLineDecimal64( dst, capacity, length, s.count );
+	scpuLineChar( dst, capacity, length, ':' );
+	scpuLineDecimal64( dst, capacity, length,
+	                   s.count ? ( s.sum / s.count ) : 0 );
+	scpuLineChar( dst, capacity, length, '/' );
+	scpuLineDecimal( dst, capacity, length, s.count ? s.min : 0 );
+	scpuLineChar( dst, capacity, length, '/' );
+	scpuLineDecimal( dst, capacity, length, s.max );
+}
+
+static void scpuAppendStageDiag( char *dst, u32 capacity, u32 &length,
+                                 const char *tag,
+                                 const RADBusAccessStats &s )
+{
+	scpuLineText( dst, capacity, length, tag );
+	scpuLineStage( dst, capacity, length, " rsync=", s.readResync );
+	scpuLineStage( dst, capacity, length, " rvic=", s.readVIC );
+	scpuLineStage( dst, capacity, length, " rcpu=", s.readCPU );
+	scpuLineStage( dst, capacity, length, " wsync=", s.writeResync );
+	scpuLineStage( dst, capacity, length, " wp1turn=", s.writeP1Turn );
+	scpuLineStage( dst, capacity, length, " wp1plain=", s.writeP1Plain );
+	scpuLineStage( dst, capacity, length, " wp2=", s.writeP2 );
+	scpuLineText( dst, capacity, length, " bastall-r/w=" );
+	scpuLineDecimal64( dst, capacity, length, s.readBAStalls );
+	scpuLineChar( dst, capacity, length, '/' );
+	scpuLineDecimal64( dst, capacity, length, s.writeBAStalls );
+	// A separate token rather than a third field inside bastall-r/w: that key
+	// is already quoted verbatim in CHT and in the K449 result, and a changed
+	// shape would silently break any grep comparing a later run against those
+	// numbers.
+	scpuLineText( dst, capacity, length, " bastall-wturn=" );
+	scpuLineDecimal64( dst, capacity, length, s.writeTurnBAStalls );
+	scpuLineText( dst, capacity, length, "\r\n" );
+}
+
+static void scpuAppendPacerDiag( char *dst, u32 capacity, u32 &length )
+{
+	// Where a physical access spends its time, beside the pacer totals it has
+	// to be read against. K448 measured the DEC/INC $D011 pair at 10.99 C64
+	// cycles of real time in its clean mode for 6 charged; these stages break
+	// the unbudgeted 6830 ARM out by PHI entry phase. The io: line is
+	// $D000-$DFFF only, which is the traffic the artifact is made of; the all:
+	// line averages in the RAM and ROM accesses that outnumber it, and is the
+	// one to read for Problem B throughput.
+	//
+	// Calibrated here rather than lazily from an access tail: nothing is on
+	// the bus while a diagnostic file is being formatted, so the 128 counter
+	// reads cannot land between two transfers and the primitives keep no
+	// per-access branch for it. stamp= bounds every figure below it.
+	// THE GUEST-STOPPED LEDGER, read off the ledger CC64Memory ALREADY keeps.
+	// noteGuestStopped()/noteGuestResumed() bracket every interpreter exit in
+	// runFrame(), and the stop that stays open across the frame hook is tagged
+	// SCPU_GUEST_STOP_FRAMEEND -- so the phase this investigation cares about is
+	// already instrumented and no second ledger is needed. What was missing is a
+	// figure that OUTLIVES the VSP appender, which drains m_GuestStopMaxHost into
+	// every retained event and zeroes it; a run whose worst stop is not followed
+	// by a $D011 write therefore lost it. peak= is that same measurement, never
+	// drained.
+	//
+	// peak= is host cycles at arm_freq=1400, so one jiffy is 23,333,333 and the
+	// ~12.7ms displacement to explain is ~17,800,000. cause= is the
+	// SCPU_GUEST_STOP_* mask for that peak, and it is what discriminates the two
+	// candidate mechanisms: $40 (FRAMEEND) alone points at the frame hook and so
+	// at a console write, while $02/$01 (BORDER/FLUSH) points at a mirror drain
+	// paying RAD_BA_WAIT_LIMIT. buswait= is reports/firstBA/firstPHI from the
+	// latch in scpuCheckButton, which is what makes the second reading possible.
+	scpuLineText( dst, capacity, length, "guest-stopped: peak=" );
+	scpuLineDecimal( dst, capacity, length,
+	                 superCPU.memory().guestStopPeakHost() );
+	scpuLineText( dst, capacity, length, " cause=$" );
+	scpuLineHexByte( dst, capacity, length,
+	                 (u8)superCPU.memory().guestStopPeakCauses() );
+	scpuLineText( dst, capacity, length, " buswait=" );
+	scpuLineDecimal( dst, capacity, length, s_BusWaitTimeoutReports );
+	scpuLineChar( dst, capacity, length, '/' );
+	scpuLineDecimal( dst, capacity, length, s_BusWaitTimeoutFirstBA );
+	scpuLineChar( dst, capacity, length, '/' );
+	scpuLineDecimal( dst, capacity, length, s_BusWaitTimeoutFirstPHI );
+	scpuLineText( dst, capacity, length, "\r\n" );
+	radCalibrateStampCost();
+	scpuLineText( dst, capacity, length, "busstage: stamp=" );
+	scpuLineDecimal( dst, capacity, length, radBusStampCost );
+	scpuLineText( dst, capacity, length, "\r\n" );
+	scpuAppendStageDiag( dst, capacity, length, "busstage all:",
+	                     radBusStages );
+	scpuAppendStageDiag( dst, capacity, length, "busstage io:",
+	                     radBusStagesIO );
+	scpuLineText( dst, capacity, length, "pacer: wait-host=" );
+	scpuLineDecimal64( dst, capacity, length,
+	                   superCPU.memory().m_PacerWaitHostCycles );
+	scpuLineText( dst, capacity, length, " late-1mhz-entries=" );
+	scpuLineDecimal64( dst, capacity, length,
+	                   superCPU.memory().m_PacerLateEntries );
+	scpuLineText( dst, capacity, length, " late-1mhz-probes=" );
+	scpuLineDecimal64( dst, capacity, length,
+	                   superCPU.memory().m_PacerLateProbes );
+	scpuLineText( dst, capacity, length, " late-snap-host=" );
+	scpuLineDecimal64( dst, capacity, length,
+	                   superCPU.memory().m_PacerLateSnapHostCycles );
+	scpuLineText( dst, capacity, length, " credit-entries=" );
+	scpuLineDecimal64( dst, capacity, length,
+	                   superCPU.memory().m_PacerCreditEntries );
+	scpuLineText( dst, capacity, length, " credit-host=" );
+	scpuLineDecimal64( dst, capacity, length,
+	                   superCPU.memory().m_PacerCreditHostCycles );
+	scpuLineText( dst, capacity, length, " credit-clamped=" );
+	scpuLineDecimal64( dst, capacity, length,
+	                   superCPU.memory().m_PacerClampEntries );
+	scpuLineText( dst, capacity, length, " slow-cycles=" );
+	scpuLineDecimal64( dst, capacity, length,
+	                   superCPU.memory().m_SlowPacedCycles );
+	scpuLineText( dst, capacity, length, "\r\n" );
+
+	// The emulated BA stall, as a population that can be divided: events are
+	// freezes and cycles are what the guest was charged for them, so
+	// cycles/events is the MEAN STEAL and has to land near 43 on a badline
+	// machine. iec-skipped counts the samples mode 1 declined inside a serial
+	// transaction -- if a load misbehaves, that number is the first thing to
+	// read, because a zero there means the suppression never engaged.
+	// pin-events/pin-cycles come from the bus side, so the two must agree
+	// exactly: both sides count only freezes with stolen >= 1, so a difference
+	// means samples were taken and then not charged.
+	//
+	// AND A DIVISOR WARNING, because this file's own populations are easy to
+	// mix: slow-cycles above is incremented in tickFast from the INSTRUCTION's
+	// cycles only, so it does NOT include these stalled cycles, while
+	// m_EmuCycles and c64Now() DO. Any "ARM per slow cycle" figure computed
+	// across a run with the stall engaged is therefore over a different
+	// population than the K448/K449 figures archived in CHT. Add
+	// bastall-emu cycles= to slow-cycles before comparing, or do not compare.
+	scpuLineText( dst, capacity, length, "bastall-emu: events=" );
+	scpuLineDecimal64( dst, capacity, length,
+	                   superCPU.memory().m_BAStallEvents );
+	scpuLineText( dst, capacity, length, " cycles=" );
+	scpuLineDecimal64( dst, capacity, length,
+	                   superCPU.memory().m_BAStallCycles );
+	scpuLineText( dst, capacity, length, " iec-skipped=" );
+	scpuLineDecimal64( dst, capacity, length,
+	                   superCPU.memory().m_BAStallSuppressedIEC );
+	scpuLineText( dst, capacity, length, " pin-events=" );
+	scpuLineDecimal64( dst, capacity, length, radBus.m_BAStallEvents );
+	scpuLineText( dst, capacity, length, " pin-cycles=" );
+	scpuLineDecimal64( dst, capacity, length, radBus.m_BAStallCycles );
+	scpuLineText( dst, capacity, length, " capped=" );
+	scpuLineDecimal64( dst, capacity, length, radBus.m_BAStallCaps );
+	scpuLineText( dst, capacity, length, " faulted=" );
+	scpuLineDecimal( dst, capacity, length, radBus.m_BAStallFaulted ? 1 : 0 );
+	// Re-entry spacing: freezes that began within 8 C64 cycles of the previous
+	// release, the cycles they were charged, how many were within 2 cycles, and
+	// how many were sprite-class in LENGTH. Read against events= above.
+	//
+	// b2b near zero means every freeze was a cleanly separated BA-low run, each
+	// charged exactly what the guest lost, so no merged sprite lead-in can be
+	// inflating the hold and the physical path is where to look. b2b-tight is
+	// deliberately the WEAKER of the two: we sample BA only at an access
+	// boundary, so a re-entry sooner than one guest instruction is unobservable
+	// and a tight zero on its own proves nothing. b2b-cycles is the exact size
+	// of the only correction this mechanism would justify.
+	scpuLineText( dst, capacity, length, " b2b=" );
+	scpuLineDecimal64( dst, capacity, length,
+	                   superCPU.memory().m_BAStallB2B );
+	scpuLineText( dst, capacity, length, " b2b-cycles=" );
+	scpuLineDecimal64( dst, capacity, length,
+	                   superCPU.memory().m_BAStallB2BCycles );
+	scpuLineText( dst, capacity, length, " b2b-tight=" );
+	scpuLineDecimal64( dst, capacity, length,
+	                   superCPU.memory().m_BAStallB2BTight );
+	scpuLineText( dst, capacity, length, " b2b-short=" );
+	scpuLineDecimal64( dst, capacity, length,
+	                   superCPU.memory().m_BAStallB2BShort );
+	// THE RASTER-WINDOW CATCH-UP READOUT, and it is not optional: the whole
+	// first reading of that mechanism is "did it fire at all". catchup=0 means
+	// the window was never open at factor 1, so the write is LATE rather than
+	// early and the repayment diagnosis is dead -- which is free information
+	// worth a card round on its own, and completely invisible without this.
+	//
+	// Read the MEAN, catchup-host divided by catchup, in ARM cycles against
+	// the grid= denominator: near one C64 cycle says the repaid lag came from
+	// the handler's own physical accesses; near six says a slice-boundary
+	// rasterLine() landed inside the window, which is the recorded dissent and
+	// points at a different fix. declined= counts deficits above the 8-cycle
+	// cap that were refused rather than spun out; a large declined with a
+	// small catchup means the cap is in the wrong place, not that the
+	// mechanism is absent.
+	scpuLineText( dst, capacity, length, " catchup=" );
+	scpuLineDecimal64( dst, capacity, length,
+	                   superCPU.memory().m_VSPCatchupEvents );
+	scpuLineText( dst, capacity, length, " catchup-host=" );
+	scpuLineDecimal64( dst, capacity, length,
+	                   superCPU.memory().m_VSPCatchupHost );
+	scpuLineText( dst, capacity, length, " catchup-declined=" );
+	scpuLineDecimal64( dst, capacity, length,
+	                   superCPU.memory().m_VSPCatchupDeclined );
+	// d011shadow=<served>/<declined> (K500): $D011 reads served from the
+	// shadow with no transfer, and reads inside the window the anchor could
+	// not vouch for. 0/0 with the key on means the window never opened.
+	scpuLineText( dst, capacity, length, " d011shadow=" );
+	scpuLineDecimal64( dst, capacity, length,
+	                   superCPU.memory().m_VSPD011ShadowReads );
+	scpuLineChar( dst, capacity, length, '/' );
+	scpuLineDecimal64( dst, capacity, length,
+	                   superCPU.memory().m_VSPD011ShadowDeclined );
+	// irqhist= / anchist= (K503): run-wide, first $D011 write after each
+	// anchor read. irqhist buckets are whole cycles of IRQ->write from -5 to
+	// +5 relative to the first sample (irqbase=, host cycles); anchist buckets
+	// are the anchor's low byte -3..+3 relative to the first (ancbase=). With
+	// a working absorber, irqhist has two adjacent populations and anchist
+	// two adjacent values; any count elsewhere is an unabsorbed frame.
+	// Absolute (K504): irqhist=<cycles>:<count>,... for the non-zero whole-cycle
+	// buckets of IRQ->first placed $D011 write (0..127), then anchist=
+	// <anchor byte>:<count>,... A working absorber shows two adjacent cycle
+	// buckets of similar size and two adjacent anchor bytes; anything else is
+	// an unabsorbed frame.
+	scpuLineText( dst, capacity, length, " irqhist=" );
+	{
+		bool first = true;
+		for ( u32 i = 0; i < 128; i++ )
+		{
+			const u32 n = superCPU.memory().m_VSPHistIrq[ i ];
+			if ( !n ) continue;
+			if ( !first ) scpuLineChar( dst, capacity, length, ',' );
+			first = false;
+			scpuLineDecimal( dst, capacity, length, i );
+			scpuLineChar( dst, capacity, length, ':' );
+			scpuLineDecimal64( dst, capacity, length, n );
+		}
+	}
+	scpuLineText( dst, capacity, length, " irqhist-128plus=" );
+	scpuLineDecimal64( dst, capacity, length,
+	                   superCPU.memory().m_VSPHistIrqOther );
+	scpuLineText( dst, capacity, length, " anchist=" );
+	{
+		bool first = true;
+		for ( u32 i = 0; i < 256; i++ )
+		{
+			const u32 n = superCPU.memory().m_VSPHistAnchor[ i ];
+			if ( !n ) continue;
+			if ( !first ) scpuLineChar( dst, capacity, length, ',' );
+			first = false;
+			scpuLineDecimal( dst, capacity, length, i );
+			scpuLineChar( dst, capacity, length, ':' );
+			scpuLineDecimal64( dst, capacity, length, n );
+		}
+	}
+	// Mirror opportunities skipped because the guest was inside a cycle-counted
+	// raster window. This is the did-it-fire readout for the raster-critical
+	// guard, and it is the FIRST thing to read if the screen does not change:
+	// zero means the window was never recognised and the guard is inert, which
+	// is a different failure from the guard firing and not helping.
+	scpuLineText( dst, capacity, length, " rdefer=" );
+	scpuLineDecimal64( dst, capacity, length, superCPU.m_RasterDeferred );
+	scpuLineText( dst, capacity, length, "\r\n" );
+
+	// THE DISTRIBUTION, on its own line so nothing that parses the line above
+	// has to change. 16 bins of 5 C64 cycles, 0-4 first, 75+ last. Read this
+	// instead of cycles/events: a sprite steal is 2-3 (bin 0), eight sprites
+	// are 3+2N=19 (bin 3) and a badline is 43 (bin 8), so K456's 31.6 mean
+	// describes no event that ever happened. Bin 15 holds the tail censored by
+	// RAD_BA_STALL_CEILING -- compare it with capped= above before dividing
+	// anything by anything.
+	scpuLineText( dst, capacity, length, "bastall-hist5:" );
+	for ( u32 bin = 0; bin < 16; bin++ )
+	{
+		scpuLineChar( dst, capacity, length, bin ? ',' : ' ' );
+		scpuLineDecimal( dst, capacity, length,
+		                 superCPU.memory().m_BAStallHist[ bin ] );
+	}
+	scpuLineText( dst, capacity, length, "\r\n" );
+
+	// ARMED TIME AGAINST TRANSACTION TIME, which iec-skipped above could only
+	// imply. All three are emulated-cycle counts over the same run, so each
+	// divides by bastall slow-cycles + bastall cycles to give its armed
+	// FRACTION -- and they are not disjoint: poll and hold can both be armed.
+	//   hold=   the 100ms speed hold. This is the one measured at 98% during
+	//           Mario gameplay with no drive access, and the only one of the
+	//           three that can be armed by a static level.
+	//   poll=   the 1000-cycle top-up, counted only where it forces the rate.
+	//   txn=    the 2ms EDGE window. This is TRANSACTION time: with no drive in
+	//           the conversation it should be near zero, and hold/txn is the
+	//           over-arm ratio stated directly.
+	// arms are the events, by the evidence that caused them. read-refused is
+	// what mode 0 WOULD have armed on and this mode did not, so a run with
+	// read-refused large and hold small is the direct proof that the level arm
+	// was the over-arm. latch/ddra are printed because an over-arm capture is
+	// only actionable with the CIA2 output state that produced it: bit 4 or 5
+	// set there means the guest was pulling CLK or DATA down itself.
+	scpuLineText( dst, capacity, length, "iecwin: mode=" );
+	scpuLineDecimal( dst, capacity, length,
+	                 (int)superCPU.memory().m_IECWindowMode );
+	scpuLineText( dst, capacity, length, " hold=" );
+	scpuLineDecimal64( dst, capacity, length,
+	                   superCPU.memory().m_IECHoldArmedCycles );
+	scpuLineText( dst, capacity, length, " poll=" );
+	scpuLineDecimal64( dst, capacity, length,
+	                   superCPU.memory().m_IECPollArmedCycles );
+	scpuLineText( dst, capacity, length, " txn=" );
+	scpuLineDecimal64( dst, capacity, length,
+	                   superCPU.memory().m_IECActivityArmedCycles );
+	scpuLineText( dst, capacity, length, " arms: edge=" );
+	scpuLineDecimal64( dst, capacity, length,
+	                   superCPU.memory().m_IECArmReadEdge );
+	scpuLineText( dst, capacity, length, " level=" );
+	scpuLineDecimal64( dst, capacity, length,
+	                   superCPU.memory().m_IECArmReadLevel );
+	scpuLineText( dst, capacity, length, " read-refused=" );
+	scpuLineDecimal64( dst, capacity, length,
+	                   superCPU.memory().m_IECArmReadRefused );
+	scpuLineText( dst, capacity, length, " write=" );
+	scpuLineDecimal64( dst, capacity, length,
+	                   superCPU.memory().m_IECArmWrite );
+	scpuLineText( dst, capacity, length, " write-refused=" );
+	scpuLineDecimal64( dst, capacity, length,
+	                   superCPU.memory().m_IECArmWriteRefused );
+	scpuLineText( dst, capacity, length, " poll-arms=" );
+	scpuLineDecimal64( dst, capacity, length,
+	                   superCPU.memory().m_IECPollArms );
+	scpuLineText( dst, capacity, length, " latch=" );
+	scpuLineHexByte( dst, capacity, length,
+	                 superCPU.memory().cia2PortALatch() );
+	scpuLineText( dst, capacity, length, " ddra=" );
+	scpuLineHexByte( dst, capacity, length, superCPU.memory().cia2DDRA() );
+	scpuLineText( dst, capacity, length, "\r\n" );
+}
+
+// The CPU post-mortem was previously formatted only into s_Logger by
+// scpuEmitResetDiagnostic(), which the LEFT-button path never calls and whose
+// output the reboot destroys anyway.  S after a hang is the single most
+// diagnostic byte in the machine, so it has to reach the card.
+// One printer for both rings. The live ring and the progress detector's SUSPECT
+// copy are the same structure and must format identically, or a reader comparing
+// the transition against the steady state has to normalise two layouts by hand.
+// target= is the handler this interrupt ENTERED: with Mario re-pointing $FFFE
+// three times a frame, the entry PC alone cannot say which rung ran.
+static void scpuAppendOneInterruptRing(
+	char *dst, u32 capacity, u32 &length, const char *tag,
+	const CW65C816::W65InterruptEntry *entries, u32 head )
+{
+	const u32 ring = CW65C816::W65_INT_RING;
+	const u32 n = head < ring ? head : ring;
+	for ( u32 i = 0; i < n; i++ )
+	{
+		const CW65C816::W65InterruptEntry &e = entries[ ( head - n + i ) % ring ];
+		scpuLineText( dst, capacity, length, "  " );
+		scpuLineText( dst, capacity, length, tag );
+		scpuLineChar( dst, capacity, length, ' ' );
+		scpuLineDecimal( dst, capacity, length, i );
+		scpuLineText( dst, capacity, length,
+		              e.nmi ? " NMI pc=$" : " IRQ pc=$" );
+		scpuLineHexU32( dst, capacity, length, e.pc );
+		scpuLineText( dst, capacity, length, " ->$" );
+		scpuLineHexByte( dst, capacity, length, (u8)( e.target >> 8 ) );
+		scpuLineHexByte( dst, capacity, length, (u8)( e.target & 0xFF ) );
+		scpuLineText( dst, capacity, length, " s=$" );
+		scpuLineHexByte( dst, capacity, length, (u8)( e.s >> 8 ) );
+		scpuLineHexByte( dst, capacity, length, (u8)( e.s & 0xFF ) );
+		scpuLineText( dst, capacity, length, " p=$" );
+		scpuLineHexByte( dst, capacity, length, e.p );
+		scpuLineText( dst, capacity, length, " cyc=" );
+		scpuLineDecimal( dst, capacity, length, e.cycles );
+		// WHY this interrupt happened, as far as it can be seen from inside.
+		// cmp= is OUR decode of the armed compare and ras= is the guest's own
+		// last physical $D012 read with its age in WHOLE C64 CYCLES -- not the
+		// hundredths dprev= and stall= print in the VSP trace below. An entry
+		// whose ras= is nowhere near its cmp= was not let in by the compare
+		// this field names.
+		scpuLineText( dst, capacity, length, " cmp=" );
+		scpuLineDecimal( dst, capacity, length, e.compare );
+		scpuLineText( dst, capacity, length, " mask=$" );
+		scpuLineHexByte( dst, capacity, length, e.d01a );
+		scpuLineText( dst, capacity, length, " ras=" );
+		if ( e.iflags & SCPU_IRQCTX_RASTER_VALID )
+		{
+			scpuLineDecimal( dst, capacity, length, e.raster );
+			scpuLineChar( dst, capacity, length, '@' );
+			if ( e.rasterAge4 == 0xFF )
+				scpuLineText( dst, capacity, length, "--" );
+			else
+				scpuLineDecimal( dst, capacity, length,
+				                 (u32)e.rasterAge4 * 4 );
+			scpuLineChar( dst, capacity, length, 'c' );
+		}
+		else
+			scpuLineText( dst, capacity, length, "--" );
+		// L sampled level, F freshly sampled at this boundary, A an ack since
+		// the previous entry left /IRQ low immediately, K it was still low at
+		// the next control event, R the raster anchor is valid, X the armed
+		// compare cannot be reached on this machine, C the asserted line was
+		// carried in from an earlier sample rather than found at this
+		// boundary -- see SCPU_IRQCTX_LINE_CARRIED for how L, F and C are
+		// read together.
+		scpuLineText( dst, capacity, length, " i=" );
+		{
+			static const char letters[ 7 ] =
+				{ 'L', 'F', 'A', 'K', 'R', 'X', 'C' };
+			for ( u32 b = 0; b < 7; b++ )
+				scpuLineChar( dst, capacity, length,
+				              ( e.iflags & ( 1u << b ) ) ? letters[ b ] : '-' );
+		}
+		scpuLineText( dst, capacity, length, "\r\n" );
+	}
+}
+
+// --- the interrupt-control write ring ---------------------------------------
+// ONE LINE PER WRITE to $D012, $D019, $D01A or a raster-bit-8 $D011, newest
+// last, with the writer's PC and a cycle stamp in the same clock domain the
+// interrupt ring above stamps -- so "which rung armed this compare" is a join
+// on cyc= and not a guess.
+//
+// HOW TO READ IT, and this is the whole point of the capture:
+//   cmp= is OUR composition. val=/other= are the bytes that reached the chip.
+//   Recompose ( other & $80 ? 256 : 0 ) | low-half and check it against cmp=
+//   before believing either. A '!' on cmp= marks a compare this machine cannot
+//   reach, which is where K471's 318 would appear.
+//   gras= is the guest's own last physical $D012 read; pras= is the physical
+//   $D012 read d011RasterHighBit() already makes when a guest $D011 read comes
+//   back claiming bit 8. BOTH ages are WHOLE C64 CYCLES. "--" is no
+//   observation, not a small one.
+//   irq=BAL: the cached /IRQ level Before the write, the pin sampled After it
+//   (only ever taken on $D019, '-' elsewhere), and the cached level at the
+//   next control event, Late, with lateh= the host cycles to that sample.
+//   A $D019 line reading irq=1 1 1 is a plain store that did not clear the
+//   source -- and that reproduces the short entry gap and the nesting with
+//   every compare in this ring perfectly correct.
+static void scpuAppendOneIntCtlRing(
+	char *dst, u32 capacity, u32 &length, const char *tag,
+	const VICIntCtlWrite *entries, u32 head, u32 limit )
+{
+	const u32 retained = head < SCPU_ICTL_RING ? head : SCPU_ICTL_RING;
+	const u32 n = retained < limit ? retained : limit;
+	for ( u32 i = 0; i < n; i++ )
+	{
+		const VICIntCtlWrite &e =
+			entries[ ( head - n + i ) & ( SCPU_ICTL_RING - 1 ) ];
+		scpuLineText( dst, capacity, length, "  " );
+		scpuLineText( dst, capacity, length, tag );
+		scpuLineChar( dst, capacity, length, ' ' );
+		scpuLineDecimal( dst, capacity, length, head - n + i );
+		scpuLineText( dst, capacity, length, " w$D0" );
+		scpuLineHexByte( dst, capacity, length, e.reg );
+		scpuLineText( dst, capacity, length, "=$" );
+		scpuLineHexByte( dst, capacity, length, e.value );
+		scpuLineText( dst, capacity, length, " prev=$" );
+		scpuLineHexByte( dst, capacity, length, e.prev );
+		scpuLineText( dst, capacity, length, " other=$" );
+		scpuLineHexByte( dst, capacity, length, e.other );
+		scpuLineText( dst, capacity, length, " cmp=" );
+		scpuLineDecimal( dst, capacity, length, e.compare );
+		if ( e.flags & SCPU_ICTL_COMPARE_IMPOSSIBLE )
+			scpuLineChar( dst, capacity, length, '!' );
+		scpuLineText( dst, capacity, length, " mask=$" );
+		scpuLineHexByte( dst, capacity, length, e.d01a );
+		scpuLineText( dst, capacity, length, " by=$" );
+		scpuLineHexU32( dst, capacity, length, e.pc );
+		scpuLineText( dst, capacity, length, " cyc=" );
+		scpuLineDecimal( dst, capacity, length, e.cycles );
+		scpuLineText( dst, capacity, length, " gras=" );
+		if ( ( e.flags & SCPU_ICTL_GRASTER_VALID ) && e.grasterAge != 0xFFFF )
+		{
+			scpuLineDecimal( dst, capacity, length, e.graster );
+			scpuLineChar( dst, capacity, length, '@' );
+			scpuLineDecimal( dst, capacity, length, e.grasterAge );
+			scpuLineChar( dst, capacity, length, 'c' );
+		}
+		else
+			scpuLineText( dst, capacity, length, "--" );
+		scpuLineText( dst, capacity, length, " pras=" );
+		if ( ( e.flags & SCPU_ICTL_PRASTER_VALID ) && e.prasterAge != 0xFFFF )
+		{
+			scpuLineDecimal( dst, capacity, length, e.praster );
+			scpuLineChar( dst, capacity, length, '@' );
+			scpuLineDecimal( dst, capacity, length, e.prasterAge );
+			scpuLineChar( dst, capacity, length, 'c' );
+		}
+		else
+			scpuLineText( dst, capacity, length, "--" );
+		scpuLineText( dst, capacity, length, " irq=" );
+		scpuLineChar( dst, capacity, length,
+		              ( e.flags & SCPU_ICTL_IRQ_BEFORE ) ? '1' : '0' );
+		scpuLineChar( dst, capacity, length,
+		              !( e.flags & SCPU_ICTL_IRQ_AFTER_VALID ) ? '-'
+		              : ( e.flags & SCPU_ICTL_IRQ_AFTER ) ? '1' : '0' );
+		scpuLineChar( dst, capacity, length,
+		              !( e.flags & SCPU_ICTL_IRQ_LATE_VALID ) ? '-'
+		              : ( e.flags & SCPU_ICTL_IRQ_LATE ) ? '1' : '0' );
+		scpuLineText( dst, capacity, length, " lateh=" );
+		if ( e.lateHost != 0xFFFF )
+			scpuLineDecimal( dst, capacity, length, e.lateHost );
+		else
+			scpuLineText( dst, capacity, length, "--" );
+		scpuLineText( dst, capacity, length, "\r\n" );
+	}
+}
+
+static void scpuAppendIntCtlDiag( char *dst, u32 capacity, u32 &length )
+{
+	const SCPUResetDiagnostic &d = s_ResetDiagnostic;
+	// THE COUNTERS FIRST, because they are the cheap answer to the leading
+	// structural suspect and they are meaningful even if both rings lapped.
+	// ack-held counts acknowledgements after which the physical /IRQ pin was
+	// STILL asserted; late= counts those still asserted at the next control
+	// event, well past any pull-up propagation. acks= against the irqs= on the
+	// post-mortem line above is the count test CODEX asked for: one plain-store
+	// ack per interrupt entry is the healthy shape.
+	scpuLineText( dst, capacity, length, "  ictl: acks=" );
+	scpuLineDecimal( dst, capacity, length, d.d019Writes );
+	scpuLineText( dst, capacity, length, " ack-held=" );
+	scpuLineDecimal( dst, capacity, length, d.d019AckHeld );
+	scpuLineText( dst, capacity, length, " ack-held-late=" );
+	scpuLineDecimal( dst, capacity, length, d.d019AckHeldLate );
+	scpuLineText( dst, capacity, length, " writes=" );
+	scpuLineDecimal( dst, capacity, length, d.ictlHead );
+	scpuLineText( dst, capacity, length, " latch=" );
+	// 1 = the first impossible compare, which is this hang's measured
+	// signature and locks the copy. 2 = a progress-detector SUSPECT episode,
+	// which knows nothing about rasters and is re-copied every episode.
+	scpuLineDecimal( dst, capacity, length, d.ictlFrozenReason );
+	scpuLineText( dst, capacity, length, " at-cyc=" );
+	scpuLineDecimal( dst, capacity, length, d.ictlFrozenCycles );
+	scpuLineText( dst, capacity, length, " ages=C64cyc\r\n" );
+	if ( d.ictlFrozenReason )
+		scpuAppendOneIntCtlRing( dst, capacity, length, "ictlF",
+		                         d.ictlFrozen, d.ictlFrozenHead,
+		                         SCPU_ICTL_RING );
+	// The live tail as well: the latched copy holds the failure, this holds
+	// what the machine is doing now, and the entry the latch caught last has
+	// no late sample in the frozen copy but does have one here.
+	scpuAppendOneIntCtlRing( dst, capacity, length, "ictl",
+	                         d.ictl, d.ictlHead, 48 );
+
+	// --- the CIA conversation, newest last ---------------------------------
+	// ON THE CARD, which is new: this ring was already captured but only ever
+	// printed to the logger, where the reboot destroys it and the LEFT-button
+	// path never looks.
+	//
+	// IT IS HERE BECAUSE IT IS THE ONLY NON-DESTRUCTIVE CIA EVIDENCE WE HAVE,
+	// and the limit it describes is as important as the data. $DC0D and $DD0D
+	// CLEAR ON READ, so nothing in this firmware may sample CIA interrupt
+	// status for observation -- doing so would destroy the state the guest's
+	// own handler is about to act on. What this block therefore carries is:
+	// every CIA WRITE (w), including the $DC0D mask writes that say whether a
+	// CIA interrupt was ever enabled, and every CIA READ (r) the GUEST itself
+	// made, with the value it got -- edge-compressed, so a polling loop shows
+	// once per change. If the guest reads $DC0D in its handler, that value IS
+	// the CIA's interrupt status at that moment and it cost us nothing. If it
+	// does not, a VIC raster IRQ and a CIA IRQ are indistinguishable to this
+	// firmware on the shared open-collector /IRQ line, and the next instrument
+	// is a scope on /IRQ rather than more code.
+	scpuLineText( dst, capacity, length, "  cia (w=write r=guest read, "
+	              "newest last, reads edge-compressed):\r\n    " );
+	for ( u32 i = 32; i < 64; i++ )
+	{
+		const u32 e = d.cia[ i ];
+		if ( !e ) continue;
+		scpuLineChar( dst, capacity, length, ( e >> 24 ) ? 'w' : 'r' );
+		scpuLineChar( dst, capacity, length, '$' );
+		scpuLineHexByte( dst, capacity, length, (u8)( ( e >> 8 ) & 0xFF ) );
+		scpuLineHexByte( dst, capacity, length, (u8)( e & 0xFF ) );
+		scpuLineChar( dst, capacity, length, '=' );
+		scpuLineHexByte( dst, capacity, length, (u8)( ( e >> 16 ) & 0xFF ) );
+		scpuLineChar( dst, capacity, length, ' ' );
+		if ( i == 47 )
+			scpuLineText( dst, capacity, length, "\r\n    " );
+	}
+	scpuLineText( dst, capacity, length, "\r\n" );
+}
+
+static void scpuAppendInterruptRingDiag( char *dst, u32 capacity, u32 &length )
+{
+	const SCPUResetDiagnostic &d = s_ResetDiagnostic;
+	if ( !d.haveCore )
+	{
+		scpuLineText( dst, capacity, length,
+		              "post-mortem: no core snapshot available\r\n" );
+		return;
+	}
+	scpuLineText( dst, capacity, length, "post-mortem: PC=$" );
+	scpuLineHexU32( dst, capacity, length, d.pc );
+	scpuLineText( dst, capacity, length, " S=$" );
+	scpuLineHexByte( dst, capacity, length, (u8)( d.sp >> 8 ) );
+	scpuLineHexByte( dst, capacity, length, (u8)( d.sp & 0xFF ) );
+	scpuLineText( dst, capacity, length, " P=$" );
+	scpuLineHexByte( dst, capacity, length, d.p );
+	scpuLineText( dst, capacity, length, " I=" );
+	scpuLineDecimal( dst, capacity, length, ( d.p & W65_I ) ? 1 : 0 );
+	scpuLineText( dst, capacity, length, " E=" );
+	scpuLineDecimal( dst, capacity, length, d.e );
+	scpuLineText( dst, capacity, length, " irqs=" );
+	scpuLineDecimal( dst, capacity, length, d.irqsTaken );
+	scpuLineText( dst, capacity, length, " nmis=" );
+	scpuLineDecimal( dst, capacity, length, d.nmisTaken );
+	scpuLineText( dst, capacity, length, " line-irq=" );
+	scpuLineDecimal( dst, capacity, length, d.liveIRQ ? 1 : 0 );
+	// now-cyc and frozen-at-cyc are the same counter (cpu()->cycles() is
+	// m_Cycles, which is what the ring stamps). A freeze whose stamp is far
+	// behind now-cyc happened during loading, not at the hang, and that run is
+	// void rather than a confirmation.
+	scpuLineText( dst, capacity, length, "\r\n  now-cyc=" );
+	scpuLineDecimal64( dst, capacity, length, d.cycles );
+	scpuLineText( dst, capacity, length, " stack-anomalies=" );
+	scpuLineDecimal( dst, capacity, length, d.stackAnomalies );
+	scpuLineText( dst, capacity, length, " ring-frozen=" );
+	scpuLineDecimal( dst, capacity, length, d.intRingFrozen );
+	scpuLineText( dst, capacity, length, " frozen-at-cyc=" );
+	scpuLineDecimal( dst, capacity, length, d.intRingFrozenCycles );
+	scpuLineText( dst, capacity, length, "\r\n  vectors: FFFA=$" );
+	scpuLineHexByte( dst, capacity, length, d.vectors[ 1 ] );
+	scpuLineHexByte( dst, capacity, length, d.vectors[ 0 ] );
+	scpuLineText( dst, capacity, length, " FFFC=$" );
+	scpuLineHexByte( dst, capacity, length, d.vectors[ 3 ] );
+	scpuLineHexByte( dst, capacity, length, d.vectors[ 2 ] );
+	scpuLineText( dst, capacity, length, " FFFE=$" );
+	scpuLineHexByte( dst, capacity, length, d.vectors[ 5 ] );
+	scpuLineHexByte( dst, capacity, length, d.vectors[ 4 ] );
+	scpuLineText( dst, capacity, length, " 0314=$" );
+	scpuLineHexByte( dst, capacity, length, d.softVectors[ 1 ] );
+	scpuLineHexByte( dst, capacity, length, d.softVectors[ 0 ] );
+	scpuLineText( dst, capacity, length, "\r\n  stack: " );
+	for ( u32 i = 0; i < 16; i++ )
+	{
+		scpuLineHexByte( dst, capacity, length, d.stack[ i ] );
+		scpuLineChar( dst, capacity, length, ' ' );
+	}
+	if ( d.haveCode )
+	{
+		scpuLineText( dst, capacity, length, "\r\n  code@PC-4: " );
+		for ( u32 i = 0; i < 16; i++ )
+		{
+			scpuLineHexByte( dst, capacity, length, d.code[ i ] );
+			scpuLineChar( dst, capacity, length, ' ' );
+		}
+	}
+	scpuLineText( dst, capacity, length, "\r\n" );
+
+	// --- the hypothesis-free detector's own verdict -----------------------
+	// Printed whether or not it tripped, and that is deliberate: the 2026-10-12
+	// run reported stack-anomalies=0 on a visibly hung machine, and a silent
+	// instrument is indistinguishable from a working one unless it says what it
+	// measured. epochs/stall-max say how close it came even when it did not
+	// fire, which is the number that calibrates the confirm threshold.
+	scpuLineText( dst, capacity, length, "  progress: confirmed=" );
+	scpuLineDecimal( dst, capacity, length, d.progConfirmed );
+	scpuLineText( dst, capacity, length, " suspects=" );
+	scpuLineDecimal( dst, capacity, length, d.progSuspects );
+	scpuLineText( dst, capacity, length, " epochs=" );
+	scpuLineDecimal( dst, capacity, length, d.progEpochs );
+	scpuLineText( dst, capacity, length, " stall-max=" );
+	scpuLineDecimal( dst, capacity, length, d.progStallEpochsMax );
+	scpuLineText( dst, capacity, length, " suspect-cyc=" );
+	scpuLineDecimal( dst, capacity, length, d.progSuspectCycles );
+	scpuLineText( dst, capacity, length, " confirm-cyc=" );
+	scpuLineDecimal( dst, capacity, length, d.progConfirmCycles );
+	scpuLineText( dst, capacity, length, " cells=" );
+	scpuLineDecimal( dst, capacity, length, d.progCellCount );
+	scpuLineText( dst, capacity, length, " pc=$" );
+	scpuLineHexByte( dst, capacity, length, (u8)( d.progPC >> 8 ) );
+	scpuLineHexByte( dst, capacity, length, (u8)( d.progPC & 0xFF ) );
+	if ( d.progConfirmed && d.progCellCount )
+	{
+		// EVERY 16-byte code cell the machine was still executing in the
+		// stalled epoch. This is the whole hang, stated as a set of addresses,
+		// with no theory about why. Capped at W65_PROG_CELL_REPORT; cells=
+		// above is the untruncated count.
+		scpuLineText( dst, capacity, length, "\r\n  live code cells:" );
+		const u32 shown = d.progCellCount < CW65C816::W65_PROG_CELL_REPORT
+		                ? d.progCellCount : CW65C816::W65_PROG_CELL_REPORT;
+		for ( u32 i = 0; i < shown; i++ )
+		{
+			const u32 addr = (u32)d.progCells[ i ] << 4;
+			scpuLineText( dst, capacity, length, " $" );
+			scpuLineHexByte( dst, capacity, length, (u8)( addr >> 8 ) );
+			scpuLineHexByte( dst, capacity, length, (u8)( addr & 0xFF ) );
+		}
+	}
+	scpuLineText( dst, capacity, length, "\r\n" );
+
+	// --- the watched RAM bytes -------------------------------------------
+	// (a) never written, (b) written the same value, (c) written correctly and
+	// read from somewhere else. The three readings are: an empty or stale ring
+	// with a large now-cyc gap; writes=high with changes=0; and via-ram
+	// disagreeing with via-map.
+	scpuLineText( dst, capacity, length, "  ram-watch: $" );
+	scpuLineHexU32( dst, capacity, length, d.watchAddr[ 0 ] );
+	scpuLineText( dst, capacity, length, " $" );
+	scpuLineHexU32( dst, capacity, length, d.watchAddr[ 1 ] );
+	scpuLineText( dst, capacity, length, " writes=" );
+	scpuLineDecimal( dst, capacity, length, d.watchWrites );
+	scpuLineText( dst, capacity, length, " changes=" );
+	scpuLineDecimal( dst, capacity, length, d.watchChanges );
+	scpuLineText( dst, capacity, length, "\r\n  phase 9F88: via-ram=$" );
+	scpuLineHexByte( dst, capacity, length, d.phaseViaRAM );
+	scpuLineText( dst, capacity, length, " via-map=$" );
+	scpuLineHexByte( dst, capacity, length, d.phaseViaMap );
+	scpuLineText( dst, capacity, length, " 9F87=$" );
+	scpuLineHexByte( dst, capacity, length, d.phaseShadow );
+	scpuLineText( dst, capacity, length, "\r\n" );
+	{
+		const u32 wring = CC64Memory::SCPU_WATCH_RING;
+		const u32 wn = d.watchPos < wring ? d.watchPos : wring;
+		for ( u32 i = 0; i < wn; i++ )
+		{
+			const CC64Memory::WatchedWrite &w =
+				d.watchRing[ ( d.watchPos - wn + i ) % wring ];
+			scpuLineText( dst, capacity, length, "  wr " );
+			scpuLineDecimal( dst, capacity, length, i );
+			scpuLineText( dst, capacity, length, " $" );
+			scpuLineHexByte( dst, capacity, length, (u8)( w.addr >> 8 ) );
+			scpuLineHexByte( dst, capacity, length, (u8)( w.addr & 0xFF ) );
+			scpuLineText( dst, capacity, length, " <- $" );
+			scpuLineHexByte( dst, capacity, length, w.value );
+			scpuLineText( dst, capacity, length, " was=$" );
+			scpuLineHexByte( dst, capacity, length, w.old );
+			// PC points just PAST the writing instruction: $09B0 STY $9F88
+			// records $09B3, because the operand bytes are already fetched.
+			scpuLineText( dst, capacity, length, " by=$" );
+			scpuLineHexU32( dst, capacity, length, w.pc );
+			scpuLineText( dst, capacity, length, " cyc=" );
+			scpuLineDecimal( dst, capacity, length, w.cycles );
+			scpuLineText( dst, capacity, length, "\r\n" );
+		}
+	}
+
+	// --- raster state the chain is waiting on -----------------------------
+	// A chain parked on one rung forever is either not being reached or waiting
+	// for a compare that cannot match. raster-compare is the line the guest
+	// last programmed; the $D012 reads are what it actually saw, with ages in
+	// the same clock the ring stamps.
+	scpuLineText( dst, capacity, length, "  raster-compare=" );
+	scpuLineDecimal( dst, capacity, length, d.rasterCompare );
+	scpuLineText( dst, capacity, length, " d012-reads=" );
+	scpuLineDecimal( dst, capacity, length, d.d012ReadCount );
+	scpuLineText( dst, capacity, length, " last:" );
+	{
+		const u32 dring = CC64Memory::SCPU_D012_RING;
+		const u32 dn = d.d012ReadPos < dring ? d.d012ReadPos : dring;
+		for ( u32 i = 0; i < dn; i++ )
+		{
+			const u32 idx = ( d.d012ReadPos - dn + i ) % dring;
+			scpuLineText( dst, capacity, length, " " );
+			scpuLineDecimal( dst, capacity, length, d.d012Reads[ idx ] );
+			scpuLineText( dst, capacity, length, "@" );
+			scpuLineDecimal( dst, capacity, length, d.d012ReadCyc[ idx ] );
+		}
+	}
+	// RST8, the one bit that parked the chain. READ THESE AS A SET:
+	//   rst8-writes>0           a read-modify-write still put raster bit 8 in
+	//                           the latch -- the fix did not hold.
+	//   samples>0 rejected=0    the physical samples were COHERENT, so the beam
+	//                           really was in 256..262 when the guest read
+	//                           $D011, and the remaining defect is that the
+	//                           access happened there at all. rejlow is then
+	//                           meaningless and low= is the line's low byte.
+	//   rejected>0              the bit did not come from the raster: rejlow is
+	//                           the confirming $D012, and low|256 was not a
+	//                           line this machine has.
+	// impossible-compare and anchor-refused are the two downstream guards; both
+	// should stay 0 once rst8-writes does.
+	scpuLineText( dst, capacity, length, "\r\n  rst8: samples=" );
+	scpuLineDecimal( dst, capacity, length, d.rst8Samples );
+	scpuLineText( dst, capacity, length, " rejected=" );
+	scpuLineDecimal( dst, capacity, length, d.rst8Rejected );
+	scpuLineText( dst, capacity, length, " low=" );
+	scpuLineDecimal( dst, capacity, length, d.rst8LastLow );
+	scpuLineText( dst, capacity, length, " rejlow=" );
+	scpuLineDecimal( dst, capacity, length, d.rst8LastRejLow );
+	scpuLineText( dst, capacity, length, " writes=" );
+	scpuLineDecimal( dst, capacity, length, d.rst8Writes );
+	scpuLineText( dst, capacity, length, " impossible-compare=" );
+	scpuLineDecimal( dst, capacity, length, d.compareImpossible );
+	scpuLineText( dst, capacity, length, " anchor-refused=" );
+	scpuLineDecimal( dst, capacity, length, d.anchorRefused );
+
+	// Newest write to each of the four registers Mario's chain drives, pulled
+	// out of the I/O ring that was already being captured and never emitted
+	// anywhere the card could read it. Bit 24 marks a write.
+	{
+		static const u8 want[ 4 ] = { 0x11, 0x16, 0x18, 0x19 };
+		scpuLineText( dst, capacity, length, "\r\n  last VIC writes:" );
+		for ( u32 k = 0; k < 4; k++ )
+		{
+			u32 found = 0xFFFFFFFF;
+			for ( u32 back = 1; back <= 64; back++ )
+			{
+				const u32 e = d.io[ 64 - back ];
+				if ( !( e & ( 1u << 24 ) ) ) continue;
+				const u32 a = e & 0xFFFF;
+				if ( a < 0xD000 || a >= 0xD400 ) continue;
+				if ( ( a & 0x3F ) != want[ k ] ) continue;
+				found = ( e >> 16 ) & 0xFF;
+				break;
+			}
+			scpuLineText( dst, capacity, length, " D0" );
+			scpuLineHexByte( dst, capacity, length, want[ k ] );
+			scpuLineText( dst, capacity, length, "=" );
+			if ( found == 0xFFFFFFFF )
+				scpuLineText( dst, capacity, length, "--" );
+			else
+				scpuLineHexByte( dst, capacity, length, (u8)found );
+		}
+		scpuLineText( dst, capacity, length, "\r\n" );
+	}
+
+	scpuAppendIntCtlDiag( dst, capacity, length );
+
+	scpuAppendOneInterruptRing( dst, capacity, length, "int",
+	                            d.intRing, d.intRingHead );
+	// The transition, which the live ring above cannot also hold: 64 entries is
+	// about five frames and the confirm is 8.4s later.
+	if ( d.progConfirmed )
+		scpuAppendOneInterruptRing( dst, capacity, length, "sus",
+		                            d.intRingSuspect, d.intRingSuspectHead );
+}
+
 static bool scpuSaveRuntimeBusDiag( const SCPURuntimeResult &runtime )
 {
-	static char haltBusDiag[ 32768 ];
+	// Raised from 65536: the post-mortem now carries a second 64-entry ring, a
+	// 32-entry watched-write ring and the live-cell list, about 7K more.
+	// scpuLineChar truncates the TAIL, which is the newest and most
+	// interesting end of every one of those blocks.
+	// Raised from 81920: the interrupt-control ring adds a latched 128-entry
+	// block and a 48-entry live tail at ~130 characters, about 23K.
+	static char haltBusDiag[ 131072 ];
 	u32 size =
 		radBus.formatSelfTestResults( haltBusDiag, sizeof haltBusDiag );
 	if ( !size ) return false;
 	scpuAppendRuntimeBusDiag( haltBusDiag, sizeof haltBusDiag, size, runtime );
 	scpuAppendPiThrottledDiag( haltBusDiag, sizeof haltBusDiag, size );
 	scpuAppendRuntimePiDiag( haltBusDiag, sizeof haltBusDiag, size );
-	return size && writeFile( s_Logger, SCPU_DRIVE, SCPU_BUS_DIAG_FILE,
-	                          (u8 *)haltBusDiag, size );
+	scpuAppendPacerDiag( haltBusDiag, sizeof haltBusDiag, size );
+	scpuAppendInterruptRingDiag( haltBusDiag, sizeof haltBusDiag, size );
+	scpuAppendVSPTraceDiag( haltBusDiag, sizeof haltBusDiag, size );
+	const bool busDiagSaved = size
+	                       && writeFile( s_Logger, SCPU_DRIVE,
+	                                     SCPU_BUS_DIAG_FILE,
+	                                     (u8 *)haltBusDiag, size );
+
+	// The cold-start self-test rewrites busdiag-e18.txt on every Pi boot. Keep
+	// the runtime VSP capture in its own file so the convenient RAD/Pi reboot
+	// button cannot successfully save the trace and then immediately erase it.
+	// Do not touch an older trace when no runtime snapshot exists.
+	bool vspTraceSaved = true;
+	if ( s_ResetDiagnostic.vspValid )
+	{
+		// Already too small before this change: 128 retained events at ~217
+		// characters is 27.8K, plus ~6.2K of matrix block and the header, so
+		// this buffer has been silently losing events. scpuLineChar truncates
+		// the TAIL -- the newest and most interesting end of the ring.
+		// Raised from 49152: the comment above already records that 128 events
+		// at ~217 characters plus the matrix block overran it, and the
+		// post-mortem block below adds ~5.5K in front of the trace (64 ring
+		// lines at ~72 characters plus the fixed dumps).
+		// Raised from 90112 for the same ~7K of new post-mortem blocks.
+		// Raised from 106496 for the same ~23K of interrupt-control ring.
+		static char vspDiag[ 131072 ];
+		u32 vspSize = 0;
+		scpuLineText( vspDiag, sizeof vspDiag, vspSize,
+		              "SCPU-EMU passive VSP timing trace\r\n" );
+		scpuAppendPacerDiag( vspDiag, sizeof vspDiag, vspSize );
+		scpuAppendInterruptRingDiag( vspDiag, sizeof vspDiag, vspSize );
+		scpuAppendVSPTraceDiag( vspDiag, sizeof vspDiag, vspSize );
+		vspTraceSaved = vspSize
+		              && writeFile( s_Logger, SCPU_DRIVE,
+		                            SCPU_VSP_TRACE_FILE,
+		                            (u8 *)vspDiag, vspSize );
+	}
+	return busDiagSaved && vspTraceSaved;
 }
 
 // Shared scratch for the three C64 images, safe to reuse because CC64Memory
@@ -1555,6 +3234,11 @@ static char scpuScreenChar( u8 c )
 	return '?';
 }
 
+// Defined below. The benchmark inside the dump now waits a serial transaction
+// out with the same helper its caller uses, instead of abandoning the
+// measurement the moment one starts.
+static bool scpuWaitForDiagnosticWindow( CSuperCPU &scpu );
+
 // Report what the emulator believes the screen contains, straight out of shadow
 // RAM. This separates two very different faults that look identical on the C64:
 // a CPU core that is running wrong, versus a core that is running correctly
@@ -1596,24 +3280,76 @@ static void scpuDumpEmulatedScreen( CLogger *logger, CSuperCPU &scpu )
 	// machine silently runs slower than it claims and everything time-based
 	// drifts. This is the number that says whether that is happening.
 	{
-		const u64 c0 = scpu.cpu()->cycles();
-		const u64 h0 = radBus.hostCycles();
-		const u64 io0 = scpu.memory().m_IOReads + scpu.memory().m_IOWrites;
-		const u64 mir0 = scpu.writeBuffer().m_BytesFlushed;
-		const u64 wait0 = scpu.memory().m_PacerWaitHostCycles;
-		const u64 slow0 = scpu.memory().m_SlowPacedCycles;
-		const u64 iec0 = scpu.memory().m_IECThrottledCycles;
+		u64 c0 = 0, h0 = 0, io0 = 0, mir0 = 0;
+		u64 wait0 = 0, late0 = 0, probe0 = 0, lateHost0 = 0;
+		u64 slow0 = 0, iec0 = 0;
+		const u32 benchResetGeneration = s_HardwareResetGeneration;
 
-		// A transaction can begin during the benchmark. Abort before producing
-		// any more synchronous log output and return to the free-running loop.
-		for ( u32 i = 0; i < 60; i++ )
+		// A transaction can begin during the benchmark, and nothing may be
+		// logged while one is in progress. This used to RETURN when that
+		// happened, which is why the verdict below never printed on a machine
+		// whose SuperCPU DOS keeps probing drives: one serial edge anywhere in
+		// sixty frames discarded the whole measurement, silently. The guard is
+		// untouched and still consulted at the same two points per frame; only
+		// the response changed -- wait the transaction out with the caller's
+		// own quiet-window helper, re-baseline, try again, and finally report a
+		// SHORTER span rather than nothing.
+		//
+		// Retry only while the span is still too short to report: a later
+		// attempt can end WORSE than an earlier one, and re-baselining means
+		// the deltas belong to the last attempt alone, so a usable span must
+		// never be thrown away for the chance of a longer one.
+		static const u32 BENCH_FRAMES = 60;
+		static const u32 BENCH_ATTEMPTS = 3;
+		static const u32 BENCH_FRAMES_MIN = 10;
+		u32 frames = 0;
+		for ( u32 attempt = 0; attempt < BENCH_ATTEMPTS; attempt++ )
 		{
-			if ( scpu.memory().iecBusActive() )
-				return;
-			if ( scpuRunFrameAndCheckButtons( scpu ) )
-				return;
-			if ( scpu.memory().iecBusActive() )
-				return;
+			c0 = scpu.cpu()->cycles();
+			h0 = radBus.hostCycles();
+			io0 = scpu.memory().m_IOReads + scpu.memory().m_IOWrites;
+			mir0 = scpu.writeBuffer().m_BytesFlushed;
+			wait0 = scpu.memory().m_PacerWaitHostCycles;
+			late0 = scpu.memory().m_PacerLateEntries;
+			probe0 = scpu.memory().m_PacerLateProbes;
+			lateHost0 = scpu.memory().m_PacerLateSnapHostCycles;
+			slow0 = scpu.memory().m_SlowPacedCycles;
+			iec0 = scpu.memory().m_IECThrottledCycles;
+
+			frames = 0;
+			while ( frames < BENCH_FRAMES )
+			{
+				if ( scpu.memory().iecBusActive() )
+					break;
+				if ( scpuRunFrameAndCheckButtons( scpu ) )
+					return;
+				if ( scpu.memory().iecBusActive() )
+					break;
+				frames++;
+			}
+			if ( frames >= BENCH_FRAMES_MIN )
+				break;
+
+			// Never wait after the LAST attempt: its partial span is about to
+			// be reported, and frames run now would land inside the measured
+			// host interval without being counted in it.
+			if ( attempt + 1 < BENCH_ATTEMPTS
+			     && !scpuWaitForDiagnosticWindow( scpu ) )
+				break;
+		}
+
+		// A reset or a reboot request during those attempts zeroed the very
+		// counters the baselines were read from, so the deltas below would be
+		// nonsense rather than merely imprecise.
+		if ( s_RebootRequested
+		     || s_HardwareResetGeneration != benchResetGeneration )
+			return;
+		if ( frames < BENCH_FRAMES_MIN )
+		{
+			logger->Write( "SCPU", LogNotice,
+			               "speed: not measured -- the serial bus was never quiet for %u frames",
+			               (unsigned)BENCH_FRAMES_MIN );
+			return;
 		}
 
 		const u64 dc  = scpu.cpu()->cycles() - c0;
@@ -1621,6 +3357,10 @@ static void scpuDumpEmulatedScreen( CLogger *logger, CSuperCPU &scpu )
 		const u64 dio = ( scpu.memory().m_IOReads + scpu.memory().m_IOWrites ) - io0;
 		const u64 dmir = scpu.writeBuffer().m_BytesFlushed - mir0;
 		const u64 dwait = scpu.memory().m_PacerWaitHostCycles - wait0;
+		const u64 dlate = scpu.memory().m_PacerLateEntries - late0;
+		const u64 dprobe = scpu.memory().m_PacerLateProbes - probe0;
+		const u64 dlateHost =
+			scpu.memory().m_PacerLateSnapHostCycles - lateHost0;
 		const u64 dslow = scpu.memory().m_SlowPacedCycles - slow0;
 		const u64 diec = scpu.memory().m_IECThrottledCycles - iec0;
 		const u64 dfast = dc > dslow ? dc - dslow : 0;
@@ -1630,8 +3370,8 @@ static void scpuDumpEmulatedScreen( CLogger *logger, CSuperCPU &scpu )
 		                       + dslow * ( SCPU_ARM_CLOCK_HZ / SCPU_NORMAL_HZ );
 
 		logger->Write( "SCPU", LogNotice,
-		               "speed: aggregate %u kHz, schedule %llu%% (%s)",
-		               (unsigned)achievedKHz,
+		               "speed: aggregate %u kHz over %u frames, schedule %llu%% (%s)",
+		               (unsigned)achievedKHz, (unsigned)frames,
 		               (unsigned long long)( dh ? ( expectedHost * 100 ) / dh : 0 ),
 		               ( expectedHost * 100 >= dh * 90 )
 		                   ? "keeping up" : "FALLING BEHIND -- timing will drift" );
@@ -1659,6 +3399,17 @@ static void scpuDumpEmulatedScreen( CLogger *logger, CSuperCPU &scpu )
 		               "  pacer waited %llu arm cycles; excluding waits: %llu arm/emucycle",
 		               (unsigned long long)dwait,
 		               (unsigned long long)( dc && dh > dwait ? ( dh - dwait ) / dc : 0 ) );
+		// The premise the +10-cycle VSP arithmetic rests on, finally measured.
+		// Counted only while the guest selected 1MHz, so this will read zero at
+		// a turbo prompt by construction -- it is Mario's regime that matters,
+		// and the SD files carry the same totals for a run that cannot be
+		// watched on the console.
+		logger->Write( "SCPU", LogNotice,
+		               "  pacer late at 1MHz %llu times, %llu probed, +%llu arm cycles (%llu arm per probe)",
+		               (unsigned long long)dlate,
+		               (unsigned long long)dprobe,
+		               (unsigned long long)dlateHost,
+		               (unsigned long long)( dprobe ? dlateHost / dprobe : 0 ) );
 		if ( superCPU.benchArmPerEmuCycle() )
 		{
 			logger->Write( "SCPU", LogNotice,
@@ -1695,7 +3446,13 @@ static void scpuDumpEmulatedScreen( CLogger *logger, CSuperCPU &scpu )
 // a bounded interval if the machine is still probing or loading from a drive.
 static bool scpuWaitForDiagnosticWindow( CSuperCPU &scpu )
 {
-	static const u32 MAX_WAIT_FRAMES = 180;
+	// 180 frames (three seconds) was not enough on a machine whose SuperCPU
+	// DOS probes drives through the whole boot: the window never opened and
+	// every diagnostic behind it was skipped in silence. Seven seconds costs
+	// nothing measurable -- this runs once, before the permanent run loop, and
+	// only ever advances ordinary frames -- and the quiet requirement itself is
+	// deliberately unchanged, so nothing is ever logged into a live transaction.
+	static const u32 MAX_WAIT_FRAMES = 420;
 	static const u32 QUIET_FRAMES_REQUIRED = 3;
 	u32 quietFrames = 0;
 
@@ -1724,6 +3481,7 @@ void scpuBootRun( CLogger *logger )
 	                    s_PiThrottledStartup );
 	scpuLogPiARMClock( logger, "at startup", s_PiARMClockStartupValid,
 	                   s_PiARMClockStartup );
+	scpuLogMeasuredCycleCounter( logger );
 
 	// One ACT-LED blink per milestone, so there is a signal even with no
 	// monitor attached. The Pi's own error codes are all >= 3 flashes, so a
@@ -1794,8 +3552,32 @@ void scpuBootRun( CLogger *logger )
 	// chooses which KERNAL to install. A later $D0B5 POKE remains in effect until
 	// the Pi is rebooted and this configuration is read again.
 	superCPU.registers().setJiffyDOSSwitch( cfgJiffyDOS != 0 );
-	// K425 bisect: the VSP aim wiring is suspended with the bias encoding.
-	(void)cfgVSPAimRead; (void)cfgVSPAimWrite;
+	// VSP PLACEMENT CALIBRATION, re-wired. The K425 bisect suspended this
+	// along with the bias-8 aim encoding and the discard was never undone,
+	// so scpu.cfg has carried VSP_AIM_READ / VSP_AIM_WRITE -- parsed,
+	// range-checked, documented as the way to measure the machine's
+	// placement constant -- into a (void) ever since. The bias encoding is
+	// long gone (the aim point is the plain K420 decode again), so the
+	// reason for the suspension no longer holds, and the knob is the only
+	// instrument here that reads placement off the VIC's own c-access
+	// counter instead of off a software anchor whose in-line position is
+	// unknown. Both default to 0, so a machine that does not set them in
+	// scpu.cfg is bit-identical to before.
+	// APPLIED AFTER init(), NOT HERE. superCPU.cpu() is NULL at this point --
+	// CSuperCPU's constructor sets m_CPU to 0 (supercpu.cpp:386) and only
+	// init() selects m_CPU = &m_Core65816 (supercpu.cpp:563), which happens
+	// roughly 170 lines below. The guard therefore skipped the call on every
+	// boot and the aim stayed at its default zero in every build that has ever
+	// shipped, while the log line that used to sit here printed the CONFIG
+	// values OUTSIDE the guard -- so the boot log reported "write +6" for a
+	// setting that was never applied, and three hardware sweeps (+2, +4, +6)
+	// were all no-ops read as results. Confirmed in the compiled image, not
+	// just the source: in the preserved kernel8.lst the null check branches
+	// past the indirect call.
+	//
+	// The lesson that belongs next to the code rather than in a log file: a
+	// configuration value that is PARSED is not a value that is APPLIED, and
+	// logging the parsed one proves nothing. See the readback after init().
 	// A deliberate $D0BA knock may request runtime VIC/HDMI selection, but only
 	// when this boot actually creates the passive HDMI renderer. Track the live
 	// handoff flag so its unlocked read reports completed hardware state.
@@ -1897,6 +3679,23 @@ void scpuBootRun( CLogger *logger )
 	superCPU.setVectorReroute( cfgVectorReroute != 0 );
 	superCPU.setIOStretch( cfgIOStretch != 0 );
 	superCPU.setMirrorStretch( cfgMirrorStretch != 0 );
+	// The VIC freezing the emulated CPU on a badline. Mode 0 is the K451
+	// behaviour, in which Mario's IRQ stabiliser sled cannot absorb a steal
+	// and the machine eventually hangs at $0849 with S destroyed.
+	superCPU.setBAStall( (u32)cfgBAStall, (u32)cfgBAStallMax );
+	// How much evidence a CIA2 access needs before it counts as serial traffic.
+	// Mode 0 is the legacy predicate measured at 98% armed during Mario
+	// gameplay with no drive access at all.
+	superCPU.setIECWindow( (u32)cfgIECWindow );
+	// Forward progress, not any particular register: the hang detector that is
+	// NOT derived from the hypothesis it tests. See the W65_PROG_ block in
+	// Source/CPU/W65C816/w65c816.h.
+	superCPU.setHangWatch( cfgHangWatch != 0 );
+	// 0 disarms a slot, and the memory layer's sentinel is 0x10000, so a
+	// disarmed slot must be translated and not passed through: passing 0 would
+	// watch $0000 and put the notify call on every zero-page write.
+	superCPU.setRAMWatch( cfgRAMWatch ? (u32)cfgRAMWatch : 0x10000u,
+	                      cfgRAMWatch2 ? (u32)cfgRAMWatch2 : 0x10000u );
 	logger->Write( "SCPU", LogNotice,
 	               "nmi retime: %s, native defer: %s, vector reroute: %s",
 	               cfgNMIRetime ? "on" : "off",
@@ -1906,6 +3705,27 @@ void scpuBootRun( CLogger *logger )
 	               "access cost: io=%s mirror=%s",
 	               cfgIOStretch ? "on" : "off",
 	               cfgMirrorStretch ? "on" : "off" );
+	// A separate line, not a third field in the one above: that format is
+	// quoted verbatim in CHT and a changed shape breaks every grep against an
+	// archived run.
+	logger->Write( "SCPU", LogNotice,
+	               "ba stall: mode=%d max=%d cycles (1MHz only)",
+	               cfgBAStall, cfgBAStallMax );
+	logger->Write( "SCPU", LogNotice, "iec window: mode=%d", cfgIECWindow );
+	logger->Write( "SCPU", LogNotice,
+	               "hang watch: %s, ram watch: $%04X $%04X",
+	               cfgHangWatch ? "on" : "off",
+	               (unsigned)cfgRAMWatch, (unsigned)cfgRAMWatch2 );
+	// DIAG_MINIMAL keeps every instrument on the line above and drops the K449
+	// per-stage bus timers: two ~40-instruction accumulator bodies riding on a
+	// transfer whose measured unstalled floor is 639 ARM, paid on every physical
+	// access the guest makes -- and invisible to the TI benchmark, whose loop
+	// never leaves Pi RAM. bastall-r/w stays live in both modes.
+	radBusStageTimingEnabled = ( cfgDiagMinimal == 0 );
+	logger->Write( "SCPU", LogNotice,
+	               "diag minimal: %s (busstage timers %s)",
+	               cfgDiagMinimal ? "on" : "off",
+	               radBusStageTimingEnabled ? "on" : "off" );
 
 	// From superCPU.init() onward the Pi owns and accesses the C64 bus in
 	// sub-microsecond GPIO windows. Circle's timer/SD IRQs may pre-empt at any
@@ -1939,6 +3759,21 @@ void scpuBootRun( CLogger *logger )
 		scpuWaitForButtonThenReboot();
 	}
 
+	// THE VSP PLACEMENT CALIBRATION, applied where the core actually exists.
+	// init() has selected m_CPU above, and no guest instruction has run yet, so
+	// this is the first moment the setting can take effect and the last moment
+	// before it would matter. Unconditional: there is no pointer to guard.
+	superCPU.cpu()->setPreciseAim( cfgVSPAimRead, cfgVSPAimWrite );
+	// K498: the write aim is applied by CC64Memory at the catch-up launch of a
+	// placed VIC write, not by the core's settle trim. Same moment, same rule.
+	superCPU.memory().setVSPAimWrite( cfgVSPAimWrite );
+	// K500: the gated shadow-served $D011 read, same moment, same rule.
+	superCPU.memory().setVSPD011ShadowRead( cfgVSPD011ShadowRead != 0 );
+	// K502: the write lead, quarter cycles, same moment, same rule.
+	superCPU.cpu()->setWriteLead( cfgVSPWriteLead );
+	superCPU.memory().setVSPPlacementK501( cfgVSPPlacementK501 != 0 );	// K505 bisect key
+	superCPU.memory().setVSPTraceWindowOnly( cfgVSPTraceWindowOnly != 0 );	// K506 trace filter
+
 	actLED.Blink( 3 );		// milestone: bus acquired
 
 	// Interrupts stay masked from init() to the end of the run loop. Each
@@ -1948,6 +3783,29 @@ void scpuBootRun( CLogger *logger )
 	// exactly the exposure the bisect proved fatal.
 	{
 	CScopedLoggingIRQs startupIRQs;
+
+	// READBACK, not a repeat of the config. These numbers come from the running
+	// core, so a mismatch against scpu.cfg is visible instead of silent -- which
+	// is exactly how the previous version hid a dead control for three hardware
+	// sweeps. Printed whenever EITHER the request or the applied value is
+	// nonzero, so "requested 6, applied 0" cannot go unreported.
+	{
+		const int aimR = superCPU.cpu()->preciseAimRead();
+		const int aimW = superCPU.memory().vspAimWrite();	// K498: applied there, read back from there
+		if ( aimR || aimW || cfgVSPAimRead || cfgVSPAimWrite )
+			logger->Write( "SCPU", LogNotice,
+			               "VSP aim APPLIED: read %+d write %+d "
+			               "(scpu.cfg requested %+d/%+d) -- CALIBRATION, "
+			               "not a normal setting",
+			               aimR, aimW, cfgVSPAimRead, cfgVSPAimWrite );
+		if ( cfgVSPD011ShadowRead )
+			logger->Write( "SCPU", LogNotice,
+			               "VSP $D011 shadow read: ON (raster window only, "
+			               "RST8 proven 0 by the anchor) -- K500" );
+		logger->Write( "SCPU", LogNotice,
+		               "VSP write lead APPLIED: %d quarter cycles (scpu.cfg %d) -- K502",
+		               superCPU.cpu()->writeLeadQuarters(), cfgVSPWriteLead );
+	}
 
 	// The pure-interpreter figure, no bus and no scheduler: 70 means 20MHz.
 	if ( superCPU.benchArmPerEmuCycle() )
@@ -1973,6 +3831,30 @@ void scpuBootRun( CLogger *logger )
 	}
 
 	const C64Signals &sig = radBus.signals();
+	s_DetectedVideo = sig.video;
+	s_DetectedVideoValid = true;
+	// Cross-check the PHI2 period the pacer is already using. setPacing()
+	// derives it from sig.video so the grid is reproducible between boots;
+	// radWaitForMachineRunning() measured the same quantity on the live
+	// machine before takeover, and they agreed to 19ppm on an NTSC C64
+	// (CHT 1024). A percent-scale disagreement means the standard is
+	// mis-detected or arm_freq is not 1400MHz, and every paced cycle is wrong
+	// by that amount -- so warn rather than print two numbers and leave the
+	// comparison to whoever reads the log.
+	{
+		const u64 rate1k   = radLastMeasuredMachineRate();
+		const u32 assumed  = c64CpuHz( sig.video );
+		const u32 measured = rate1k
+		                   ? (u32)( 1000ULL * SCPU_ARM_CLOCK_HZ / rate1k ) : 0;
+		const u32 delta    = measured > assumed
+		                   ? ( measured - assumed ) : ( assumed - measured );
+		logger->Write( "SCPU",
+		               ( measured && delta * 100u <= assumed )
+		                   ? LogNotice : LogWarning,
+		               "PHI2: %s %u Hz assumed, %u Hz measured",
+		               sig.video == VIDEO_PAL ? "PAL" : "NTSC",
+		               (unsigned)assumed, (unsigned)measured );
+	}
 	if ( s_HDMIDisplay )
 		s_HDMIDisplay->setVideoTiming( c64CyclesPerLine( sig.video ),
 		                               c64RasterLines( sig.video ),

@@ -137,6 +137,290 @@ struct TimedHostBus : CHostBus
 	u32 hostCyclesPerSec() override { return rate; }
 };
 
+// A scripted BA pin. The RAD backend waits the steal out and reports the
+// cycles; here the test says how long the VIC held the bus and counts how
+// often it was asked, which is the only way to prove the 1MHz gate from the
+// host side -- "was the pin even sampled" is a different claim from "were
+// cycles charged".
+struct StallHostBus : TimedHostBus
+{
+	// THE HOST CLOCK'S RESOLUTION IS LOAD-BEARING HERE, not just its rate.
+	// TimedHostBus::hostCycles() returns now++, so at the inherited 1:1 rate
+	// every clock READ costs a whole emulated cycle -- and the pacer arms these
+	// tests exist to tell apart are one cycle wide, so the fixture can return a
+	// verdict on how often the code under test looks at the clock. MEASURED, on
+	// this tree: adding one more hostCycles() read to baStallSettle, between the
+	// spin's return and `m_BAStallCycles += stolen`, flips
+	// bastall_hands_the_pacer_the_time_the_spin_already_spent to FAIL on
+	// m_PacerCreditEntries with the arithmetic it checks completely unchanged.
+	// That is how this was found: the release stamp added to baStallSettle in
+	// this same change is exactly that one extra read, and without the line
+	// below the suite goes 806626/1. The Pi runs 1368 ARM cycles per C64
+	// cycle, so model that ratio: every claim below is unchanged and now has
+	// 1368x the margin.
+	//
+	// REBUILD FROM SCRATCH BEFORE BELIEVING EITHER VERDICT HERE. A one-read
+	// sensitivity is also a one-stale-object sensitivity: an incremental make
+	// over a copied build tree reported this suite green with the old
+	// c64_memory.o linked in, which is the opposite answer.
+	enum { PER_C64 = 1368 };
+
+	u32 steal = 0;
+	u32 asked = 0;
+
+	StallHostBus() { rate = 1000000u * PER_C64; }
+
+	u32 busStealCycles( u32 maxCycles ) override
+	{
+		asked++;
+		u32 s = steal;
+		if ( s > maxCycles ) s = maxCycles;
+		// A real stall also consumes the real time it reports.
+		now += (u64)s * PER_C64;
+		return s;
+	}
+};
+
+TEST( bastall_charges_the_guest_at_1mhz_and_forces_a_fresh_interrupt_sample )
+{
+	StallHostBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.m_BAStallMode = 1;
+	mem.m_BAStallMaxCycles = 80;
+	mem.setPacing( bus.rate, SCPU_NORMAL_HZ );
+
+	// Nothing held the bus: no charge, and the sample costs one pin read.
+	const u64 before = mem.m_EmuCycles;
+	mem.tickFast( 2 );
+	CHECK_EQ( bus.asked, 1u );
+	CHECK_EQ( mem.m_EmuCycles - before, (u64)2 );
+	CHECK_EQ( mem.m_BAStallEvents, (u64)0 );
+
+	// A badline-length steal is charged to the guest's clock in full, on top
+	// of the instruction's own cycles. 43 is BA low at cycle 12 through the
+	// last c-access at 54.
+	bus.steal = 43;
+	const u64 mid = mem.m_EmuCycles;
+	const u64 c64Before = mem.emuNow();
+	mem.m_IntCredit = 0;
+	mem.tickFast( 2 );
+	CHECK_EQ( mem.m_EmuCycles - mid, (u64)45 );
+	CHECK_EQ( mem.m_BAStallEvents, (u64)1 );
+	CHECK_EQ( mem.m_BAStallCycles, (u64)43 );
+	// The C64-domain clock moves with it: the gate implies factor == 1, so the
+	// freeze is visible one-for-one to everything that counts time.
+	CHECK_EQ( mem.emuNow() - c64Before, (u64)45 );
+	// And the first instruction after the release must re-sample the lines.
+	CHECK( mem.m_IntCredit >= 0x100 );
+}
+
+// THE PACER MUST NOT BILL THE SPIN TWICE. busStealCycles() has already spent
+// the real time, so the settle that follows must land on the on-time arm and
+// not on the late/credit/clamp arm -- which is where the VSP hold is decided.
+// Delete the m_PacingAnchor advance in baStallSettle to watch this fail.
+TEST( bastall_hands_the_pacer_the_time_the_spin_already_spent )
+{
+	StallHostBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.m_BAStallMode = 2;
+	mem.m_BAStallMaxCycles = 80;
+	mem.setPacing( bus.rate, SCPU_NORMAL_HZ );
+	bus.steal = 43;
+
+	mem.tickFast( 2 );
+	CHECK_EQ( mem.m_BAStallEvents, (u64)1 );
+	const u64 creditBefore = mem.m_PacerCreditEntries;
+	const u64 clampBefore  = mem.m_PacerClampEntries;
+	bus.steal = 0;
+	mem.tickFast( 2 );
+	CHECK_EQ( mem.m_PacerCreditEntries, creditBefore );
+	CHECK_EQ( mem.m_PacerClampEntries, clampBefore );
+}
+
+// THE INSTRUMENT, not the mechanism. K456 left a hold error of +3 to +4 cycles
+// against hold = 59 - DECcycle, and UNIFORM across the sweep -- so the slope
+// the invariant asks for is already right and what is left is one constant.
+// The arithmetic cannot say where that constant lives: the error is
+// (INC_true - 59) + the bias in a cycle-in-line that is reconstructed from the
+// guest's last $D012 read. These three records are what separate them: the
+// LENGTH distribution of the steals, the host instant of the RELEASE, and
+// which class of steal that release came from.
+TEST( bastall_records_the_steal_distribution_and_the_release_instant )
+{
+	StallHostBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.m_BAStallMode = 2;
+	mem.m_BAStallMaxCycles = 80;
+	mem.setPacing( bus.rate, SCPU_NORMAL_HZ );
+
+	// A badline and a sprite steal are DIFFERENT populations; their mean is
+	// 22.5 and describes neither, which is the error that has already wrecked
+	// three conclusions in this project.
+	bus.steal = 43;
+	mem.tickFast( 2 );
+	CHECK_EQ( (u32)mem.m_BAStallLastReleaseLen, 43u );
+	bus.steal = 2;
+	mem.tickFast( 2 );
+	CHECK_EQ( mem.m_BAStallEvents, (u64)2 );
+	CHECK_EQ( mem.m_BAStallHist[ 8 ], 1u );
+	CHECK_EQ( mem.m_BAStallHist[ 0 ], 1u );
+	// And the sprite steal has REPLACED the badline as the reference, which is
+	// exactly the confound SCPU_VSP_RELEASE_BADLINE exists to make visible.
+	CHECK_EQ( (u32)mem.m_BAStallLastReleaseLen, 2u );
+
+	// The stamp has to be taken AFTER the spin consumed the time it reported,
+	// or it is not the release: 45 cycles have been spent by now.
+	CHECK( mem.m_BAStallLastReleaseHost >= (u64)45 * StallHostBus::PER_C64 );
+
+	// The censored tail is its own bin, so capped= can be compared with it
+	// instead of being averaged into everything else.
+	bus.steal = 80;
+	mem.tickFast( 2 );
+	CHECK_EQ( mem.m_BAStallHist[ 15 ], 1u );
+}
+
+TEST( bastall_is_never_sampled_in_turbo )
+{
+	StallHostBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.m_BAStallMode = 2;
+	bus.steal = 43;
+	mem.setPacing( bus.rate, SCPU_TURBO_HZ );
+
+	// Several settles' worth at 20MHz. The accelerator runs from its own SRAM
+	// there and BA is irrelevant to it; the hot path must not even look.
+	for ( u32 i = 0; i < 64; i++ )
+		mem.tickFast( 8 );
+	CHECK_EQ( bus.asked, 0u );
+	CHECK_EQ( mem.m_BAStallEvents, (u64)0 );
+	CHECK_EQ( mem.m_BAStallCycles, (u64)0 );
+}
+
+TEST( bastall_mode_0_is_the_k451_path_exactly )
+{
+	StallHostBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.m_BAStallMode = 0;
+	bus.steal = 43;
+	mem.setPacing( bus.rate, SCPU_NORMAL_HZ );
+
+	for ( u32 i = 0; i < 16; i++ )
+		mem.tickFast( 2 );
+	CHECK_EQ( bus.asked, 0u );
+	CHECK_EQ( mem.m_BAStallEvents, (u64)0 );
+}
+
+TEST( bastall_mode_1_declines_inside_a_serial_transaction )
+{
+	StallHostBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.m_BAStallMode = 1;
+	bus.steal = 43;
+	mem.setPacing( bus.rate, SCPU_NORMAL_HZ );
+
+	// An IEC line change arms the transaction window.
+	mem.write8( 0xDD00, 0x08 );
+	CHECK( mem.iecBusActive() );
+	const u32 askedBefore = bus.asked;
+	mem.tickFast( 2 );
+	CHECK_EQ( bus.asked, askedBefore );
+	CHECK_EQ( mem.m_BAStallEvents, (u64)0 );
+	CHECK( mem.m_BAStallSuppressedIEC > 0 );
+
+	// Mode 2 is the faithful setting and stalls there too.
+	mem.m_BAStallMode = 2;
+	mem.tickFast( 2 );
+	CHECK_EQ( mem.m_BAStallEvents, (u64)1 );
+	CHECK_EQ( mem.m_BAStallCycles, (u64)43 );
+}
+
+TEST( bastall_charge_is_bounded_by_the_configured_ceiling )
+{
+	StallHostBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.m_BAStallMode = 2;
+	mem.m_BAStallMaxCycles = 80;
+	bus.steal = 4000;			// a BA that never came back
+	mem.setPacing( bus.rate, SCPU_NORMAL_HZ );
+
+	mem.tickFast( 2 );
+	CHECK_EQ( mem.m_BAStallCycles, (u64)80 );
+}
+
+// The setter is where the bound is enforced for every caller, so test it there
+// and not only through the config parser. 80 and not 128: anything above 80 is
+// unreachable past RAD_BA_STALL_CEILING, so the setter must not promise it.
+TEST( bastall_setter_clamps_mode_and_ceiling )
+{
+	CSuperCPU cpu;
+	cpu.setBAStall( 9, 4000 );
+	CHECK_EQ( (u32)cpu.memory().m_BAStallMode, 2u );
+	CHECK_EQ( (u32)cpu.memory().m_BAStallMaxCycles, 80u );
+	cpu.setBAStall( 0, 1 );
+	CHECK_EQ( (u32)cpu.memory().m_BAStallMode, 0u );
+	CHECK_EQ( (u32)cpu.memory().m_BAStallMaxCycles, 8u );
+}
+
+TEST( hostbus_badline_model_matches_the_published_rule )
+{
+	CHostBus bus;				// the MODEL, not the scripted pin above
+	static u64 cycle;
+	cycle = 0;
+	bus.setRasterClock( []( void *ctx ) -> u64 { (void)ctx; return cycle; }, 0 );
+	const u32 perLine = c64CyclesPerLine( bus.m_Signals.video );
+
+	// DEN set, YSCROLL = 6. Line 54 is then a badline ( 54 & 7 == 6 ).
+	bus.m_Memory[ 0xD011 ] = (u8)( 0x10 | 6 );
+
+	// Bauer 3.6.3: BA falls at cycle 12 and the last stolen cycle is 54, so a
+	// CPU frozen at cycle 14 resumes at 55 -- 41 cycles -- and Mario's INC,
+	// five cycles later, completes at 59.
+	cycle = (u64)54 * perLine + 13;			// cycle-in-line 14, 1-based
+	CHECK_EQ( bus.busStealCycles( 80 ), 41u );
+	cycle = (u64)54 * perLine + 29;			// cycle 30
+	CHECK_EQ( bus.busStealCycles( 80 ), 25u );
+	cycle = (u64)54 * perLine + 49;			// cycle 50
+	CHECK_EQ( bus.busStealCycles( 80 ), 5u );
+	cycle = (u64)54 * perLine + 52;			// cycle 53
+	CHECK_EQ( bus.busStealCycles( 80 ), 2u );
+
+	// Before BA falls and after the last c-access there is no steal at all.
+	cycle = (u64)54 * perLine + 10;			// cycle 11
+	CHECK_EQ( bus.busStealCycles( 80 ), 0u );
+	cycle = (u64)54 * perLine + 54;			// cycle 55
+	CHECK_EQ( bus.busStealCycles( 80 ), 0u );
+
+	// The model obeys its own caller's bound.
+	cycle = (u64)54 * perLine + 13;
+	CHECK_EQ( bus.busStealCycles( 10 ), 10u );
+
+	// Not a badline line: YSCROLL no longer matches.
+	cycle = (u64)55 * perLine + 13;
+	CHECK_EQ( bus.busStealCycles( 80 ), 0u );
+
+	// Outside the display window, and with DEN clear, there are no badlines --
+	// which is exactly why a loader that blanks the screen keeps full speed.
+	cycle = (u64)0x2E * perLine + 13;
+	CHECK_EQ( bus.busStealCycles( 80 ), 0u );
+	bus.m_Memory[ 0xD011 ] = 6;
+	cycle = (u64)54 * perLine + 13;
+	CHECK_EQ( bus.busStealCycles( 80 ), 0u );
+
+	// And a backend with no cycle source, which cannot place a cycle inside a
+	// line, must answer 0 rather than invent a steal -- that is what keeps
+	// every other IC64Bus unchanged.
+	CHostBus noClock;
+	noClock.m_Memory[ 0xD011 ] = (u8)( 0x10 | 6 );
+	CHECK_EQ( noClock.busStealCycles( 80 ), 0u );
+}
+
 TEST( integration_reset_vector_comes_from_shadowed_kernal )
 {
 	SystemFixture f;
@@ -1121,6 +1405,159 @@ TEST( integration_cia2_held_receive_line_refreshes_activity )
 	CHECK( f.mem.iecBusActive() );
 }
 
+// The 98% over-arm, reproduced and then refused. CIA2 PA3-PA5 drive inverting
+// open collectors onto a wired-AND bus, so a latch bit the guest leaves set
+// pulls its line low and the direct input reads that same low back. Measured
+// on hardware at K456: during Mario gameplay with no drive access at all, the
+// old predicate kept the 100ms hold armed 98% of the time.
+TEST( integration_a_line_the_guest_pulls_down_is_not_a_drive_answering )
+{
+	SystemFixture f;
+	f.start();
+
+	// PA0-PA5 outputs with CLK OUT (bit 4) set: the guest is pulling CLK low
+	// itself. $17 is the value a real capture of this state showed.
+	f.mem.write8( 0xDD02, 0x3F );
+	f.mem.write8( 0xDD00, 0x17 );
+	// CLK IN low -- our own pull-down looped back -- DATA IN released high.
+	f.bus.m_Memory[ 0xDD00 ] = 0x97;
+	CHECK_EQ( f.mem.read8( 0xDD00 ), 0x97 );
+	for ( u32 i = 0; i < 110000; i++ ) f.mem.tickFast( 1 );
+	CHECK( !f.mem.iecThrottleActive() );
+	CHECK( !f.mem.iecBusActive() );
+
+	// One $DD00 read per frame, which a VIC-bank switch alone would do, for
+	// ten frames. Nothing may arm the transaction window or the 100ms hold.
+	// Baselines taken AFTER the deliberately conservative first-write arm has
+	// expired: a cold machine with no CIA2 state yet still arms once, by design.
+	const u64 events = f.mem.m_IECThrottleEvents;
+	const u64 refused0 = f.mem.m_IECArmReadRefused;
+	const u64 txn0 = f.mem.m_IECActivityArmedCycles;
+	for ( u32 frame = 0; frame < 10; frame++ )
+	{
+		CHECK_EQ( f.mem.read8( 0xDD00 ), 0x97 );
+		for ( u32 i = 0; i < 20000; i++ ) f.mem.tickFast( 1 );
+	}
+	CHECK_EQ( f.mem.m_IECThrottleEvents, events );
+	CHECK( !f.mem.iecThrottleActive() );
+	CHECK( !f.mem.iecBusActive() );
+	// Ten reads the legacy predicate would have armed on, and not one cycle of
+	// transaction time charged for them.
+	CHECK_EQ( f.mem.m_IECArmReadRefused - refused0, (u64)10 );
+	CHECK_EQ( f.mem.m_IECActivityArmedCycles - txn0, (u64)0 );
+}
+
+// The same ten reads under IEC_WINDOW 0, which is the behaviour that was
+// measured at 98% armed. This test exists so the narrowing is shown against
+// the defect rather than against nothing.
+TEST( integration_legacy_iec_window_arms_on_the_guests_own_pull_down )
+{
+	SystemFixture f;
+	f.start();
+	f.mem.m_IECWindowMode = 0;
+
+	f.mem.write8( 0xDD02, 0x3F );
+	f.mem.write8( 0xDD00, 0x17 );
+	f.bus.m_Memory[ 0xDD00 ] = 0x97;
+	CHECK_EQ( f.mem.read8( 0xDD00 ), 0x97 );
+	for ( u32 i = 0; i < 110000; i++ ) f.mem.tickFast( 1 );
+	const u64 events = f.mem.m_IECThrottleEvents;
+
+	for ( u32 frame = 0; frame < 10; frame++ )
+	{
+		CHECK_EQ( f.mem.read8( 0xDD00 ), 0x97 );
+		for ( u32 i = 0; i < 20000; i++ ) f.mem.tickFast( 1 );
+	}
+	// Every frame re-armed a 100ms hold, so the machine never came back out of
+	// it: one arm event, and the hold still live 200000 cycles later.
+	CHECK( f.mem.m_IECThrottleEvents > events );
+	CHECK( f.mem.iecThrottleActive() );
+	CHECK_EQ( f.mem.m_IECArmReadRefused, (u64)0 );
+}
+
+// What the level test exists for must survive the narrowing: a drive holding a
+// line WE released is still evidence, with no edge of its own. This is the
+// K411 Test Drive case -- DATA held low across an EOI pause.
+TEST( integration_a_drive_holding_a_line_we_released_still_arms )
+{
+	SystemFixture f;
+	f.start();
+
+	// Outputs configured, nothing asserted: PA3-PA5 all low in the latch.
+	f.mem.write8( 0xDD02, 0x3F );
+	f.mem.write8( 0xDD00, 0x07 );
+	for ( u32 i = 0; i < 110000; i++ ) f.mem.tickFast( 1 );
+	CHECK( !f.mem.iecBusActive() );
+
+	// DATA IN low with DATA OUT released is the drive, not us.
+	f.bus.m_Memory[ 0xDD00 ] = 0x40;
+	CHECK_EQ( f.mem.read8( 0xDD00 ), 0x47 );
+	CHECK( f.mem.iecBusActive() );
+	CHECK( f.mem.m_IECArmReadEdge + f.mem.m_IECArmReadLevel > 0 );
+
+	// And it keeps the window alive across repeated polls with no further edge.
+	for ( u32 i = 0; i < 1500; i++ ) f.mem.tickFast( 1 );
+	CHECK_EQ( f.mem.read8( 0xDD00 ), 0x47 );
+	for ( u32 i = 0; i < 1500; i++ ) f.mem.tickFast( 1 );
+	CHECK( f.mem.iecBusActive() );
+}
+
+// IEC_WINDOW 2: only an ATN assertion -- which every KERNAL and JiffyDOS
+// conversation opens with -- or an input edge may OPEN a window. A CLK or DATA
+// output change, which is what a VIC-bank write with stray bits looks like,
+// may only re-arm one that is open.
+TEST( integration_iec_window_mode2_needs_atn_to_open_a_transaction )
+{
+	SystemFixture f;
+	f.start();
+	f.mem.m_IECWindowMode = 2;
+
+	f.mem.write8( 0xDD02, 0x3F );
+	f.mem.write8( 0xDD00, 0x07 );
+	for ( u32 i = 0; i < 110000; i++ ) f.mem.tickFast( 1 );
+	CHECK( !f.mem.iecBusActive() );
+
+	// CLK out asserted, no ATN, no window open: refused.
+	f.mem.write8( 0xDD00, 0x17 );
+	CHECK( !f.mem.iecBusActive() );
+	CHECK_EQ( f.mem.m_IECArmWriteRefused, (u64)1 );
+
+	// ATN asserted: a transaction is unambiguously starting.
+	f.mem.write8( 0xDD00, 0x1F );
+	CHECK( f.mem.iecBusActive() );
+
+	// And while it is open, the bit-banging inside it re-arms as before.
+	const u64 arms = f.mem.m_IECArmWrite;
+	f.mem.write8( 0xDD00, 0x0F );
+	CHECK_EQ( f.mem.m_IECArmWrite, arms + 1 );
+	CHECK( f.mem.iecBusActive() );
+}
+
+// The instrumentation itself, because a ratio is only readable if both halves
+// count what their names say. The edge window is 2000 cycles and the hold is
+// 100000, which is the asymmetry that let the hold sit armed while the mirror
+// gate looked quiet.
+TEST( integration_iec_armed_time_and_transaction_time_are_counted_apart )
+{
+	SystemFixture f;
+	f.start();
+
+	f.mem.write8( 0xDD02, 0x3F );
+	f.mem.write8( 0xDD00, 0x07 );
+	for ( u32 i = 0; i < 110000; i++ ) f.mem.tickFast( 1 );
+	f.bus.m_Memory[ 0xDD00 ] = 0x40;
+	CHECK_EQ( f.mem.read8( 0xDD00 ), 0x47 );
+
+	const u64 hold0 = f.mem.m_IECHoldArmedCycles;
+	const u64 txn0 = f.mem.m_IECActivityArmedCycles;
+	for ( u32 i = 0; i < 3000; i++ ) f.mem.tickFast( 1 );
+	// Transaction time stops at the 2ms window; armed time keeps running.
+	CHECK_EQ( f.mem.m_IECActivityArmedCycles - txn0, (u64)2000 );
+	CHECK_EQ( f.mem.m_IECHoldArmedCycles - hold0, (u64)3000 );
+	CHECK( !f.mem.iecBusActive() );
+	CHECK( f.mem.iecThrottleActive() );
+}
+
 TEST( integration_dd02_direction_change_can_start_iec_activity )
 {
 	SystemFixture f;
@@ -1379,6 +1816,69 @@ TEST( integration_bulk_display_flip_never_waits_or_flushes_synchronously )
 	// owns delivery of the queued RAM bytes.
 	f.wb.flush();
 	CHECK_EQ( f.bus.m_Memory[ 0x2063 ], 0x63 );
+}
+
+TEST( integration_raster_window_protects_frame_end_and_bounds_deferral )
+{
+	struct RasterWindowBus : CHostBus
+	{
+		CSuperCPU *owner = nullptr;
+		u32 samples = 0;
+		u32 protectedSamples = 0;
+		u16 line = 100;
+		u16 rasterLine() override
+		{
+			++samples;
+			if ( owner && owner->memory().rasterCriticalWindowOpen()
+			     && owner->m_RasterDeferRun != 0 )
+				++protectedSamples;
+			return line;
+		}
+	} bus;
+	CSuperCPU scpu;
+	u8 basic[ C64_BASIC_SIZE ];
+	u8 kernal[ C64_KERNAL_SIZE ];
+	std::memset( basic, 0xEA, sizeof basic );
+	std::memset( kernal, 0xEA, sizeof kernal );
+	const u8 code[] = {
+		0xA9, 0x00,             // LDA #0
+		0x8D, 0x7A, 0xD0,       // STA $D07A: select 1MHz
+		0xAD, 0x12, 0xD0,       // LDA $D012: keep the timing window active
+		0x4C, 0x05, 0xE0        // JMP $E005
+	};
+	std::memcpy( kernal, code, sizeof code );
+	kernal[ 0x1FFC ] = 0x00;
+	kernal[ 0x1FFD ] = 0xE0;
+	scpu.setBasicROM( basic );
+	scpu.setKernalROM( kernal );
+	CHECK( scpu.init( &bus, SCPU_CORE_65816, 0 ) );
+	scpu.writeBuffer().setOptMode( SCPU_OPT_NONE );
+	scpu.setMirrorDisplayBudget( 0 );
+	for ( u32 i = 0; i < 100; ++i )
+		scpu.memory().write8( (u16)( 0x2000 + i ), (u8)i );
+	bus.owner = &scpu;
+
+	for ( u32 i = 0; i < 3; ++i )
+		scpu.runFrame();
+	CHECK( scpu.m_RasterDeferred > 0 );
+	// Continuous raster polling must still reach the bounded escape. But a
+	// protected opportunity must not be followed by an unguarded frame-end
+	// raster query, border approach, or flush.
+	CHECK( bus.samples > 0 );
+	CHECK_EQ( bus.protectedSamples, 0u );
+	CHECK_EQ( scpu.writeBuffer().pending(), 100u );
+	// The optional coarse raster logger must honor the same decision, even
+	// though it is outside the mirror-drain block.
+	scpu.memory().enableVICLog( true );
+	for ( u32 i = 0; i < 3; ++i )
+		scpu.runFrame();
+	CHECK_EQ( bus.protectedSamples, 0u );
+	// Once an allowed opportunity observes the border, continuous D012
+	// polling must not prevent actual delivery, either.
+	bus.line = c64DisplayLastLine( bus.signals().video ) + 1;
+	scpu.runFrame();
+	CHECK_EQ( scpu.writeBuffer().pending(), 0u );
+	CHECK_EQ( bus.protectedSamples, 0u );
 }
 
 TEST( integration_unknown_raster_never_authorizes_a_flush )
@@ -1801,6 +2301,177 @@ TEST( integration_d011_read_uses_shadowed_control_and_live_raster_high_bit )
 	CHECK_EQ( f.mem.read8( 0xD011 ), (u8)0xBB );
 }
 
+// A bus whose $D011 and $D012 can be made to DISAGREE. CHostBus answers both
+// from one rasterLineInternal(), so it is constitutionally coherent and cannot
+// express the sample the card captured: bit 7 set while the low byte says the
+// beam is nowhere near 256. This is the only way to drive the refusal arm.
+struct SplitRasterBus : CHostBus
+{
+	u8 d011 = 0;
+	u8 d012 = 0;
+	u32 d012Reads = 0;
+
+	u8 read( u16 addr ) override
+	{
+		// Answer every $40-byte mirror in $D000-$D1FF, not just the base
+		// address: the mirror test's whole point is that the reconstruction
+		// used to miss them, and a bus that only answered $D011 would have
+		// handed the other seven a zero and hidden the hole it is looking for.
+		if ( addr >= 0xD000 && addr < 0xD200 )
+		{
+			if ( ( addr & 0x3F ) == 0x11 ) { m_Reads++; return d011; }
+			if ( ( addr & 0x3F ) == 0x12 )
+				{ m_Reads++; d012Reads++; return d012; }
+		}
+		return CHostBus::read( addr );
+	}
+};
+
+TEST( integration_d011_bit7_refused_when_it_composes_to_no_raster_line )
+{
+	// K471's capture, reproduced exactly: $D011 reads back $97 while $D012 says
+	// 62. 256 + 62 = 318 and NTSC-R8 has 263 lines, so the sample describes a
+	// line that does not exist and bit 8 can only be 0. Before this check the
+	// $80 went into the latch through DEC/INC $D011, m_RasterCompare composed
+	// 318, and Mario's chain waited for it for ever.
+	SplitRasterBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	bus.m_Signals.video = VIDEO_NTSC_R8;
+
+	mem.write8( 0xD011, 0x17 );			// the guest's real control latch
+	bus.d011 = 0x97;
+	bus.d012 = 62;
+	bus.d012Reads = 0;
+
+	CHECK_EQ( mem.read8( 0xD011 ), (u8)0x17 );
+	CHECK_EQ( bus.d012Reads, 1u );
+	CHECK_EQ( mem.m_D011RST8Samples, 1u );
+	CHECK_EQ( mem.m_D011RST8Rejected, 1u );
+	CHECK_EQ( mem.m_D011RST8LastRejLow, (u8)62 );
+
+	// And the write-back a DEC/INC pair would make now carries no RST8, so the
+	// composed compare stays reachable.
+	mem.write8( 0xD011, (u8)( mem.read8( 0xD011 ) - 1 ) );
+	mem.write8( 0xD011, (u8)( mem.read8( 0xD011 ) + 1 ) );
+	mem.write8( 0xD012, 62 );
+	CHECK_EQ( mem.rasterCompare(), (u16)62 );
+	CHECK_EQ( mem.m_D011RST8Writes, 0u );
+	CHECK_EQ( mem.m_RasterCompareImpossible, 0u );
+}
+
+TEST( integration_d011_bit7_survives_when_the_beam_really_is_past_255 )
+{
+	// The other arm, and the one that proves this is not a mask. A guest
+	// polling $D011 for raster bit 8 must still get it: lines 256..262 exist on
+	// NTSC-R8, $D012 reads 0..6 there, and 256 + 5 = 261 is a real line.
+	SplitRasterBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	bus.m_Signals.video = VIDEO_NTSC_R8;
+
+	mem.write8( 0xD011, 0x1B );
+	bus.d011 = 0x80;
+	bus.d012 = 5;
+
+	CHECK_EQ( mem.read8( 0xD011 ), (u8)0x9B );
+	CHECK_EQ( mem.m_D011RST8Samples, 1u );
+	CHECK_EQ( mem.m_D011RST8Rejected, 0u );
+
+	// PAL has 312 lines, so a low byte that is impossible on NTSC is ordinary
+	// there. The check is the machine's line count, never a constant.
+	bus.m_Signals.video = VIDEO_PAL;
+	bus.d012 = 44;						// line 300
+	CHECK_EQ( mem.read8( 0xD011 ), (u8)0x9B );
+	CHECK_EQ( mem.m_D011RST8Rejected, 0u );
+	bus.m_Signals.video = VIDEO_NTSC_R8;
+	CHECK_EQ( mem.read8( 0xD011 ), (u8)0x1B );
+	CHECK_EQ( mem.m_D011RST8Rejected, 1u );
+}
+
+TEST( integration_d011_read_with_bit7_clear_costs_no_confirming_transfer )
+{
+	// The cost argument has to be testable, not asserted. Bit 7 clear is the
+	// overwhelming majority of $D011 reads -- 256 lines in 263 on NTSC -- and
+	// those must not pay for a second bus access.
+	SplitRasterBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	bus.m_Signals.video = VIDEO_NTSC_R8;
+
+	mem.write8( 0xD011, 0x1B );
+	bus.d011 = 0x1B;
+	bus.d012Reads = 0;
+	for ( u32 i = 0; i < 16; i++ )
+		CHECK_EQ( mem.read8( 0xD011 ), (u8)0x1B );
+	CHECK_EQ( bus.d012Reads, 0u );
+	CHECK_EQ( mem.m_D011RST8Samples, 0u );
+}
+
+TEST( integration_d011_mirrors_reconstruct_exactly_like_the_base_address )
+{
+	// VIC registers repeat every $40 bytes, and write8 has always shadowed the
+	// whole $D000-$D1FF window into m_VICRegShadow[ 0x11 ]. The read side used
+	// to test the exact address, so $D051 and its siblings handed the guest raw
+	// physical bits 6..0 -- the GEOS residue hazard, reachable through a mirror.
+	SplitRasterBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	bus.m_Signals.video = VIDEO_NTSC_R8;
+
+	mem.write8( 0xD051, 0x3B );			// a mirror write updates the shadow
+	bus.d011 = 0x7F;					// residue on the physical readback
+	bus.d012 = 62;
+	static const u16 mirrors[] =
+		{ 0xD011, 0xD051, 0xD091, 0xD0D1, 0xD111, 0xD151, 0xD191, 0xD1D1 };
+	for ( u32 i = 0; i < 8; i++ )
+		CHECK_EQ( mem.read8( mirrors[ i ] ), (u8)0x3B );
+
+	bus.d011 = 0xFF;					// now with bit 7 set and incoherent
+	for ( u32 i = 0; i < 8; i++ )
+		CHECK_EQ( mem.read8( mirrors[ i ] ), (u8)0x3B );
+	CHECK_EQ( mem.m_D011RST8Rejected, 8u );
+}
+
+TEST( integration_an_impossible_raster_compare_is_counted_and_never_anchored )
+{
+	// The two downstream guards. A guest that really does arm a line its
+	// machine has not is reported as having done so -- m_RasterCompare is NOT
+	// clamped, because a plausible neighbour would have hidden exactly the
+	// reading that cost K471 a capture -- and the HDMI raster anchor refuses it
+	// rather than placing every split in the frame 55 lines out.
+	SplitRasterBus bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	bus.m_Signals.video = VIDEO_NTSC_R8;
+	mem.enableVICLog( true );
+
+	mem.write8( 0xD012, 62 );
+	CHECK_EQ( mem.m_RasterCompareImpossible, 0u );
+	CHECK_EQ( mem.rasterAnchor() != 0ULL, true );
+	const u64 goodAnchor = mem.rasterAnchor();
+
+	mem.write8( 0xD011, 0x97 );			// RST8 by hand: compare becomes 318
+	CHECK_EQ( mem.rasterCompare(), (u16)318 );
+	CHECK_EQ( mem.m_D011RST8Writes, 1u );
+	CHECK_EQ( mem.m_RasterCompareImpossible, 1u );
+
+	// The anchor is taken BEFORE the shadow moves, on purpose -- the beam is at
+	// the OLD compare when a handler re-aims it -- so the write that creates 318
+	// still anchors the reachable 62. The refusal belongs to the NEXT handler,
+	// the one that would anchor 318, which is exactly the frame in which K471's
+	// splits would have gone 55 lines out.
+	mem.tick( 300 );					// clear the 256-cycle anchor guard
+	mem.write8( 0xD019, 0x01 );			// the chain's acknowledge
+	CHECK_EQ( mem.m_RasterAnchorRefused, 1u );
+	CHECK_EQ( mem.rasterAnchor(), goodAnchor );
+}
+
 TEST( integration_c64_cia2_seed_repeats_only_the_verified_ddra_write )
 {
 	CIA2SeedBus bus;
@@ -1926,16 +2597,21 @@ TEST( integration_visible_drain_defers_screen_but_not_cold_traffic )
 
 	// Put the active matrix at the FIFO head, as a scrolling screen does, then
 	// queue unrelated VIC-visible RAM behind it.
-	for ( u32 i = 0; i < 1000; i++ )
+	// The final eight matrix bytes are live sprite pointers and deliberately
+	// bypass the queue. Queue every ordinary matrix byte, including all 16
+	// normally-unused VSP-visible bytes immediately before that pointer row.
+	const u32 queuedMatrixBytes = SCPU_VIC_MATRIX_BYTES - 8u;
+	for ( u32 i = 0; i < queuedMatrixBytes; i++ )
 		scpu.memory().write8( (u16)( 0x0400 + i ), (u8)( i ^ 0xA5 ) );
 	scpu.memory().write8( 0x2000, 0x5A );
 
-	// With the beam held in the picture, cold traffic progresses past all 1000
-	// deferred matrix entries but no matrix byte reaches physical DRAM.
+	// With the beam held in the picture, cold traffic progresses past all 1024
+	// deferred matrix-ring entries but no matrix byte reaches physical DRAM.
 	scpu.runFrame();
 	CHECK_EQ( bus.m_Memory[ 0x2000 ], 0x5A );
 	CHECK( bus.m_Memory[ 0x0400 ] != (u8)0xA5 );
-	CHECK_EQ( scpu.writeBuffer().pending(), 1000u );
+	CHECK( bus.m_Memory[ 0x07F7 ] != (u8)( 1015 ^ 0xA5 ) );
+	CHECK_EQ( scpu.writeBuffer().pending(), queuedMatrixBytes );
 
 	// Once outside the picture, the same small installments prioritize and
 	// finish the screen before ordinary border work. The dedicated allowance is
@@ -1945,11 +2621,153 @@ TEST( integration_visible_drain_defers_screen_but_not_cold_traffic )
 	bus.resetStats();
 	bus.maxBurst = 0;
 	scpu.runFrame();
-	CHECK_EQ( bus.m_BurstWrites, 1000u );
+	CHECK_EQ( bus.m_BurstWrites, queuedMatrixBytes );
 	CHECK_EQ( bus.maxBurst, 64u );
 	CHECK_EQ( bus.m_Memory[ 0x0400 ], (u8)0xA5 );
 	CHECK_EQ( bus.m_Memory[ 0x07E7 ], (u8)( 999 ^ 0xA5 ) );
-	CHECK( !scpu.writeBuffer().hasPendingInRange( 0x0400, 1000 ) );
+	CHECK_EQ( bus.m_Memory[ 0x07F7 ], (u8)( 1015 ^ 0xA5 ) );
+	CHECK( !scpu.writeBuffer().hasPendingInRange(
+	       0x0400, SCPU_VIC_MATRIX_BYTES ) );
+}
+
+TEST( integration_vsp_matrix_diagnostic_detects_constant_physical_shift_once )
+{
+	struct FixedRasterBus : CHostBus
+	{
+		u16 line = 260;
+		u16 rasterLine() override { return line; }
+	} bus;
+
+	CSuperCPU scpu;
+	u8 basic[ C64_BASIC_SIZE ];
+	u8 kernal[ C64_KERNAL_SIZE ];
+	std::memset( basic, 0xEA, sizeof basic );
+	std::memset( kernal, 0xEA, sizeof kernal );
+	kernal[ 0 ] = 0x4C;
+	kernal[ 1 ] = 0x00;
+	kernal[ 2 ] = 0xE0;
+	kernal[ 0x1FFC ] = 0x00;
+	kernal[ 0x1FFD ] = 0xE0;
+	scpu.setBasicROM( basic );
+	scpu.setKernalROM( kernal );
+	CHECK( scpu.init( &bus, SCPU_CORE_6502, 0 ) );
+	scpu.writeBuffer().setOptMode( SCPU_OPT_NONE );
+	// Preserve the deliberately shifted physical image while the observer arms.
+	scpu.setMirrorHalted( true );
+
+	scpu.memory().write8( 0xD016, 0x10 );
+	scpu.memory().write8( 0xD018, 0xCE );
+	scpu.memory().m_RAM[ 0x9F88 ] = 0x00;
+	const u32 logical = scpu.memory().activeVICScreenBase();
+	const u32 physical = scpu.memory().activeScreenBase();
+	CHECK( logical < 0x10000 );
+	CHECK( physical < 0x10000 );
+
+	u8 expected[ SCPU_VIC_MATRIX_BYTES ];
+	for ( u32 i = 0; i < SCPU_VIC_MATRIX_BYTES; i++ )
+	{
+		expected[ i ] = (u8)( i * 37u + ( i >> 3 ) + 0x51u );
+		scpu.memory().m_RAM[ ( logical + i ) & 0xFFFF ] = expected[ i ];
+	}
+	for ( u32 i = 0; i < SCPU_VIC_MATRIX_BYTES; i++ )
+		bus.m_Memory[ ( physical + i ) & 0xFFFF ] =
+			i + 3 < SCPU_VIC_MATRIX_BYTES ? expected[ i + 3 ] : 0xFF;
+
+	// Establish the first phase, then change it once. The gameplay gate must
+	// remain latched while the phase dwells, and the host thresholds 2/4/6 must
+	// produce three independent comparisons.
+	scpu.runFrame();
+	scpu.memory().m_RAM[ 0x9F88 ] = 0x20;
+	for ( u32 frame = 0; frame < 6; frame++ )
+	{
+		scpu.memory().write8( 0xD016, (u8)( 0x10 + ( frame % 3 ) ) );
+		scpu.runFrame();
+	}
+
+	SCPUVSPMatrixDiagnostic d = {};
+	scpuVSPMatrixDiagnostic( d );
+	CHECK_EQ( d.state, (u8)2 );
+	CHECK_EQ( d.gameplaySeen, (u8)1 );
+	CHECK_EQ( d.capturedCount, (u8)3 );
+	for ( u32 slot = 0; slot < SCPU_VSP_MATRIX_CLEAN_CAPTURES; slot++ )
+	{
+		const SCPUVSPMatrixCapture &capture = d.capture[ slot ];
+		CHECK_EQ( capture.state, (u8)2 );
+		CHECK_EQ( capture.logicalBase, logical );
+		CHECK_EQ( capture.physicalBase, physical );
+		CHECK_EQ( capture.rasterBefore, (u16)260 );
+		CHECK_EQ( capture.rasterAfter, (u16)260 );
+		CHECK_EQ( capture.safeWindow, (u8)1 );
+		CHECK_EQ( capture.pendingAtCapture, 0u );
+		CHECK_EQ( capture.bestShift, (s32)3 );
+		CHECK_EQ( capture.bestShiftMatches, SCPU_VIC_MATRIX_BYTES - 3u );
+		CHECK_EQ( capture.bestShiftCompared, SCPU_VIC_MATRIX_BYTES - 3u );
+		CHECK( capture.mismatchCount > 900 );
+	}
+	CHECK_EQ( d.capture[ SCPU_VSP_MATRIX_STALL_SLOT ].state, (u8)0 );
+
+	// All clean slots are bounded: later frames must not issue another readback.
+	const u64 reads = bus.m_Reads;
+	scpu.memory().write8( 0xD016, 0x10 );
+	scpu.runFrame();
+	CHECK_EQ( bus.m_Reads, reads );
+}
+
+TEST( integration_vsp_matrix_diagnostic_waits_for_a_clean_matrix )
+{
+	struct FixedRasterBus : CHostBus
+	{
+		u16 rasterLine() override { return 260; }
+	} bus;
+
+	CSuperCPU scpu;
+	u8 basic[ C64_BASIC_SIZE ];
+	u8 kernal[ C64_KERNAL_SIZE ];
+	std::memset( basic, 0xEA, sizeof basic );
+	std::memset( kernal, 0xEA, sizeof kernal );
+	kernal[ 0 ] = 0x4C;
+	kernal[ 1 ] = 0x00;
+	kernal[ 2 ] = 0xE0;
+	kernal[ 0x1FFC ] = 0x00;
+	kernal[ 0x1FFD ] = 0xE0;
+	scpu.setBasicROM( basic );
+	scpu.setKernalROM( kernal );
+	CHECK( scpu.init( &bus, SCPU_CORE_6502, 0 ) );
+	scpu.writeBuffer().setOptMode( SCPU_OPT_NONE );
+	scpu.setMirrorHalted( true );
+	bus.resetStats();
+	scpu.memory().write8( 0xD016, 0x10 );
+	scpu.memory().write8( 0xD018, 0xCE );
+	scpu.memory().m_RAM[ 0x9F88 ] = 0x00;
+	const u32 screen = scpu.memory().activeVICScreenBase();
+	scpu.memory().write8( (u16)screen, 0xA5 );
+
+	scpu.runFrame();
+	scpu.memory().m_RAM[ 0x9F88 ] = 0x20;
+	for ( u32 frame = 0; frame < 3; frame++ )
+	{
+		scpu.memory().write8( 0xD016, (u8)( 0x10 + ( frame & 1 ) ) );
+		scpu.runFrame();
+	}
+	SCPUVSPMatrixDiagnostic d = {};
+	scpuVSPMatrixDiagnostic( d );
+	CHECK_EQ( d.state, (u8)1 );
+	CHECK_EQ( d.capture[ 0 ].state, (u8)1 );
+	CHECK( d.capture[ 0 ].pendingWaits > 0 );
+	CHECK_EQ( bus.m_Reads, 0u );
+
+	// The at-stall slot preserves rather than drains the dirty queue. It still
+	// waits for a hidden raster position, then reports the outstanding count.
+	CHECK( scpuCaptureVSPStallMatrixDiagnostic( &scpu ) );
+	scpuVSPMatrixDiagnostic( d );
+	const SCPUVSPMatrixCapture &stall =
+		d.capture[ SCPU_VSP_MATRIX_STALL_SLOT ];
+	CHECK_EQ( stall.state, (u8)2 );
+	CHECK_EQ( stall.kind, (u8)1 );
+	CHECK( stall.pendingAtCapture > 0 );
+	CHECK_EQ( scpu.writeBuffer().pendingInRange(
+	          screen, SCPU_VIC_MATRIX_BYTES ), stall.pendingAtCapture );
+	CHECK_EQ( bus.m_Reads, (u64)SCPU_VIC_MATRIX_BYTES );
 }
 
 TEST( integration_bitmap_drain_is_hidden_and_prioritized )

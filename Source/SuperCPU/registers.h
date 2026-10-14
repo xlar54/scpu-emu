@@ -260,6 +260,23 @@ public:
 	typedef void (*SpeedHook)( void *ctx );
 	void setSpeedHook( SpeedHook hook, void *ctx ) { m_SpeedHook = hook; m_SpeedHookCtx = ctx; }
 
+	// Immediate notification that something in here moved the bank-0 read
+	// map. CC64Memory resolves that map into a per-page base pointer table
+	// (see CC64Memory::m_ReadBase) and applyKernalShadow() moves the KERNAL
+	// window between two different halves of bank 1, so the table has to be
+	// rebuilt in the same breath or the next KERNAL fetch reads the wrong 8K
+	// -- the boot-animation-then-blank-screen failure, again. A function
+	// pointer rather than an interface, like the speed hook: this class
+	// reaches CC64Memory through raw pointers and must not acquire a
+	// dependency on its type.
+	//
+	// PAIR THIS WITH trackKernalShadow(). Nothing enforces it: the live
+	// machine wires both in CSuperCPU::initialize(), and a fixture that
+	// wires only trackKernalShadow() and then reads through readFast() sees
+	// a stale KERNAL window with no diagnostic.
+	typedef void (*MapHook)( void *ctx );
+	void setMapHook( MapHook hook, void *ctx ) { m_MapHook = hook; m_MapHookCtx = ctx; }
+
 	u64 m_RegWrites;
 
 private:
@@ -285,6 +302,8 @@ private:
 	bool *m_BootmapFlag;
 	SpeedHook m_SpeedHook = 0;
 	void     *m_SpeedHookCtx = 0;
+	MapHook   m_MapHook = 0;
+	void     *m_MapHookCtx = 0;
 
 	void applyBootmap() { if ( m_BootmapFlag ) *m_BootmapFlag = m_Bootmap; }
 
@@ -293,6 +312,10 @@ private:
 	{
 		// KS while the registers are open, KT while they are not.
 		if ( m_KernalShadowBase ) *m_KernalShadowBase = m_HWRegsEnabled ? 0x6000 : 0xE000;
+		// After the store, so the hook's reader sees the new base, and
+		// unconditional: firing with a null m_KernalShadowBase costs one
+		// rebuild of an unchanged table and keeps the two cases from drifting.
+		if ( m_MapHook ) m_MapHook( m_MapHookCtx );
 	}
 	bool m_DOSExt;
 	bool m_RAMLink;

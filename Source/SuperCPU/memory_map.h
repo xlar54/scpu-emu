@@ -49,6 +49,34 @@
 #define SCPU_ROM_BASE       0xF80000
 #define SCPU_ROM_MAXSIZE    0x80000		// 512K address space for the ROM image
 
+// m_Bank0Accesses and m_FastAccesses are read by NOTHING in the firmware. The
+// references under Source/ are: this header, the constructor and reset() in
+// memory_map.cpp, and two further increments in readAbove()/writeAbove()
+// (memory_map.cpp:60,100) which this macro deliberately leaves ALONE -- those
+// are the cold out-of-line bank>=1 paths, so gating them would buy nothing and
+// the counters simply stay partial in the firmware, where nobody reads them.
+// The only readers are in Tests/SuperCPU/test_memory_map.cpp. Contrast
+// m_RamWrites, which Source/App/boot.cpp:1252 and :2303 DO report and which
+// therefore stays unconditional.
+//
+// MEASURED in the shipped object: the increment is a dependent ldr/add/str to
+// the same address on EVERY emulated bank-0 access, and a host census of the
+// TI throughput benchmark measured 2.806 bank-0 accesses per emulated
+// instruction. That is ~8.4 ARM instructions per emulated instruction spent on
+// a number the Pi never prints -- and on an in-order A53 that load-add-store
+// chain also serialises, which the instruction count does not capture.
+//
+// The host build keeps counting, so every test assertion still holds and the
+// suite is unchanged. The FIELDS stay in both builds: their position in front
+// of m_Bank1 is load-bearing codegen (see the note on them below), and
+// deleting them would push m_Bank0 back out of a ldr immediate's reach and
+// undo the K448 layout hoist.
+#ifdef SCPU_HOST_BUILD
+	#define SCPU_COUNT_ACCESS( c ) ( (c)++ )
+#else
+	#define SCPU_COUNT_ACCESS( c ) ( (void)0 )
+#endif
+
 // final: see the note on CC64Memory. The 65816 reaches memory through this
 // class, so it is on the hot path twice over.
 class CSuperCPUMemoryMap final : public ICpuBus
@@ -76,6 +104,12 @@ public:
 		    && m_Bank0->interruptRerouteActive( emulationMode );
 	}
 	void noteNMITaken() { if ( m_Bank0 ) m_Bank0->noteNMITaken(); }
+	// Bank 0 owns the VIC shadows and the sampled interrupt lines, so the
+	// core's interrupt ring asks for its context through here. One call per
+	// interrupt; see CC64Memory::interruptContext for what it may and may not
+	// touch.
+	u64 interruptContext()
+		{ return m_Bank0 ? m_Bank0->interruptContext() : 0; }
 
 	u16 rerouteVector( u16 addr )
 	{
@@ -99,16 +133,17 @@ public:
 		addr &= SCPU_ADDR_MASK;
 		if ( addr < 0x010000 )
 		{
-			m_Bank0Accesses++;
+			SCPU_COUNT_ACCESS( m_Bank0Accesses );
 			return m_Bank0 ? m_Bank0->readFast( (u16)addr ) : 0xFF;
 		}
 		// Bank 1 inline: the SuperCPU's private SRAM is the hottest region
 		// after bank 0 -- native-mode code and data live there -- and the
 		// out-of-line readAbove call cost more than the access itself. The
-		// counter increment must stay: tests assert on it.
+		// counter increment is kept for the HOST build, where the tests assert
+		// on it; the firmware never reads it -- see SCPU_COUNT_ACCESS above.
 		if ( addr < 0x020000 )
 		{
-			m_FastAccesses++;
+			SCPU_COUNT_ACCESS( m_FastAccesses );
 			const u16 offset = (u16)addr;
 			if ( __builtin_expect( offset < 2, 0 ) )
 				return readBank1Port( offset );
@@ -122,13 +157,13 @@ public:
 		addr &= SCPU_ADDR_MASK;
 		if ( addr < 0x010000 )
 		{
-			m_Bank0Accesses++;
+			SCPU_COUNT_ACCESS( m_Bank0Accesses );
 			if ( m_Bank0 ) m_Bank0->writeFast( (u16)addr, value );
 			return;
 		}
 		if ( addr < 0x020000 )
 		{
-			m_FastAccesses++;
+			SCPU_COUNT_ACCESS( m_FastAccesses );
 			const u16 offset = (u16)addr;
 			if ( __builtin_expect( offset < 2, 0 ) )
 			{
@@ -168,12 +203,28 @@ public:
 	bool fineTicksRequired() const { return m_Bank0 && m_Bank0->fineTicksRequired(); }
 	bool nmiAsserted() override { return m_Bank0 ? m_Bank0->nmiFast() : false; }
 	void tick( u32 nCycles ) override { if ( m_Bank0 ) m_Bank0->tickFast( nCycles ); }
-
-	// Bank 1: the accelerator's private SRAM.
-	u8 m_Bank1[ SCPU_BANK1_SIZE ];
+	void tickPhaseTrim( s32 c64Cycles ) override { if ( m_Bank0 ) m_Bank0->tickPhaseTrim( c64Cycles ); }
 
 	// Statistics, split by where an access landed. Useful for judging how much
 	// of a workload escapes bank 0 -- anything that does runs at full speed.
+	//
+	// EDIT 2 of 3, lands with the next hunk. LAYOUT IS LOAD-BEARING HERE.
+	// m_Bank1 used to be declared first, which pushed these two and m_Bank0
+	// below to +0x10008, +0x10010 and +0x10018 -- confirmed by gdb ptype /o on
+	// kernel8.elf as 65544 / 65552 / 65560, all past a ldr immediate's reach.
+	// So the shipped K448 object emits `add x0, x0, #0x10, lsl #12` on EVERY
+	// bank-0 access purely to address them: busRead8+0x34, busWrite8, and
+	// every fast-switch site in stepInner (e.g. +0x9c0). They also sat a full
+	// 64KB from the vtable pointer the same access had just loaded, so the
+	// three hottest fields in the class cost a cache line of their own.
+	//
+	// Declared ahead of the array they land at +8 / +16 / +24, share the
+	// object's first line with that pointer, and are addressed directly --
+	// verified in the rebuilt object as `ldr x1,[x0,#8]` / `ldr x21,[x0,#24]`
+	// with no add, and stepInner shrinks by 548 bytes alongside the
+	// c64_memory.h hoist (0x6b10 -> 0x68ec). m_Bank1 is only ever reached by
+	// name -- no offsetof, no memcpy of this object, no test asserts an offset
+	// -- so this is codegen only.
 	u64 m_Bank0Accesses;
 	u64 m_FastAccesses;
 
@@ -189,6 +240,22 @@ private:
 	CFastRAM   *m_SIMM;
 	const u8   *m_ROM;
 	u32         m_ROMLength;
+
+public:
+	// Bank 1: the accelerator's private SRAM. Declared LAST on purpose -- see
+	// the note on m_Bank0Accesses above. 64KB in front of the scalars put
+	// every one of them out of immediate reach and in a far cache line.
+	//
+	// CONSEQUENCE, so nobody trips over it later: this array now starts at
+	// offset 52, so it is 4-byte aligned, not 8 (verified in the rebuilt
+	// object as `ldrb w0,[x0,#52]`). That is safe because every one of its
+	// uses is a byte access -- memory_map.cpp:27,41,63,104; memory_map.h:115,
+	// 138; supercpu.cpp:492,684-691,990,1083-1084; registers.h:314,325; and
+	// Tests/SuperCPU/test_memory_map.cpp -- and AArch64 permits unaligned
+	// byte access on normal memory. Do NOT add a u16/u32/u64 cast, a typed
+	// memcpy or a DMA handoff over this array without first restoring an
+	// explicit alignment guarantee.
+	u8 m_Bank1[ SCPU_BANK1_SIZE ];
 };
 
 #endif

@@ -416,3 +416,61 @@ TEST( integration_run_ticks_per_instruction_while_speed_is_explicitly_1mhz )
 	m.cpu.run( 400 );
 	CHECK( m.mem.m_MaxTickChunk > 8 );
 }
+
+
+// ---------------------------------------------------------------------------
+// Watched-RAM write forensics
+//
+// Needs no ROMs: this is the memory layer's own hook, and the two claims worth
+// proving are that a disarmed watch leaves the write-notify bitmap exactly as
+// it was -- which is the entire basis for calling the hook free -- and that an
+// armed one records enough to tell "never written" from "written the same
+// value" from "written correctly and read from somewhere else".
+// ---------------------------------------------------------------------------
+
+struct WatchOnly
+{
+	CHostBus   bus;
+	CC64Memory mem;
+	WatchOnly()
+	{
+		mem.attachBus( &bus );
+		mem.reset();
+	}
+};
+
+TEST( ram_watch_is_free_when_disarmed_and_records_old_and_new_when_armed )
+{
+	// Static, not a local: CC64Memory carries 64K of DRAM plus its shadows and
+	// has no business on a test's stack.
+	static WatchOnly w;
+	CC64Memory &mem = w.mem;
+
+	mem.setRAMWatch( 0x10000u, 0x10000u );
+	const u16 bare = mem.m_WriteNotifyPages;
+	mem.setRAMWatch( 0x9F88u, 0x10000u );
+	// Exactly one bit more, and it is page $9. Nothing else about the gate
+	// moves, which is what makes RAM_WATCH 0 a bit-for-bit bisect.
+	CHECK_EQ( (u32)( mem.m_WriteNotifyPages & ~bare ), 1u << 9 );
+	CHECK_EQ( (u32)( bare & ~mem.m_WriteNotifyPages ), 0u );
+
+	mem.m_RAM[ 0x9F88 ] = 0x20;
+	mem.writeFast( 0x9F88, 0x40 );
+	// A same-value rewrite is still a WRITE. Case (b) -- the phase index
+	// written repeatedly with the value it already held -- is invisible unless
+	// writes and changes are counted separately.
+	mem.writeFast( 0x9F88, 0x40 );
+	mem.writeFast( 0x9F89, 0x11 );		// same page, not the watched address
+	CHECK_EQ( mem.m_WatchWrites, 2u );
+	CHECK_EQ( mem.m_WatchChanges, 1u );
+	CHECK_EQ( (u32)mem.m_WatchRing[ 0 ].addr, 0x9F88u );
+	CHECK_EQ( (u32)mem.m_WatchRing[ 0 ].old, 0x20u );
+	CHECK_EQ( (u32)mem.m_WatchRing[ 0 ].value, 0x40u );
+	CHECK_EQ( (u32)mem.m_WatchRing[ 1 ].old, 0x40u );
+	// No CPU probe installed here, so the writer fields read 0 rather than
+	// stale garbage -- the firmware installs one in CSuperCPU::installCore.
+	CHECK_EQ( mem.m_WatchRing[ 0 ].pc, 0u );
+
+	mem.setRAMWatch( 0x10000u, 0x10000u );
+	CHECK_EQ( (u32)mem.m_WriteNotifyPages, (u32)bare );
+}

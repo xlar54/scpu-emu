@@ -748,6 +748,47 @@ TEST( w65c816_precise_vic_store_with_turnaround_enters_one_cycle_early )
 	CHECK_EQ( f.bus.m_TickLog[ 1 ], 2u );
 }
 
+TEST( w65c816_precise_aim_never_advances_the_ledger_past_the_instruction )
+{
+	// VSP_AIM_* is a PHYSICAL phase trim. Through ICpuBus it is tickPhaseTrim,
+	// which this bus ignores -- so from here the aim must be INVISIBLE: DEC
+	// $D011 / INC $D011 tick the same six and six cycles at every aim, in the
+	// same three settles each, and the ticked total never leads cpu.cycles().
+	// Before the fix the aim was added to the LOGICAL settle point: aim 6
+	// ticked the DEC through start+10, the INC's cycle-4 pre-read settle was
+	// skipped and the INC's write settled through ITS start+10 (host-measured
+	// lead = max( 0, aim - 2 )); a negative aim settled the write at the
+	// read's own point. Either way the ledger stopped being the instruction.
+	for ( int aim = -6; aim <= 6; aim++ )
+	{
+		const u8 code[] = { 0xCE, 0x11, 0xD0, 0xEE, 0x11, 0xD0 };	// DEC / INC $D011
+		W65Fixture f( code, sizeof( code ) );
+		s_Mem[ 0x00D011 ] = 0x17;
+		f.bus.m_PreciseVICCycles = true;
+		f.bus.m_TurnaroundLag = true;
+		f.cpu.setPreciseAim( 0, aim );
+
+		f.cpu.step();						// DEC
+		CHECK_EQ( f.bus.m_Ticks, f.cpu.cycles() );		// ledger == instruction end
+		CHECK_EQ( f.bus.m_TickLogCount, 3u );			// read +3, write +4, epilogue +6
+		CHECK_EQ( f.bus.m_TickLog[ 0 ], 3u );
+		CHECK_EQ( f.bus.m_TickLog[ 1 ], 1u );
+		CHECK_EQ( f.bus.m_TickLog[ 2 ], 2u );
+
+		f.cpu.step();						// INC
+		CHECK_EQ( f.bus.m_Ticks, f.cpu.cycles() );
+		CHECK_EQ( f.bus.m_TickLogCount, 6u );
+		CHECK_EQ( f.bus.m_TickLog[ 3 ], 3u );			// the pre-read settle RAN
+		CHECK_EQ( f.bus.m_TickLog[ 4 ], 1u );
+		CHECK_EQ( f.bus.m_TickLog[ 5 ], 2u );
+		u64 at = 99;
+		CHECK( f.bus.nthAccessAt( 0x00D011, false, 1, at ) );
+		CHECK_EQ( at, 9u );					// INC's read at ITS cycle 4
+		CHECK( f.bus.nthAccessAt( 0x00D011, true, 1, at ) );
+		CHECK_EQ( at, 10u );					// INC's write entered at +4 (lag 2)
+	}
+}
+
 TEST( w65c816_non_vic_store_keeps_end_of_instruction_tick )
 {
 	const u8 code[] = { 0x8D, 0x00, 0x04 };		// STA $0400
@@ -1248,6 +1289,31 @@ TEST( w65c816_every_opcode_is_defined )
 	}
 }
 
+TEST( w65c816_precise_form_table_matches_the_predicate )
+{
+	// s_PreciseForm is a pure accelerator for the || chain stepInner used to
+	// evaluate on every emulated instruction, and it has NO state inputs at
+	// all -- the opcode and m_E are its only inputs -- so there is nothing to
+	// invalidate and this enumeration is a COMPLETE proof over the table's
+	// whole domain, not a sample.
+	//
+	// Verified to bite: flipping the single table byte for opcode $8D in the
+	// E=1 half takes the suite from 682844 checks / 0 failed to 9 failed --
+	// this test plus the behavioural
+	// w65c816_precise_vic_store_with_turnaround_enters_one_cycle_early, which
+	// exercises the same opcode's access timing end to end.
+	for ( u32 e = 0; e < 2; e++ )
+		for ( u32 op = 0; op < 256; op++ )
+		{
+			const u8 lowFive = (u8)( op & 0x1F );
+			const bool want =
+			       op == 0x8C || op == 0x8D || op == 0x9C
+			    || ( e && ( lowFive == 0x0C || lowFive == 0x0D
+			             || lowFive == 0x0E || op == 0x1C ) );
+			CHECK_EQ( CW65C816::s_PreciseForm[ ( e << 8 ) | op ], want );
+		}
+}
+
 TEST( w65c816_dispatch_consumes_exactly_the_table_length )
 {
 	// Every opcode must advance the PC by exactly what the table says. This is
@@ -1351,4 +1417,61 @@ TEST( w65c816_cycle_lut_reproduces_the_reference_exactly )
 					CHECK_EQ( used, ref );
 				}
 	}
+}
+
+
+// ---------------------------------------------------------------------------
+// The hypothesis-free hang detector
+//
+// These two exist because the instrument they replace was wrong in a way no
+// test would have caught: the stack-anomaly detector tested S < $0110, the
+// signature of the one hang it was written for, and reported zero anomalies on
+// a machine that was visibly hung by a different mechanism. So the positive
+// case below is deliberately a hang that leaves the stack, the flags and the
+// vectors perfectly intact -- the case the old detector is blind to.
+// ---------------------------------------------------------------------------
+
+TEST( w65c816_progress_detector_confirms_a_stall_that_never_touches_the_stack )
+{
+	// JMP $0200 at $0200. Forward progress stops; S, P and the vectors are
+	// untouched and no interrupt is ever taken.
+	static const u8 code[] = { 0x4C, 0x00, 0x02 };
+	W65Fixture f( code, sizeof code );
+	CHECK_EQ( (u32)f.cpu.m_ProgEnable, 1u );
+
+	// The SHIPPED thresholds, not test-only ones: 48 epochs of 65536 batch
+	// samples. A detector proved against relaxed constants is a different
+	// detector from the one that runs on the card. Three cycles an
+	// instruction and eight instructions a batch puts the confirm at roughly
+	// 75M emulated cycles; the bound is generous and the loop exits early.
+	while ( !f.cpu.m_ProgConfirmed && f.cpu.cycles() < 400000000ull )
+		f.cpu.run( 4000000 );
+
+	CHECK_EQ( f.cpu.m_ProgConfirmed, 1u );
+	CHECK_EQ( f.cpu.m_IntRingFrozen, 1u );
+	// The whole point of the new detector, stated as an assertion: the old one
+	// would have reported nothing here.
+	CHECK_EQ( f.cpu.m_StackAnomalies, 0u );
+	// The footprint IS the hang: one 16-byte code cell, at $0200.
+	CHECK_EQ( f.cpu.m_ProgCellCount, 1u );
+	CHECK_EQ( (u32)f.cpu.m_ProgCells[ 0 ] << 4, 0x0200u );
+}
+
+TEST( w65c816_progress_detector_does_nothing_at_all_when_disabled )
+{
+	static const u8 code[] = { 0x4C, 0x00, 0x02 };
+	W65Fixture f( code, sizeof code );
+
+	// Disabled means not even an epoch rolls, so HANG_WATCH 0 is a real off
+	// switch and not just a suppressed verdict -- which matters because the
+	// throughput figures have to be measurable with the instrument out of the
+	// way.
+	f.cpu.m_ProgEnable = 0;
+	f.cpu.run( 10000000 );
+	CHECK_EQ( f.cpu.m_ProgEpochs, 0u );
+	CHECK_EQ( f.cpu.m_ProgConfirmed, 0u );
+
+	f.cpu.m_ProgEnable = 1;
+	f.cpu.run( 10000000 );
+	CHECK( f.cpu.m_ProgEpochs > 0 );
 }

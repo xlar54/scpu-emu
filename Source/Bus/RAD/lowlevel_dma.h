@@ -161,8 +161,18 @@ __attribute__( ( always_inline ) ) inline u8 flipByte( u8 x )
 
 extern volatile u32 radBAWaitTimeouts;
 extern volatile u32 radPHIWaitTimeouts;
+// Whole PHI cycles the LAST read / LAST write spent waiting out BA. See
+// gpio_defs.cpp for why these are published per primitive and why they are
+// last-value rather than cumulative.
+extern volatile u32 radBASpinsLastRead;
+extern volatile u32 radBASpinsLastWrite;
 
 #define HANDLE_BUS_AVAILABLE_READ \
+	/* Cleared on EVERY read, including the BA-high path that never enters	\
+	   the spin below, or the publication would be a stale count from an	\
+	   earlier read and would read as a wait this access never made. Placed	\
+	   first because nothing between here and the spin reads it. One store. */\
+	radBASpinsLastRead = 0;						\
 	WAIT_UP_TO_CYCLE( busTiming.TIMING_BA_SIGNAL_AVAIL );			\
 	g2 = read32( ARM_GPIO_GPLEV0 );							\
 	if ( VIC_BA ) {											\
@@ -175,6 +185,7 @@ extern volatile u32 radPHIWaitTimeouts;
 			g2 = read32( ARM_GPIO_GPLEV0 );					\
 		} while ( !(g2 & bBA) && ++baSpins__ < RAD_BA_WAIT_LIMIT );	\
 		if ( baSpins__ >= RAD_BA_WAIT_LIMIT ) radBAWaitTimeouts++;	\
+		radBASpinsLastRead = baSpins__;				\
 	}
 
 
@@ -189,7 +200,10 @@ extern volatile u32 radPHIWaitTimeouts;
 		RESTART_CYCLE_COUNTER								\
 		WAIT_UP_TO_CYCLE( busTiming.TIMING_READ_BA_WRITING );		\
 		g2 = read32( ARM_GPIO_GPLEV0 ); }						\
-	if ( baSpins__ >= RAD_BA_WAIT_LIMIT ) radBAWaitTimeouts++; }
+	if ( baSpins__ >= RAD_BA_WAIT_LIMIT ) radBAWaitTimeouts++;		\
+	/* && short-circuits before the post-increment, so a BA-high issue leaves	\
+	   this at zero without a branch of its own. */		\
+	radBASpinsLastWrite = baSpins__; }
 
 
 __attribute__( ( always_inline ) ) inline 
@@ -418,13 +432,24 @@ void busWriteByteBurst_p2( register u32 &g2, bool releaseDMA )
 
 __attribute__( ( always_inline ) ) inline  
 void busWriteByte_p1( register u32 &g2, u16 addr, u8 data,
-	                  bool selectIOWithGame = false )
+	                  bool selectIOWithGame = false, u32 passesPaid = 0 )
 {
+	// passesPaid: K243 idle passes the caller has ALREADY paid for this
+	// transition. radDirectWrite pays the first one inside its own BUS_RESYNC
+	// (see the note there): the flag is only ever raised by a read's p3, which
+	// releases the bus at a PHI2 falling edge, so the resync's wait to the next
+	// falling edge is one complete idle period -- which is what one pass is. The
+	// configured passes beyond that (a C128's second) are still paid here,
+	// falling edge to falling edge, exactly as before. Callers that have not
+	// resynced (RAD_POKE, the diagnostics) pass 0 and pay them all here.
 	if ( busWriteTurnaroundNeeded )
 	{
-		CLR_GPIO( bDIR_Dx );
-		SET_BANK2_OUTPUT
-		for ( u32 turnPass__ = 0; turnPass__ < busWriteTurnaroundPasses;
+		if ( !passesPaid )
+		{
+			CLR_GPIO( bDIR_Dx );
+			SET_BANK2_OUTPUT
+		}
+		for ( u32 turnPass__ = passesPaid; turnPass__ < busWriteTurnaroundPasses;
 		      turnPass__++ )
 		{
 			WAIT_FOR_CPU_HALFCYCLE

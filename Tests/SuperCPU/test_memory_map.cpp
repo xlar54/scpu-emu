@@ -632,6 +632,347 @@ TEST( scpu_dos_extension_maps_its_bank1_work_areas )
 	CHECK_EQ( bank0.readFast( 0x8123 ), 0x22 );
 }
 
+TEST( bank0_readfast_matches_read8_in_every_banking_state )
+{
+	// readFast() answers RAM, BASIC and KERNAL inline instead of calling the
+	// 2372-byte read8(). That is only legitimate if the byte is identical in
+	// every state read8() can be in, so enumerate them: both ROM-shadow
+	// states, both KERNAL shadow bases ($E000 KT and $6000 KS), SCPU128 mode
+	// on and off, and all 32 PLA configurations against every 4K page.
+	// I/O is excluded because read8() has read-to-clear side effects there
+	// and readFast() declines to it anyway.
+	CHostBus bus;
+	CC64Memory bank0;
+	CSuperCPUMemoryMap map;
+	bank0.attachBus( &bus );
+	map.attachBank0( &bank0 );
+	bank0.reset();
+
+	static u8 basic[ 0x2000 ], kernal[ 0x2000 ], chars[ 0x1000 ];
+	for ( u32 i = 0; i < 0x2000; i++ ) basic[ i ]  = (u8)( 0x40 + ( i & 0x0F ) );
+	for ( u32 i = 0; i < 0x2000; i++ ) kernal[ i ] = (u8)( 0x50 + ( i & 0x0F ) );
+	for ( u32 i = 0; i < 0x1000; i++ ) chars[ i ]  = (u8)( 0x60 + ( i & 0x0F ) );
+	bank0.setBasicROM( basic );
+	bank0.setKernalROM( kernal );
+	bank0.setCharROM( chars );
+	for ( u32 a = 0; a < 0x10000; a++ ) bank0.m_RAM[ a ] = (u8)( a ^ 0x5A );
+	// The bank-1 fill must not repeat every 256 bytes. The two KERNAL shadow
+	// bases are exactly $8000 apart, so a pattern derived from the low byte
+	// alone answers KT and KS with the SAME value and the test goes blind to
+	// the one mistake that matters most here -- the boot animation runs and
+	// the screen then goes blank.
+	for ( u32 a = 0; a < SCPU_BANK1_SIZE; a++ )
+		map.m_Bank1[ a ] = (u8)( a ^ ( a >> 8 ) ^ 0xA5 );
+
+	for ( u32 scpu128 = 0; scpu128 < 2; scpu128++ )
+	for ( u32 shadow = 0; shadow < 2; shadow++ )
+	for ( u32 ks = 0; ks < 2; ks++ )
+	{
+		bank0.setSCPU128Mode( scpu128 != 0 );
+		bank0.setROMShadow( shadow ? map.m_Bank1 : 0 );
+		bank0.m_KernalShadowBase = ks ? 0x6000 : 0xE000;
+		for ( u32 mode = 0; mode < 32; mode++ )
+		{
+			bank0.m_BankMode = (u8)mode;
+			// This loop writes m_BankMode and m_KernalShadowBase behind their
+			// setters, so it owes the read-decode table what updateBankMode()
+			// and the register layer's map hook do for the live machine. Delete
+			// this line to watch the table go stale: 6572 of these checks fail,
+			// which is the guard that makes a cached decode safe to ship.
+			bank0.rebuildReadDecode();
+			for ( u32 page = 0; page < 16; page++ )
+			{
+				const C64Region r = c64MapRead( (u16)( page << 12 ), (u8)mode );
+				if ( r == REG_IO )
+					continue;
+				// All three SCPU128 windows have to be sampled or the
+				// m_SCPU128Mode decline goes untested: $FF00-$FF04 sits inside
+				// the KERNAL page, $D500 and $D600 inside page $D.
+				const u16 lows[ 7 ] = { 0x0002, 0x0345, 0x0500, 0x0600,
+				                        0x0F00, 0x0F04, 0x0FFF };
+				for ( u32 i = 0; i < 7; i++ )
+				{
+					const u16 a = (u16)( ( page << 12 ) | lows[ i ] );
+					const bool scpu128Window =
+					       ( a >= 0xD500 && a <= 0xD50B )
+					    || ( a >= 0xD600 && a <= 0xD601 )
+					    || ( a >= 0xFF00 && a <= 0xFF04 );
+					// PRE-EXISTING divergence, and not this fast path's: when the
+					// PLA resolves one of those windows to RAM, readFast()'s RAM
+					// arm has always served it out of bank-0 DRAM while read8()
+					// routes it to the 8722. Drop the r == REG_RAM term to
+					// reproduce; it fails with no fast ROM arm at all.
+					if ( scpu128 && scpu128Window && r == REG_RAM )
+						continue;
+					CHECK_EQ( bank0.readFast( a ), bank0.read8( a ) );
+				}
+			}
+		}
+	}
+}
+
+// Two machines in identical state, one driven through writeFast and one
+// through write8. Heap-allocated: CC64Memory is ~140KB and this test needs two
+// of them plus their buses, which is more than a test stack should carry.
+struct WriteDiffPair
+{
+	CHostBus    busA, busB;
+	CC64Memory  a, b;
+
+	WriteDiffPair()
+	{
+		a.attachBus( &busA );
+		b.attachBus( &busB );
+		a.reset();
+		b.reset();
+	}
+};
+
+TEST( bank0_writefast_matches_write8_in_every_banking_state )
+{
+	// The write-side twin of bank0_readfast_matches_read8_in_every_banking_state
+	// above, and the reason the WRITE decode cache is safe to ship.
+	//
+	// writeFast() stores through m_WriteBase instead of calling write8(), so
+	// every byte it stores must land where write8() would have put it, in every
+	// state write8() can be in. A stale entry here is strictly worse than on
+	// the read side: it does not return one wrong byte, it STORES a byte into
+	// bank-0 DRAM that belonged to a VIC/SID/CIA/colour-RAM register, so the
+	// DRAM byte is permanently wrong AND the register write never happens.
+	//
+	// Three observables per write, which between them pin both failure
+	// directions:
+	//   m_RAM[ a ]   did the byte land in DRAM, or not?
+	//   m_IOWrites   did the access reach the I/O path at all?
+	//   m_RamWrites  was it accounted as a DRAM write?
+	// I/O pages are deliberately NOT skipped the way the read test skips them:
+	// "the table still says RAM for a page that is now I/O" is the catastrophic
+	// direction, and skipping I/O pages is exactly what would hide it.
+	WriteDiffPair *p = new WriteDiffPair();
+	CC64Memory &a = p->a;
+	CC64Memory &b = p->b;
+
+	static u8 shadowA[ SCPU_BANK1_SIZE ], shadowB[ SCPU_BANK1_SIZE ];
+	for ( u32 i = 0; i < SCPU_BANK1_SIZE; i++ )
+		shadowA[ i ] = shadowB[ i ] = (u8)( i ^ ( i >> 8 ) ^ 0xA5 );
+
+	u8 value = 0x11;
+
+	for ( u32 scpu128 = 0; scpu128 < 2; scpu128++ )
+	for ( u32 shadow = 0; shadow < 2; shadow++ )
+	for ( u32 ks = 0; ks < 2; ks++ )
+	{
+		a.setSCPU128Mode( scpu128 != 0 );
+		b.setSCPU128Mode( scpu128 != 0 );
+		a.setROMShadow( shadow ? shadowA : 0 );
+		b.setROMShadow( shadow ? shadowB : 0 );
+		a.m_KernalShadowBase = b.m_KernalShadowBase = ks ? 0x6000 : 0xE000;
+		for ( u32 mode = 0; mode < 32; mode++ )
+		{
+			a.m_BankMode = b.m_BankMode = (u8)mode;
+			// This loop writes m_BankMode behind its setter, so it owes the
+			// decode tables what updateBankMode() does for the live machine.
+			// DELETE THE rebuildWriteDecode() LINE TO WATCH THE TABLE GO
+			// STALE: thousands of these checks fail, and they fail as wrong
+			// BYTES in DRAM, which is the guard that makes a cached write
+			// decode safe to ship at all.
+			a.rebuildReadDecode();
+			b.rebuildReadDecode();
+			a.rebuildWriteDecode();
+			b.rebuildWriteDecode();
+			for ( u32 page = 0; page < 16; page++ )
+			{
+				const C64Region r = c64MapRead( (u16)( page << 12 ), (u8)mode );
+				// The table must be CURRENT, not merely present. A table that is
+				// null everywhere is writeFast's deliberate bisect
+				// (WRITE_DECODE_CACHE = false): every write then goes through
+				// write8(), which is bit-identical and would satisfy every byte
+				// comparison below while buying nothing. So assert the shape of
+				// the table itself as well as the bytes it produces -- dropping an
+				// invalidation can leave it EMPTY as easily as STALE, and only one
+				// of those two shows up in the bytes. Skipped when the cache is
+				// bisected off, because then null everywhere IS the correct shape
+				// and the byte comparisons below are the whole point of the run.
+				if ( CC64Memory::WRITE_DECODE_CACHE )
+				{
+					CHECK_EQ( a.m_WriteBase[ page ] != 0, r != REG_IO );
+					CHECK_EQ( a.m_WriteBase[ page ] != 0,
+					          !c64WriteIsIO( (u16)( page << 12 ),
+					                         a.m_BankMode ) );
+				}
+				// $0000/$0001 are the 6510 port: writeFast declines to write8()
+				// unconditionally and write8() then calls updateBankMode(),
+				// which would overwrite this loop's hand-set m_BankMode. There
+				// is nothing to compare -- both paths are the same call.
+				const u16 lows[ 8 ] = { 0x0002, 0x0345, 0x03F8, 0x0500,
+				                        0x0600, 0x0F00, 0x0F04, 0x0FFF };
+				for ( u32 i = 0; i < 8; i++ )
+				{
+					const u16 addr = (u16)( ( page << 12 ) | lows[ i ] );
+					const bool scpu128Window =
+					       ( addr >= 0xD500 && addr <= 0xD50B )
+					    || ( addr >= 0xD600 && addr <= 0xD601 )
+					    || ( addr >= 0xFF00 && addr <= 0xFF04 );
+					// PRE-EXISTING divergence, inherited from writeFast and
+					// shared with readFast -- see the same exemption in the read
+					// test. write8() routes these three windows to the 8722
+					// BEFORE it consults the PLA, so whenever the PLA resolves
+					// the page to anything but I/O, writeFast has always stored
+					// them into bank-0 DRAM instead. Drop the `r != REG_IO` term
+					// to reproduce; it fails with no write table at all, i.e. it
+					// is not this cache's doing. The one-line fix is to null
+					// m_WriteBase[ 0xD ] and [ 0xF ] while m_SCPU128Mode is set,
+					// which also means deleting this exemption.
+					if ( scpu128 && scpu128Window && r != REG_IO )
+						continue;
+
+					// Both machines start from the same sentinel so "stored" and
+					// "left alone" are distinguishable, and the value changes on
+					// every iteration so a stale DRAM byte cannot coincidentally
+					// match the one being written.
+					value = (u8)( value + 0x37 );
+					a.m_RAM[ addr ] = b.m_RAM[ addr ] = 0x5A;
+					if ( shadow )
+						shadowA[ addr ] = shadowB[ addr ] = 0xA5;
+
+					a.writeFast( addr, value );
+					b.write8( addr, value );
+
+					CHECK_EQ( a.m_RAM[ addr ], b.m_RAM[ addr ] );
+					CHECK_EQ( a.m_IOWrites, b.m_IOWrites );
+					CHECK_EQ( a.m_RamWrites, b.m_RamWrites );
+					if ( shadow )
+						CHECK_EQ( shadowA[ addr ], shadowB[ addr ] );
+				}
+			}
+		}
+	}
+
+	delete p;
+}
+
+TEST( bank0_write_decode_follows_a_live_port_write )
+{
+	// THE INVALIDATION SITE THAT MATTERS, and the one the exhaustive test above
+	// cannot reach: m_BankMode changes because the GUEST wrote $01, so
+	// updateBankMode() has to re-resolve m_WriteBase in the same breath. That
+	// test hand-sets m_BankMode and rebuilds the table itself, so it proves the
+	// table's CONTENT, not its invalidation. This one drives the real path.
+	// DELETE rebuildWriteDecode() FROM updateBankMode() TO WATCH IT FAIL.
+	//
+	// The dangerous direction is a stale NON-null entry -- a page that was RAM
+	// or character ROM and is now I/O -- because then writeFast stores into
+	// bank-0 DRAM and the register write never happens. $D020 is the test
+	// point: with CHAREN=0 the page is REG_CHARROM and the write falls through
+	// to the DRAM underneath (writes never land in ROM), with CHAREN=1 it is
+	// the VIC border register. Alternating the two is exactly the transition a
+	// stale table gets wrong, and every page is swept because a stale entry is
+	// not confined to the page whose mapping moved.
+	WriteDiffPair *p = new WriteDiffPair();
+	CC64Memory &a = p->a;
+	CC64Memory &b = p->b;
+
+	// Prime the table once, the way updateBankMode() would, so that what the
+	// loop below measures is INVALIDATION and not initial construction. Without
+	// a prime, dropping the rebuild from updateBankMode() leaves the table NULL
+	// rather than stale, and null is the SAFE direction -- writeFast simply
+	// declines to write8() and every byte comparison passes.
+	//
+	// Prime it with CHAREN=0, where page $D is character ROM and therefore
+	// WRITABLE DRAM, so the primed entry is non-null. The loop then walks into
+	// the three port values where page $D is the VIC, and an entry carried over
+	// from here stores $D020 into bank-0 DRAM instead -- a WRONG BYTE, which is
+	// the failure this test exists to produce. (The port write below goes
+	// through write8() on both machines, so it is the shipped path even here.)
+	a.writeFast( 0x0000, 0x07 );
+	b.write8   ( 0x0000, 0x07 );
+	a.writeFast( 0x0001, 0x03 );
+	b.write8   ( 0x0001, 0x03 );
+	a.rebuildWriteDecode();
+	b.rebuildWriteDecode();
+
+	u8 value = 0x40;
+	// Four rounds, so every ordered pair of port values is visited and the test
+	// sees each transition in both directions. Within one round the ascending
+	// sweep already contains the transition that kills a stale table: port 4
+	// (LORAM=0 HIRAM=0 CHAREN=1) resolves page $D to RAM, port 5 resolves it to
+	// I/O, so an entry carried over from port 4 stores $D020 into DRAM and
+	// loses the VIC register write.
+	for ( u32 round = 0; round < 4; round++ )
+	for ( u32 port = 0; port < 8; port++ )
+	{
+		// Through the guest path on both machines: writeFast delegates $00/$01
+		// to write8(), which is where updateBankMode() lives, so this is the
+		// shipped sequence and not a test-only poke.
+		a.writeFast( 0x0000, 0x07 );
+		b.write8   ( 0x0000, 0x07 );
+		a.writeFast( 0x0001, (u8)port );
+		b.write8   ( 0x0001, (u8)port );
+
+		// Current after a GUEST port write, not just after a hand rebuild.
+		// Skipped when the cache is bisected off -- see the twin above.
+		if ( CC64Memory::WRITE_DECODE_CACHE )
+			for ( u32 page = 0; page < 16; page++ )
+				CHECK_EQ( a.m_WriteBase[ page ] != 0,
+				          !c64WriteIsIO( (u16)( page << 12 ), a.m_BankMode ) );
+
+		for ( u32 page = 0; page < 16; page++ )
+		{
+			const u16 addr = (u16)( ( page << 12 ) | 0x0020 );
+			value = (u8)( value + 0x37 );
+			a.m_RAM[ addr ] = b.m_RAM[ addr ] = 0x5A;
+			a.writeFast( addr, value );
+			b.write8   ( addr, value );
+			CHECK_EQ( a.m_RAM[ addr ], b.m_RAM[ addr ] );
+			CHECK_EQ( a.m_IOWrites,    b.m_IOWrites );
+			CHECK_EQ( a.m_RamWrites,   b.m_RamWrites );
+		}
+	}
+
+	delete p;
+}
+
+TEST( bank0_write_notify_pages_cover_every_sprite_pointer_row )
+{
+	// m_WriteNotifyPages is writeFast's gate for noteRAMWriteSideEffects, so a
+	// stale bit is a sprite-pointer write that never reaches the real bus --
+	// "every sprite wears its last shape", which this codebase has shipped once
+	// already when writeFast and write8 drifted apart over this exact check.
+	//
+	// Enumerate every row the VIC can be pointed at: 4 banks x 16 screen
+	// positions, driven through the registers that move it, and require the
+	// bitmap to name the row's page every time. DELETE rebuildWriteNotify()
+	// from updateSpritePtrBase() to watch this fail.
+	MapFixture f;
+	f.bank0.setRAMUnderIOAccessible( true );	// keep every row reachable
+
+	for ( u32 bank = 0; bank < 4; bank++ )
+	{
+		// $DD02 makes PA0/PA1 outputs, $DD00 selects the bank through the
+		// inverters, so the latch is the complement of the bank number.
+		f.bank0.write8( 0xDD02, 0x3F );
+		f.bank0.write8( 0xDD00, (u8)( ( ~bank ) & 0x03 ) );
+		for ( u32 sel = 0; sel < 16; sel++ )
+		{
+			f.bank0.write8( 0xD018, (u8)( sel << 4 ) );
+			const u32 base = ( bank << 14 ) + ( sel << 10 ) + 0x3F8;
+			if ( !CC64Memory::WRITE_NOTIFY_CACHE )
+			{
+				// Bisected off: every page notifies, which is the K451
+				// behaviour and the correct shape for that build.
+				CHECK_EQ( f.bank0.m_WriteNotifyPages, 0xFFFFu );
+				continue;
+			}
+			// EXACT, not just "the bit is set": the fail-safe default is
+			// 0xFFFF, which would satisfy a bit test while saying nothing.
+			// Bit 15 is in the expected value because it is unconditional,
+			// which is what makes the REU hook a non-input.
+			CHECK_EQ( f.bank0.m_WriteNotifyPages,
+			          0x8000u | ( 1u << ( base >> 12 ) ) );
+		}
+	}
+}
+
 TEST( integration_hardware_interrupt_does_not_change_the_register_bank )
 {
 	// VICE's only SuperCPU-specific interrupt hook is the EPROM vector reroute.
@@ -1551,6 +1892,15 @@ struct RerouteFixture
 		bank0.setIOInterceptor( &regs );
 		bank0.setROMShadow( bank1 );
 		regs.trackKernalShadow( &bank0.m_KernalShadowBase );
+		// trackKernalShadow() on its own is only half of what the live machine
+		// does: CSuperCPU::initialize() also installs the map hook, because a
+		// raw-u32* write to m_KernalShadowBase is invisible to CC64Memory's
+		// read-decode table. This is the only hand-wired fixture that drives a
+		// real CW65C816 through readFast(), so without this a $D0B2/$D0Bx
+		// toggle in a future test here would fetch from the wrong 8K with
+		// nothing to catch it.
+		regs.setMapHook( []( void *ctx )
+			{ ( (CC64Memory *)ctx )->rebuildReadDecode(); }, &bank0 );
 		regs.reset();
 		simm.init( SCPU_SIMM_NONE );
 		map.attachBank0( &bank0 );
@@ -1805,4 +2155,507 @@ TEST( mirrored_write_stretch_is_disabled_by_default_on_rad )
 	cpu.step();
 	CHECK_EQ( mem.m_EmuCycles - start, 4u );
 	CHECK_EQ( mem.m_MirrorStretchCycles, 0u );
+}
+
+TEST( pacing_period_is_phi2_and_not_a_round_megahertz )
+{
+	// The pacer's "1MHz" is the host machine's own PHI2, and no C64 runs at a
+	// round megahertz. hostPerC64 is the trace's record of the divisor the
+	// pacer and its phase-lock modulus actually use, so pinning it on both
+	// standards is the host-side proof the physical period reached them:
+	// 1400 on either would mean the /1000000 dilation is back. A measured
+	// discriminator -- without the fix all three checks below fail.
+	CHostBus   bus;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+
+	VSPTimingEvent events[ 4 ];
+	u32 total = 0, overwritten = 0;
+
+	bus.m_Signals.video = VIDEO_PAL;
+	mem.setPacing( 1400000000ULL, 1000000u );
+	mem.write8( 0xD011, 0x1B );
+	CHECK_EQ( mem.copyVSPTrace( events, 4, total, overwritten ), 1u );
+	CHECK_EQ( events[ 0 ].hostPerC64, 1420u );		// 1.4GHz / 985248Hz
+
+	bus.m_Signals.video = VIDEO_NTSC_R8;
+	mem.setPacing( 1400000000ULL, 1000000u );
+	mem.write8( 0xD011, 0x1B );
+	CHECK_EQ( mem.copyVSPTrace( events, 4, total, overwritten ), 2u );
+	CHECK_EQ( events[ 1 ].hostPerC64, 1368u );		// 1.4GHz / 1022727Hz
+
+	// Turbo leaves this period alone: it is the C64's cycle, not the selected
+	// one, and the card's 20MHz comes from its own oscillator.
+	mem.setPacing( 1400000000ULL, 20000000u );
+	mem.write8( 0xD011, 0x1B );
+	CHECK_EQ( mem.copyVSPTrace( events, 4, total, overwritten ), 3u );
+	CHECK_EQ( events[ 2 ].hostPerC64, 1368u );
+}
+
+// A host clock the test moves by hand. CHostBus returns 0 from hostCycles(),
+// and TimedHostBus's now++ cannot express "the guest was stopped for exactly
+// this long" because every read of it advances time. These claims are about a
+// specific duration, so the duration has to be the test's to set.
+struct HeldHostBus : CHostBus
+{
+	u64 now = 0;
+	u64 hostCycles() override { return now; }
+	u32 hostCyclesPerSec() override { return 1400000000u; }
+};
+
+TEST( guest_stop_bracket_keeps_the_longest_pause_and_the_path_that_took_it )
+{
+	// K478's displacement is 201 NTSC raster lines -- about 13,000 C64 cycles,
+	// 17.8M ARM cycles at 1368 per cycle -- and nothing in the emulator
+	// measures how long the guest is stopped while the physical raster keeps
+	// moving. This is that measurement: the interval between a return from
+	// CW65C816::run() and the next entry.
+	HeldHostBus bus;
+	bus.m_Signals.video = VIDEO_NTSC_R8;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	mem.setPacing( 1400000000ULL, 1000000u );
+
+	// An ordinary 64-byte mirror installment first, then the displacement.
+	// The long one must win AND must carry ITS OWN cause bits: a union of the
+	// two would name the border drain for work the flush did, which is the one
+	// way this instrument could send the next investigation to the wrong path.
+	mem.noteGuestStopped();
+	mem.noteGuestStopCause( SCPU_GUEST_STOP_FLUSH );
+	bus.now += 90000;						// ~64 physical bytes
+	mem.noteGuestResumed();
+
+	mem.noteGuestStopped();
+	mem.noteGuestStopCause( SCPU_GUEST_STOP_BORDER );
+	mem.noteGuestStopCause( SCPU_GUEST_STOP_SWEEP );
+	bus.now += 17800000;					// the K478 displacement
+	mem.noteGuestResumed();
+
+	mem.noteGuestStopped();
+	mem.noteGuestStopCause( SCPU_GUEST_STOP_RASTER );
+	bus.now += 4100;						// three $D012 transactions
+	mem.noteGuestResumed();
+
+	CHECK_EQ( mem.guestStopMaxHost(), 17800000u );
+	CHECK_EQ( mem.guestStopMaxCauses(),
+	          (u32)( SCPU_GUEST_STOP_BORDER | SCPU_GUEST_STOP_SWEEP ) );
+
+	// A stop that is never closed cannot be counted: noteGuestStopped() with
+	// no matching resume would otherwise let the NEXT resume measure from an
+	// origin that belongs to a different interval.
+	mem.noteGuestStopped();
+	bus.now += 99000000;
+	CHECK_EQ( mem.guestStopMaxHost(), 17800000u );
+	mem.noteGuestResumed();
+	CHECK_EQ( mem.guestStopMaxHost(), 99000000u );
+	CHECK_EQ( mem.guestStopMaxCauses(), 0u );
+	// And it closes exactly once, so a second resume cannot re-bill it.
+	bus.now += 500000000;
+	mem.noteGuestResumed();
+	CHECK_EQ( mem.guestStopMaxHost(), 99000000u );
+}
+
+TEST( vsp_event_carries_the_stall_the_poll_shape_and_the_irq_distance )
+{
+	// The three fields are read together, so they are proved together: the
+	// event has to drain all of them and then zero them, because each window
+	// means "since the previous retained event" like bastall= and not "since
+	// the previous write to this register" like dprev=.
+	HeldHostBus bus;
+	bus.m_Signals.video = VIDEO_NTSC_R8;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	mem.setPacing( 1400000000ULL, 1000000u );
+
+	VSPTimingEvent events[ 4 ];
+	u32 total = 0, overwritten = 0;
+
+	// The physical /IRQ rising edge, observed where the interrupt sample is
+	// already paid for. Mario's chain is driven by the real VIC through the
+	// real pin, so this is the only stamp that can separate "we noticed the
+	// assertion late" from "it was asserted late".
+	// m_IntCredit starts "due" so the first query samples; m_CachedIRQ starts
+	// false, so this one call is the rising edge.
+	bus.now = 1000;
+	bus.m_IRQ = true;
+	CHECK( mem.irqFast() );
+
+	mem.noteGuestStopped();
+	mem.noteGuestStopCause( SCPU_GUEST_STOP_MATRIXDIAG );
+	bus.now += 1400000;
+	mem.noteGuestResumed();
+
+	// Mario's stabiliser polls $D012 from the bottom border down to its target
+	// line. CHostBus answers $D011/$D012 from a free-running counter that
+	// advances on bus accesses, so these reads really do return rising values
+	// and d012First is the one the FIRST of them saw.
+	const u8 first = mem.read8( 0xD012 );
+	for ( u32 i = 0; i < 6; i++ ) (void)mem.read8( 0xD012 );
+
+	bus.now += 7000;
+	mem.write8( 0xD011, 0x1B );
+	CHECK_EQ( mem.copyVSPTrace( events, 4, total, overwritten ), 1u );
+	CHECK_EQ( events[ 0 ].stallHost, 1400000u );
+	CHECK_EQ( events[ 0 ].stallCause, (u8)SCPU_GUEST_STOP_MATRIXDIAG );
+	CHECK_EQ( events[ 0 ].d012Reads, 7u );
+	CHECK_EQ( events[ 0 ].d012First, first );
+	CHECK_EQ( events[ 0 ].irqToWriteHost, (u32)( bus.now - 1000 ) );
+
+	// Drained: the next event reports its own window, not a running total.
+	mem.write8( 0xD011, 0x1B );
+	CHECK_EQ( mem.copyVSPTrace( events, 4, total, overwritten ), 2u );
+	CHECK_EQ( events[ 1 ].stallHost, 0u );
+	CHECK_EQ( events[ 1 ].stallCause, 0u );
+	CHECK_EQ( events[ 1 ].d012Reads, 0u );
+	CHECK_EQ( events[ 1 ].d012First, 0u );
+
+	// With no assertion ever observed the distance has to read as "no
+	// reference", exactly like sinceReleaseHost, and never as a small
+	// plausible number.
+	CC64Memory fresh;
+	HeldHostBus freshBus;
+	freshBus.m_Signals.video = VIDEO_NTSC_R8;
+	fresh.attachBus( &freshBus );
+	fresh.reset();
+	fresh.setPacing( 1400000000ULL, 1000000u );
+	freshBus.now = 5000;
+	fresh.write8( 0xD011, 0x1B );
+	CHECK_EQ( fresh.copyVSPTrace( events, 4, total, overwritten ), 1u );
+	CHECK_EQ( events[ 0 ].irqToWriteHost, 0xFFFFFFFFu );
+}
+
+// --- the interrupt-control write ring ---------------------------------------
+// WHAT THESE ARE FOR. The 2026-10-12 Mario capture could establish an earlier,
+// NESTED interrupt entry and nothing more: no instrument recorded what armed
+// the compare, what the acknowledgement did, or what the enable mask was. A
+// capture that cannot discriminate between its candidates is not worth a card,
+// so each test below fixes one of the discriminations the field capture will
+// be read against.
+//
+// 1368 is host cycles per C64 cycle at 1.4GHz on an NTSC-R8 machine
+// (1400000000 / 1022727), which is what setPacing computes from the detected
+// standard. Ages in this ring are WHOLE C64 CYCLES, deliberately unlike the
+// VSP trace's dprev=/stall=, which print hundredths.
+static const u64 SCPU_TEST_HOST_PER_C64 = 1368;
+
+TEST( intctl_ring_keeps_compare_programming_and_skips_marios_vsp_pair )
+{
+	HeldHostBus bus;
+	bus.m_Signals.video = VIDEO_NTSC_R8;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	mem.setPacing( 1400000000ULL, 1000000u );
+	bus.now = 1000000;
+
+	// Mario's VSP DEC/INC pair at $0871/$0874 changes YSCROLL only. It must
+	// NOT enter this ring: the hold between those two writes is what the VSP
+	// instrument measures, and an entry is real time inside it.
+	mem.write8( 0xD011, 0x1A );
+	mem.write8( 0xD011, 0x1B );
+	CHECK_EQ( mem.m_ICtlHead, 0u );
+
+	// A $D012 arm is kept, with the OTHER compare half beside it so the
+	// composed compare can be checked rather than believed.
+	mem.write8( 0xD012, 0x35 );
+	CHECK_EQ( mem.m_ICtlHead, 1u );
+	CHECK_EQ( mem.m_ICtlRing[ 0 ].reg, 0x12 );
+	CHECK_EQ( mem.m_ICtlRing[ 0 ].value, 0x35 );
+	CHECK_EQ( mem.m_ICtlRing[ 0 ].prev, 0x00 );
+	CHECK_EQ( mem.m_ICtlRing[ 0 ].other, 0x1B );
+	CHECK_EQ( mem.m_ICtlRing[ 0 ].compare, 0x35 );
+	// No guest $D012 read yet and no physical bit-8 sample yet, so both raster
+	// observations must read as ABSENT. A missing reference presented as a
+	// small plausible number is the failure mode this guards.
+	CHECK_EQ( mem.m_ICtlRing[ 0 ].grasterAge, 0xFFFFu );
+	CHECK_EQ( mem.m_ICtlRing[ 0 ].prasterAge, 0xFFFFu );
+	CHECK( !( mem.m_ICtlRing[ 0 ].flags & SCPU_ICTL_GRASTER_VALID ) );
+
+	// The mask, the acknowledgement, and a $D011 that carries raster bit 8 --
+	// the $96/$97 shape K478 caught coming out of a read-modify-write.
+	mem.write8( 0xD01A, 0x01 );
+	mem.write8( 0xD019, 0x01 );
+	mem.write8( 0xD011, 0x9B );
+	CHECK_EQ( mem.m_ICtlHead, 4u );
+	CHECK_EQ( mem.m_ICtlRing[ 1 ].reg, 0x1A );
+	CHECK_EQ( mem.m_ICtlRing[ 2 ].reg, 0x19 );
+	CHECK_EQ( mem.m_ICtlRing[ 3 ].reg, 0x11 );
+	CHECK_EQ( mem.m_ICtlRing[ 3 ].compare, 0x135 );
+	// The mask as it stood AT the write, not as it stands at capture time.
+	CHECK_EQ( mem.m_ICtlRing[ 3 ].d01a, 0x01 );
+	// Clearing bit 8 again is compare programming too, in the other direction.
+	mem.write8( 0xD011, 0x1B );
+	CHECK_EQ( mem.m_ICtlHead, 5u );
+	CHECK_EQ( mem.m_ICtlRing[ 4 ].compare, 0x35 );
+}
+
+TEST( intctl_ring_dates_the_raster_observations_it_did_not_pay_for )
+{
+	HeldHostBus bus;
+	bus.m_Signals.video = VIDEO_NTSC_R8;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	mem.setPacing( 1400000000ULL, 1000000u );
+	bus.now = 1000000;
+
+	// The guest's own $D012 read is the physical raster observation this ring
+	// quotes. 91 C64 cycles is the staleness K478 measured on the bad event,
+	// and the point of the field is that it reads as 91 and not as "now".
+	const u8 seen = mem.read8( 0xD012 );
+	bus.now += 91 * SCPU_TEST_HOST_PER_C64;
+	mem.write8( 0xD012, 0x36 );
+	CHECK( mem.m_ICtlRing[ 0 ].flags & SCPU_ICTL_GRASTER_VALID );
+	CHECK_EQ( mem.m_ICtlRing[ 0 ].graster, seen );
+	CHECK_EQ( mem.m_ICtlRing[ 0 ].grasterAge, 91u );
+}
+
+TEST( intctl_ack_records_whether_the_plain_store_released_the_irq_line )
+{
+	HeldHostBus bus;
+	bus.m_Signals.video = VIDEO_NTSC_R8;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	mem.setPacing( 1400000000ULL, 1000000u );
+	bus.now = 1000000;
+
+	// THE LEADING STRUCTURAL SUSPECT, made testable. Mario acks with a plain
+	// STA $D019. If the source is still asserting immediately afterwards, it
+	// re-enters through whatever vector is current -- which reproduces both the
+	// short entry gap and the nesting with every compare in the ring correct.
+	// Here the host bus holds /IRQ from a source the $D019 write cannot clear.
+	bus.m_IRQ = true;
+	mem.write8( 0xD019, 0xFF );
+	CHECK_EQ( mem.m_D019Writes, 1u );
+	CHECK( mem.m_ICtlRing[ 0 ].flags & SCPU_ICTL_IRQ_AFTER_VALID );
+	CHECK( mem.m_ICtlRing[ 0 ].flags & SCPU_ICTL_IRQ_AFTER );
+	CHECK_EQ( mem.m_D019AckHeldIRQ, 1u );
+
+	// The follow-up sample, which is what separates a latch that did not clear
+	// from pull-up propagation on a shared open-collector line. It comes from
+	// the cached level -- no second GPIO read -- so the cache has to be
+	// refreshed after the write for it to count.
+	mem.tickFast( 2 );
+	(void)mem.irqAsserted();
+	bus.now += 3 * SCPU_TEST_HOST_PER_C64;
+	mem.write8( 0xD012, 0x35 );
+	CHECK( mem.m_ICtlRing[ 0 ].flags & SCPU_ICTL_IRQ_LATE_VALID );
+	CHECK( mem.m_ICtlRing[ 0 ].flags & SCPU_ICTL_IRQ_LATE );
+	CHECK_EQ( mem.m_ICtlRing[ 0 ].lateHost, 3 * SCPU_TEST_HOST_PER_C64 );
+	CHECK_EQ( mem.m_D019AckHeldIRQLate, 1u );
+
+	// And the healthy shape: the line releases, so this acknowledgement is
+	// ruled out as the cause of anything.
+	bus.m_IRQ = false;
+	mem.tickFast( 2 );
+	(void)mem.irqAsserted();
+	mem.write8( 0xD019, 0xFF );
+	CHECK_EQ( mem.m_D019Writes, 2u );
+	CHECK( mem.m_ICtlRing[ 2 ].flags & SCPU_ICTL_IRQ_AFTER_VALID );
+	CHECK( !( mem.m_ICtlRing[ 2 ].flags & SCPU_ICTL_IRQ_AFTER ) );
+	CHECK_EQ( mem.m_D019AckHeldIRQ, 1u );
+}
+
+TEST( intctl_late_verdict_refuses_a_cache_that_predates_the_acknowledgement )
+{
+	HeldHostBus bus;
+	bus.m_Signals.video = VIDEO_NTSC_R8;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	mem.setPacing( 1400000000ULL, 1000000u );
+	bus.now = 1000000;
+
+	// THE BATCH, REPRODUCED, and this is the test the old credit gate could not
+	// pass. CW65C816::run executes up to eight instructions and ticks the bus
+	// ONCE, at the boundary, so m_IntCredit does not move while the guest
+	// acknowledges. Sample /IRQ low, let the EMULATED clock move on with no new
+	// sample, then acknowledge and release the line as the chip would. The
+	// follow-up must REFUSE to quote the pre-ack level: with m_IntCredit at 0
+	// the old test ( 0 * perEmu > d ) was false and passed it as valid, which is
+	// how K487's irq=101 came to be read as a re-assertion and sent the hunt
+	// after a VIC re-latch that the beam position rules out.
+	// EVERY tickFast HERE IS PRECEDED BY A HOST-CLOCK ADVANCE, and it is not
+	// decoration: HeldHostBus only moves when the test moves it, and tickSettle
+	// SPINS until hostCycles() reaches m_PacingAnchor + owed. A tick whose owed
+	// time has not been granted hangs the suite rather than failing it. Eight
+	// C64 cycles covers two emulated cycles plus any I/O stretch the pending
+	// posted write adds.
+	bus.m_IRQ = true;
+	bus.now += 8 * SCPU_TEST_HOST_PER_C64;
+	mem.tickFast( 2 );
+	(void)mem.irqAsserted();			// the cache is sampled BEFORE the ack
+	// The emulated clock moves on with NO new sample, so the stamp this cache
+	// carries is provably older than the acknowledgement below. Two cycles, and
+	// the amount is load-bearing in the OTHER direction too: the old credit gate
+	// computed 2 * 1368 = 2736 host cycles of claimed cache age against the 4104
+	// gap below, so it still ACCEPTED here and this test still fails against it.
+	// tickFast( 4 ) would have made the old gate reject for the wrong reason and
+	// the test would have proved nothing.
+	bus.now += 8 * SCPU_TEST_HOST_PER_C64;
+	mem.tickFast( 2 );
+	bus.m_IRQ = false;					// the acknowledgement releases the line
+	mem.write8( 0xD019, 0xFF );
+	// MEASURED on this sequence: the entry records irq=1 before, 0 after -- the
+	// plain store DID release the line -- and the ack arms the re-sample
+	// one-shot, which is what ends the batch so the core cannot act on the stale
+	// level above.
+	CHECK( mem.m_ICtlRing[ 0 ].flags & SCPU_ICTL_IRQ_BEFORE );
+	CHECK( !( mem.m_ICtlRing[ 0 ].flags & SCPU_ICTL_IRQ_AFTER ) );
+	CHECK( mem.m_IRQResampleDue );
+	bus.now += 3 * SCPU_TEST_HOST_PER_C64;
+	mem.write8( 0xD012, 0x35 );			// resolves the follow-up
+	CHECK( !( mem.m_ICtlRing[ 0 ].flags & SCPU_ICTL_IRQ_LATE_VALID ) );
+	CHECK( !( mem.m_ICtlRing[ 0 ].flags & SCPU_ICTL_IRQ_LATE ) );
+	CHECK_EQ( mem.m_D019AckHeldIRQLate, 0u );
+	// The GAP still reports, so a refused verdict stays visible as refused
+	// rather than as silence -- the same discipline as "--" for a missing age.
+	CHECK_EQ( mem.m_ICtlRing[ 0 ].lateHost, 3 * SCPU_TEST_HOST_PER_C64 );
+
+	// The forced sample disarms the one-shot, so a $D019 write cannot leave
+	// turbo parked on fine ticks for longer than one instruction.
+	bus.now += 8 * SCPU_TEST_HOST_PER_C64;
+	mem.tickFast( 2 );
+	(void)mem.irqAsserted();
+	CHECK( !mem.m_IRQResampleDue );
+
+	// AND THE POSITIVE CONTROL, without which the test above would also pass a
+	// gate that simply refused everything: that same sample provably FOLLOWS
+	// the $D012 write it is being quoted against, so this verdict is valid --
+	// and it reads 0, the healthy shape, because the line really did release.
+	bus.now += 3 * SCPU_TEST_HOST_PER_C64;
+	mem.write8( 0xD012, 0x36 );
+	CHECK( mem.m_ICtlRing[ 1 ].flags & SCPU_ICTL_IRQ_LATE_VALID );
+	CHECK( !( mem.m_ICtlRing[ 1 ].flags & SCPU_ICTL_IRQ_LATE ) );
+}
+
+TEST( intctl_ring_latches_at_the_first_impossible_compare_and_then_locks )
+{
+	HeldHostBus bus;
+	bus.m_Signals.video = VIDEO_NTSC_R8;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	mem.setPacing( 1400000000ULL, 1000000u );
+	bus.now = 1000000;
+
+	// 272 on a 263-line machine, the same shape as K471's 318. The latch has to
+	// include the write that COMPOSED it -- the detection happens before the
+	// ring entry exists, which is why the freeze is deferred by one append.
+	// The raster interrupt must be ENABLED for an impossible compare to matter.
+	// K486 proved why: it latched during boot on CMD's ROM composing 311 with
+	// $D01A = $00, inert and overwritten microseconds later, 600M cycles before
+	// the hang -- and that false positive cost an entire hardware capture.
+	mem.write8( 0xD01A, 0x01 );
+	mem.write8( 0xD012, 0x10 );
+	mem.write8( 0xD011, 0x9B );
+	CHECK_EQ( mem.m_RasterCompareImpossible, 1u );
+	CHECK_EQ( mem.m_ICtlFrozenReason, 1u );
+	CHECK_EQ( mem.m_ICtlFrozenHead, 3u );
+	CHECK_EQ( mem.m_ICtlFrozen[ 2 ].reg, 0x11 );
+	CHECK_EQ( mem.m_ICtlFrozen[ 2 ].value, 0x9B );
+	CHECK_EQ( mem.m_ICtlFrozen[ 2 ].compare, 272 );
+	CHECK( mem.m_ICtlFrozen[ 2 ].flags & SCPU_ICTL_COMPARE_IMPOSSIBLE );
+
+	// Seconds of post-hang traffic and any number of progress-detector
+	// episodes must not disturb it: that traffic is exactly what overwrites the
+	// live ring before the button is pressed.
+	mem.write8( 0xD012, 0x20 );
+	mem.noteProgressSuspects( 1 );
+	mem.noteProgressSuspects( 2 );
+	CHECK_EQ( mem.m_ICtlFrozenReason, 1u );
+	CHECK_EQ( mem.m_ICtlFrozenHead, 3u );
+	CHECK_EQ( mem.m_ICtlFrozen[ 2 ].reg, 0x11 );
+}
+
+TEST( intctl_ring_ignores_an_impossible_compare_while_the_raster_irq_is_off )
+{
+	// The exact K486 false positive, pinned so it cannot return: CMD's boot ROM
+	// composes 311 on a 263-line machine with the raster interrupt disabled.
+	// It is inert -- nothing can fire on it -- so it must not consume the latch.
+	HeldHostBus bus;
+	bus.m_Signals.video = VIDEO_NTSC_R8;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	mem.setPacing( 1400000000ULL, 1000000u );
+	bus.now = 1000000;
+
+	mem.write8( 0xD012, 0x37 );
+	mem.write8( 0xD011, 0x9B );
+	CHECK_EQ( mem.m_RasterCompareImpossible, 1u );	// still COUNTED
+	CHECK_EQ( mem.m_ICtlFrozenReason, 0u );			// but NOT latched
+
+	// Arming it afterwards and composing another one does latch, so the guard
+	// defers the latch rather than disabling it.
+	mem.write8( 0xD01A, 0x01 );
+	mem.write8( 0xD011, 0x1B );
+	mem.write8( 0xD011, 0x9B );
+	CHECK_EQ( mem.m_ICtlFrozenReason, 1u );
+}
+
+TEST( intctl_ring_latches_on_a_progress_suspect_when_nothing_else_has )
+{
+	HeldHostBus bus;
+	bus.m_Signals.video = VIDEO_NTSC_R8;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	mem.setPacing( 1400000000ULL, 1000000u );
+	bus.now = 1000000;
+
+	// The hypothesis-free backstop, with the same re-copy rule as
+	// CW65C816::m_IntRingSuspect: a disk load reaches SUSPECT harmlessly and
+	// must not be able to silence the instrument for the rest of the run.
+	mem.write8( 0xD012, 0x35 );
+	mem.noteProgressSuspects( 1 );
+	CHECK_EQ( mem.m_ICtlFrozenReason, 2u );
+	CHECK_EQ( mem.m_ICtlFrozenHead, 1u );
+	mem.write8( 0xD012, 0x36 );
+	mem.noteProgressSuspects( 2 );
+	CHECK_EQ( mem.m_ICtlFrozenHead, 2u );
+	// The same episode count is not a new episode.
+	mem.write8( 0xD012, 0x37 );
+	mem.noteProgressSuspects( 2 );
+	CHECK_EQ( mem.m_ICtlFrozenHead, 2u );
+}
+
+TEST( interrupt_context_reports_the_armed_compare_the_mask_and_the_anchor_age )
+{
+	HeldHostBus bus;
+	bus.m_Signals.video = VIDEO_NTSC_R8;
+	CC64Memory mem;
+	mem.attachBus( &bus );
+	mem.reset();
+	mem.setPacing( 1400000000ULL, 1000000u );
+	bus.now = 1000000;
+
+	// What the interrupt ring cannot see for itself, and the reason the entry
+	// gap and the stack pointer alone could not identify a source: an entry
+	// whose observed raster is nowhere near its armed compare was not let in by
+	// that compare. No bus cycle, no GPIO read and no CIA access here -- $DC0D
+	// and $DD0D clear on read, so they are never sampled for observation.
+	mem.write8( 0xD01A, 0x01 );
+	mem.write8( 0xD012, 0x35 );
+	const u8 seen = mem.read8( 0xD012 );
+	bus.now += 88 * SCPU_TEST_HOST_PER_C64;
+	const u64 ctx = mem.interruptContext();
+	CHECK_EQ( (u16)ctx, 0x35 );
+	CHECK_EQ( (u8)( ctx >> 16 ), 0x01 );
+	CHECK_EQ( (u8)( ctx >> 24 ), seen );
+	CHECK_EQ( (u8)( ctx >> 32 ), 22 );			// 88 C64 cycles, reported / 4
+	CHECK( (u8)( ctx >> 40 ) & SCPU_IRQCTX_RASTER_VALID );
+	CHECK( !( (u8)( ctx >> 40 ) & SCPU_IRQCTX_COMPARE_IMPOSSIBLE ) );
+
+	// An acknowledgement that left the line asserted is reported ONCE, on the
+	// next interrupt entry, and then cleared: the bit describes the interval
+	// before that entry, which is the interval a nested re-entry happened in.
+	bus.m_IRQ = true;
+	mem.write8( 0xD019, 0xFF );
+	CHECK( (u8)( mem.interruptContext() >> 40 ) & SCPU_IRQCTX_ACK_HELD );
+	CHECK( !( (u8)( mem.interruptContext() >> 40 ) & SCPU_IRQCTX_ACK_HELD ) );
 }

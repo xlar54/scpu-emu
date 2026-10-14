@@ -202,6 +202,23 @@ void CW65C816::opBIT( u16 v, bool immediate )
 // Interrupts
 // ---------------------------------------------------------------------------
 
+// WHAT THE RING CANNOT SEE FOR ITSELF. One call per interrupt -- 240 a second
+// in Mario -- into state the memory layer already holds. Nothing here reads the
+// bus, the GPIO pins or a CIA; see CC64Memory::interruptContext.
+void CW65C816::noteInterruptContext( bool freshSample, bool carriedLine )
+{
+	if ( !m_IntRingTargetDue || !m_FastBus ) return;
+	const u64 ctx = m_FastBus->interruptContext();
+	W65InterruptEntry &e = m_IntRing[ ( m_IntRingHead - 1 ) % W65_INT_RING ];
+	e.compare = (u16)ctx;
+	e.d01a = (u8)( ctx >> 16 );
+	e.raster = (u8)( ctx >> 24 );
+	e.rasterAge4 = (u8)( ctx >> 32 );
+	e.iflags = (u8)( (u8)( ctx >> 40 )
+	               | ( freshSample ? SCPU_IRQCTX_FRESH_SAMPLE : 0 )
+	               | ( carriedLine ? SCPU_IRQCTX_LINE_CARRIED : 0 ) );
+}
+
 void CW65C816::serviceInterrupt( u32 vectorNative, u32 vectorEmu, bool isBRKorCOP )
 {
 	// Interrupts and COP use the "old" stack class, so they stay inside page 1
@@ -327,6 +344,85 @@ u32 CW65C816::stepNoTick()
 	return stepInner();
 }
 
+// The resolved form of stepInner's precise-access-timeline predicate,
+// indexed by ( m_E << 8 ) | opcode.
+//
+// MEASURED in the shipped object, disassembled with the project's own
+// aarch64-none-elf-objdump: the || chain this replaces is exactly 16
+// instructions (opcode+0x74 / and / cmp / cset, cmp $9C / cset, orr, then the
+// m_E-only tail: and $1F / sub $0C / and / cmp / b.ls, cmp $1C / cset), after
+// excluding the PC increment, the m_PreciseAccessCycle store and the m_E load
+// that the dispatch test shares. The table form is 4 (adrp, add, one orr to
+// build the index, ldrb).
+//
+// BUT NOT 16 ON EVERY INSTRUCTION, and the distinction matters: the chain has
+// two short-circuit exits, one after the three unconditional forms and one on
+// m_E. The E=1 path executes all 16; the E=0 path leaves after 9. Weighted by
+// the measured E split of the TI benchmark (64.3% E=1) the baseline mean is
+// ~13.5, so the honest saving is ~9.5 per emulated instruction, not 16-4=12.
+// An earlier round of this work charged the E=1 worst case to 100% of
+// instructions and overstated the gain by ~25%; do not repeat that.
+//
+// WHY 512 AND NOT 256: a 256-entry two-bit form (bit 0 unconditional, bit 1
+// E-only, masked by m_E ? 3 : 1) was built and measured first and reached
+// only 11, because GCC spent `mov w5,#1 / mov w4,#3 / csel` on the mask.
+// Folding m_E into the INDEX makes it one `orr w2,w20,w1,lsl #8`.
+//
+// INVALIDATION: there is none. The only inputs are the opcode byte and m_E,
+// both read at the point the original predicate read them -- verified in the
+// disassembly, where a single m_E load feeds both this index and the dispatch
+// test, exactly as it fed the old chain and the dispatch. No $00/$01 write,
+// SCPU register window, bootmap, DOS extension, C128 mode, REU or
+// ultimax/cartridge line can change a correct entry, which is what makes this
+// safer than a write-decode cache.
+//
+// Tests/CPU/test_w65c816.cpp's w65c816_precise_form_table_matches_the_predicate
+// enumerates all 256 opcodes x both m_E values against the original
+// expression -- a COMPLETE proof over the table's entire domain, not a
+// sample. Verified to bite: flipping the single byte for opcode $8D in the
+// E=1 half takes the suite from 682844 checks / 0 failed to 9 failed, because
+// the behavioural test w65c816_precise_vic_store_with_turnaround_enters_one_
+// cycle_early catches it too. One wrong byte cannot hide.
+//
+// $8C, $8D and $9C are unconditional, so they are set in BOTH halves. The
+// E-only forms are $xC/$xD/$xE on EVEN high nibbles, plus $1C: note that
+// $xC/$xD/$xE on ODD high nibbles have low five bits $1C/$1D/$1E and so are
+// NOT included -- $BC is absent from this table on purpose.
+const bool CW65C816::s_PreciseForm[ 512 ] = {
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+};
+
 u32 CW65C816::stepInner()
 {
 	// The opcode fetch itself is cycle 1. Exact access sequencing is enabled
@@ -353,6 +449,14 @@ u32 CW65C816::stepInner()
 	// first instruction; a high-but-masked IRQ line keeps W65_PEND_IRQLINE
 	// set so CLI still takes the interrupt on the very next instruction.
 	bool irq = ( m_Pending & W65_PEND_IRQLINE ) != 0;
+	// Whether the level acted on below was SAMPLED here or reused from the
+	// cache. One local on a path that already branches on the same bit; the
+	// interrupt ring records it so "a stale sampled IRQ level let us in" stops
+	// being a candidate that can only be argued about.
+	const bool freshSample = ( m_Pending & W65_PEND_SAMPLE ) != 0;
+	// And whether the asserted line was CARRIED IN from an earlier sample
+	// rather than found here. Both locals are bits of a byte already loaded.
+	const bool carriedLine = irq;
 	if ( m_Pending & W65_PEND_SAMPLE )
 	{
 		bool nmiLevel = false;
@@ -372,9 +476,13 @@ u32 CW65C816::stepInner()
 		m_Pending &= (u8)~( W65_PEND_NMI | W65_PEND_WAITING );
 		m_NMIsTaken++;
 		m_LastNMITakeCycles = m_Cycles;
+		noteInterruptEntry( true );
+		noteInterruptContext( freshSample, carriedLine );
 		if ( m_FastBus ) m_FastBus->noteNMITaken();
 		const u32 c = m_E ? 7 : 8;
 		serviceInterrupt( W65_VEC_NATIVE_NMI, W65_VEC_EMU_NMI, false );
+		// m_PC is the vector's destination only now; see noteInterruptTarget.
+		noteInterruptTarget();
 		m_Cycles += c;
 		return c;
 	}
@@ -399,8 +507,16 @@ u32 CW65C816::stepInner()
 	if ( irq && !( m_P & W65_I ) )
 	{
 		m_IRQsTaken++;
+		// Before serviceInterrupt pushes: the ring wants the PC we are
+		// LEAVING and the S we are leaving it with, not the vector.
+		noteInterruptEntry( false );
+		noteInterruptContext( freshSample, carriedLine );
 		const u32 c = m_E ? 7 : 8;
 		serviceInterrupt( W65_VEC_NATIVE_IRQ, W65_VEC_EMU_IRQ, false );
+		// Which RUNG this interrupt entered. Mario re-points $FFFE three times
+		// a frame, so the entry PC alone cannot say whether the $0991 rung --
+		// the one that writes $9F88 at $09B0 -- is still being reached.
+		noteInterruptTarget();
 		m_Cycles += c;
 		return c;
 	}
@@ -410,7 +526,21 @@ u32 CW65C816::stepInner()
 	// widths mid-instruction, but their own cycle counts are the ones for the
 	// state they started in -- so the epilogue indexes the table with this
 	// LOCAL, never the live member.
-	const u8 opcode = fetch8();
+	// f8E(), not fetch8(), and NOT because this is emulation mode -- this is
+	// the SHARED opcode fetch, native mode included, and the E in the name is
+	// historical. GCC leaves fetch8 and busRead8 out of line at -Os, so this
+	// one line cost three bl/ret pairs and two stack frames on every
+	// instruction the machine executes: stepInner+0x890 is `bl fetch8` in the
+	// K449-era object, with the relocation to prove it, and removing it takes
+	// the object's `bl fetch8` sites from 25 to 24. The E twins are
+	// always_inline and their bodies are byte-identical to the generic
+	// accessors -- see the note above them -- and every address this fetch can
+	// form, (PBR << 16) | PC, is at most 0xFFFFFF and so already inside
+	// SCPU_ADDR_MASK (0x00FFFFFF, Common/types.h:58), which makes rd8E's extra
+	// mask a no-op.
+	// If f8E() ever acquires a genuine dependency on m_E, this line has to go
+	// back to fetch8() or grow its own always_inline twin.
+	const u8 opcode = f8E();
 
 	// Non-indexed absolute forms have no hidden internal cycle before their
 	// data access: the interpreter's fetch/read/write order is the literal
@@ -427,13 +557,14 @@ u32 CW65C816::stepInner()
 	// placement is end-of-instruction poisons every access that follows it.
 	// Indexed and indirect forms carry internal cycles the access counter
 	// cannot see and stay on end-of-instruction timing.
-	{
-		const u8 lowFive = (u8)( opcode & 0x1F );
-		m_PreciseAccessTimeline =
-		       opcode == 0x8C || opcode == 0x8D || opcode == 0x9C
-		    || ( m_E && ( lowFive == 0x0C || lowFive == 0x0D
-		               || lowFive == 0x0E || opcode == 0x1C ) );
-	}
+	// Same predicate, same inputs, same point in the instruction; only its
+	// COST changes. It was 16 instructions on the E=1 path and 9 on the E=0
+	// path; the table is 4. No `!= 0` here: s_PreciseForm is a bool array, so
+	// GCC stores the byte straight through, and comparing against zero would
+	// put back the cmp/cset this table exists to remove. See s_PreciseForm
+	// above for the measurement and for why there is nothing to invalidate.
+	m_PreciseAccessTimeline =
+	    s_PreciseForm[ ( (u32)m_E << 8 ) | opcode ];
 	m_PreciseAccessCycle = 1;
 
 	// --- emulation-mode fast path ---------------------------------------
@@ -1187,6 +1318,11 @@ u64 CW65C816::run( u64 nCycles )
 
 	while ( m_Cycles - start < nCycles && !m_RunBreak )
 	{
+		// Hypothesis-free hang detector, sampled here and not in stepInner:
+		// see the W65_PROG_ block in the header for why one PC in eight is
+		// enough and what it costs. stepInner is deliberately not recompiled
+		// by this, so its object size stays the turbo-is-untouched proof.
+		noteProgressSample();
 		if ( nCycles - ( m_Cycles - start ) > 80 )
 		{
 			for ( u32 i = 0; i < 8; i++ )

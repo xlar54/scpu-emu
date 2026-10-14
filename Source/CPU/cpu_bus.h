@@ -73,6 +73,14 @@ public:
 	// account for elapsed time (VIC-II raster position, CIA timers, and the
 	// SuperCPU's own 1MHz/20MHz speed switching). nCycles is in 65816 cycles.
 	virtual void tick( u32 nCycles ) { (void)nCycles; }
+
+	// A ONE-SHOT PHYSICAL PHASE TRIM for the next settle, in QUARTER C64 cycles
+	// (K502; whole cycles before), positive landing it LATER. It moves the real-time deadline of that one
+	// settle and nothing else -- not the cycles ticked, not the guest's ledger,
+	// not the pacer's grid origin. The next settle meets the displacement as
+	// ordinary lag. Only a bus with a pacer can honour it; the default ignores
+	// it, which keeps every cycle-counting test bus blind to it by design.
+	virtual void tickPhaseTrim( s32 quarterCycles ) { (void)quarterCycles; }
 };
 
 #endif

@@ -117,6 +117,17 @@ int cfgREUSize = REUSIZE_NONE;
 int cfgRAMUnderIO = SCPU_CFG_RAM_UNDER_IO_DEFAULT;
 int cfgVSPAimRead = 0;
 int cfgVSPAimWrite = 0;
+int cfgBAStall = SCPU_CFG_BA_STALL_DEFAULT;
+int cfgBAStallMax = SCPU_CFG_BA_STALL_MAX_DEFAULT;
+int cfgIECWindow = SCPU_CFG_IEC_WINDOW_DEFAULT;
+int cfgHangWatch = SCPU_CFG_HANG_WATCH_DEFAULT;
+int cfgRAMWatch = SCPU_CFG_RAM_WATCH_DEFAULT;
+int cfgRAMWatch2 = SCPU_CFG_RAM_WATCH2_DEFAULT;
+int cfgDiagMinimal = SCPU_CFG_DIAG_MINIMAL_DEFAULT;
+int cfgVSPD011ShadowRead = 0;
+int cfgVSPWriteLead = SCPU_CFG_VSP_WRITE_LEAD_DEFAULT;
+int cfgVSPPlacementK501 = 1;
+int cfgVSPTraceWindowOnly = 0;
 
 char cfg[ 65536 ];
 
@@ -153,6 +164,17 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	cfgRAMUnderIO = SCPU_CFG_RAM_UNDER_IO_DEFAULT;
 	cfgVSPAimRead = 0;
 	cfgVSPAimWrite = 0;
+	cfgBAStall = SCPU_CFG_BA_STALL_DEFAULT;
+	cfgBAStallMax = SCPU_CFG_BA_STALL_MAX_DEFAULT;
+	cfgIECWindow = SCPU_CFG_IEC_WINDOW_DEFAULT;
+	cfgHangWatch = SCPU_CFG_HANG_WATCH_DEFAULT;
+	cfgRAMWatch = SCPU_CFG_RAM_WATCH_DEFAULT;
+	cfgRAMWatch2 = SCPU_CFG_RAM_WATCH2_DEFAULT;
+	cfgDiagMinimal = SCPU_CFG_DIAG_MINIMAL_DEFAULT;
+	cfgVSPD011ShadowRead = 0;
+	cfgVSPWriteLead = SCPU_CFG_VSP_WRITE_LEAD_DEFAULT;
+	cfgVSPPlacementK501 = 1;
+	cfgVSPTraceWindowOnly = 0;
 
 	// Leave a byte spare so cfg is always NUL-terminated for the line scanner.
 	if ( !readFile( logger, DRIVE, FILENAME, (u8*)cfg, &cfgBytes, sizeof( cfg ) - 1 ) )
@@ -183,6 +205,17 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 	bool ramUnderIOSeen = false;
 	bool vspAimReadSeen = false;
 	bool vspAimWriteSeen = false;
+	bool baStallSeen = false;
+	bool baStallMaxSeen = false;
+	bool iecWindowSeen = false;
+	bool hangWatchSeen = false;
+	bool ramWatchSeen = false;
+	bool ramWatch2Seen = false;
+	bool diagMinimalSeen = false;
+	bool vspD011ShadowReadSeen = false;
+	bool vspWriteLeadSeen = false;
+	bool vspPlacementK501Seen = false;
+	bool vspTraceWindowOnlySeen = false;
 
 	while ( *cfgPos != 0 )
 	{
@@ -225,6 +258,17 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 						if ( i == 43 ) ramUnderIOSeen = true;
 						if ( i == 44 ) vspAimReadSeen = true;
 						if ( i == 45 ) vspAimWriteSeen = true;
+						if ( i == 46 ) baStallSeen = true;
+						if ( i == 47 ) baStallMaxSeen = true;
+						if ( i == 48 ) iecWindowSeen = true;
+						if ( i == 49 ) hangWatchSeen = true;
+						if ( i == 50 ) ramWatchSeen = true;
+						if ( i == 51 ) ramWatch2Seen = true;
+						if ( i == 52 ) diagMinimalSeen = true;
+						if ( i == 53 ) vspD011ShadowReadSeen = true;
+						if ( i == 54 ) vspWriteLeadSeen = true;
+						if ( i == 55 ) vspPlacementK501Seen = true;
+						if ( i == 56 ) vspTraceWindowOnlySeen = true;
 						while ( *ptr == '\t' || *ptr == ' ' ) ptr++;
 					#ifdef DEBUG_OUT
 						logger->Write( "RaspiMenu", LogNotice, "  %s >%d< (%s)", timingNames[ i ], timingValues[ i ], ptr );
@@ -379,6 +423,76 @@ int readConfig( CLogger *logger, const char *DRIVE, const char *FILENAME )
 		cfgVSPAimWrite = timingValues[ 45 ];
 		if ( cfgVSPAimWrite < -6 || cfgVSPAimWrite > 6 ) cfgVSPAimWrite = 0;
 	}
+
+	// A MODE, so 0 is meaningful and cannot use the "if non-zero" idiom. An
+	// out-of-range value falls back to the default rather than to off: BA_STALL
+	// 0 is a diagnostic state in which Mario hangs, and a typo must not select
+	// it silently.
+	if ( baStallSeen )
+	{
+		cfgBAStall = timingValues[ 46 ];
+		if ( cfgBAStall < 0 || cfgBAStall > 2 )
+			cfgBAStall = SCPU_CFG_BA_STALL_DEFAULT;
+	}
+	// A cycle count. 80 is the top because RAD_BA_STALL_CEILING clamps there;
+	// the same range is enforced in CSuperCPU::setBAStall, which is the setter
+	// every caller goes through, including the tests.
+	if ( baStallMaxSeen )
+	{
+		cfgBAStallMax = timingValues[ 47 ];
+		if ( cfgBAStallMax < 8 || cfgBAStallMax > 80 )
+			cfgBAStallMax = SCPU_CFG_BA_STALL_MAX_DEFAULT;
+	}
+	// Also a MODE: 0 is the legacy predicate and a typo must not select it,
+	// because mode 0 is the state in which a game that never touches the drive
+	// holds the serial window armed 98% of the time.
+	if ( iecWindowSeen )
+	{
+		cfgIECWindow = timingValues[ 48 ];
+		if ( cfgIECWindow < 0 || cfgIECWindow > 2 )
+			cfgIECWindow = SCPU_CFG_IEC_WINDOW_DEFAULT;
+	}
+	// A diagnostic switch, so an out-of-range value means OFF rather than the
+	// default: unlike BA_STALL there is no emulated behaviour behind it, and a
+	// typo must not silently re-arm an instrument the operator was disabling.
+	if ( hangWatchSeen )
+		cfgHangWatch = ( timingValues[ 49 ] == 1 ) ? 1 : 0;
+	// A 16-bit address. Out of range DISARMS rather than clamping: a clamped
+	// watch address would log a different byte than the one asked for, and a
+	// post-mortem that names the wrong address is worse than an empty one.
+	if ( ramWatchSeen )
+	{
+		cfgRAMWatch = timingValues[ 50 ];
+		if ( cfgRAMWatch < 0 || cfgRAMWatch > 0xFFFF ) cfgRAMWatch = 0;
+	}
+	if ( ramWatch2Seen )
+	{
+		cfgRAMWatch2 = timingValues[ 51 ];
+		if ( cfgRAMWatch2 < 0 || cfgRAMWatch2 > 0xFFFF ) cfgRAMWatch2 = 0;
+	}
+	// Only the exact value 1 selects minimal mode, and the SAFE direction here
+	// is the opposite of HANG_WATCH's: a typo must not silently DISARM an
+	// instrument while the hang is open, so anything that is not 1 keeps
+	// everything on.
+	if ( diagMinimalSeen )
+		cfgDiagMinimal = ( timingValues[ 52 ] == 1 ) ? 1 : 0;
+	// Exact value 1 only, like DIAG_MINIMAL: a typo must not switch a read path
+	// on. The safe direction is the physical read.
+	if ( vspD011ShadowReadSeen )
+		cfgVSPD011ShadowRead = ( timingValues[ 53 ] == 1 ) ? 1 : 0;
+	// A quantity with a measured default, like BA_STALL_MAX: out of range falls
+	// back to the default, not to 0, because 0 is the placement that flickers.
+	if ( vspWriteLeadSeen )
+	{
+		cfgVSPWriteLead = timingValues[ 54 ];
+		if ( cfgVSPWriteLead < 0 || cfgVSPWriteLead > 3 )
+			cfgVSPWriteLead = SCPU_CFG_VSP_WRITE_LEAD_DEFAULT;
+	}
+	// Exact 0 selects the old placement; anything else keeps the new one.
+	if ( vspPlacementK501Seen )
+		cfgVSPPlacementK501 = ( timingValues[ 55 ] == 0 ) ? 0 : 1;
+	if ( vspTraceWindowOnlySeen )
+		cfgVSPTraceWindowOnly = ( timingValues[ 56 ] == 1 ) ? 1 : 0;
 
 	return 1;
 }

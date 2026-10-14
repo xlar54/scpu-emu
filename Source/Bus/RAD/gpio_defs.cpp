@@ -38,6 +38,28 @@
 volatile u32 radBAWaitTimeouts = 0;
 volatile u32 radPHIWaitTimeouts = 0;
 
+// WHOLE PHI CYCLES THE LAST ACCESS SPENT WAITING OUT BA, published per
+// primitive because the two ends of every placement measurement we take are
+// a READ tail and a WRITE tail and they can move independently.
+//
+// The count itself is not new: HANDLE_BUS_AVAILABLE_READ and
+// HANDLE_BUS_AVAILABLE have always computed baSpins__ to drive their timeout
+// check and then DISCARDED it. That discard is why the VSP trace cannot say
+// which end of a DEC/INC placement moved: dprev= is write-tail to write-tail,
+// so a whole-cycle slip in the $D012 anchor read is invisible to it, and the
+// 21-frame K488 capture showed the INC landing a whole cycle later on 16
+// frames than on 5 with its sub-cycle phase TIGHTER than the DEC's (arcs
+// 0.080 vs 0.094 of a cycle). Phase is therefore not the variable; WHICH PHI
+// CYCLE is, and these two say whether the bus made that choice on the read or
+// on the write.
+//
+// LAST, not cumulative, and deliberately: a window total would blend every
+// access since the previous retained event, which is exactly the conflation
+// being resolved. Each is written once per access, so the value read straight
+// after a primitive returns belongs to THAT access.
+volatile u32 radBASpinsLastRead = 0;
+volatile u32 radBASpinsLastWrite = 0;
+
 void INP_GPIO( int pin )
 {
 	unsigned nSelReg = ARM_GPIO_GPFSEL0 + ( pin / 10 ) * 4;

@@ -56,4 +56,4 @@ EOF
 
 echo
 echo "Put it on the test disk as TESTDATA, e.g."
-echo "  c1541 -attach C64Tests/SCPU-TESTS.d81 -write $OUT testdata"
+echo "  c1541 -attach C64Tests/diskimages/scpu-tests.d81 -write $OUT testdata"

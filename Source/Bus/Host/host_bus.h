@@ -31,6 +31,13 @@
 
 #define HOSTBUS_LOG_SIZE 65536
 
+// The two cycle numbers of the badline steal, 1-based like Bauer's tables:
+// BA falls three cycles before the first c-access, and the last stolen cycle
+// is the 40th c-access. Named so an off-by-one can be corrected in one place
+// without touching the predicate -- see CHostBus::busStealCycles.
+#define HOSTBUS_BADLINE_BA_LOW  12
+#define HOSTBUS_BADLINE_BA_LAST 54
+
 enum HostBusOp { HOSTOP_READ = 0, HOSTOP_WRITE, HOSTOP_BURST_WRITE };
 
 typedef struct
@@ -61,6 +68,7 @@ public:
 	bool irqAsserted() override;
 	bool nmiAsserted() override { return m_NMI; }
 	u16  rasterLine() override;
+	u32  busStealCycles( u32 maxCycles ) override;
 
 	// Free-running raster position, without charging a bus cycle. Used to
 	// answer reads of $D011/$D012 -- see the note in read().

@@ -55,6 +55,13 @@ u64 radMeasureMachineRate()
 	return duration - start;
 }
 
+static u64 s_LastMachineRate;
+
+u64 radLastMeasuredMachineRate()
+{
+	return s_LastMachineRate;
+}
+
 bool radWaitForMachineRunning()
 {
 	// Time 1000 C64 cycles against the ARM cycle counter. A PAL C64 runs at
@@ -70,7 +77,15 @@ bool radWaitForMachineRunning()
 		u64 duration = radMeasureMachineRate();
 
 		if ( duration > 1200000 && duration < 1600000 )
+		{
+			// Keep the accepted figure. The pacer derives PHI2 from the
+			// DETECTED video standard for determinism, and this is the only
+			// independent measurement of the same quantity -- recorded at the
+			// accept point, before takeover, so the cross-check adds no bus
+			// time and no C128 refresh-window time.
+			s_LastMachineRate = duration;
 			return true;
+		}
 	}
 
 	return false;
